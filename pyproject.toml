@@ -1,0 +1,21 @@
+[project]
+name = "reddit-scrape"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Zhi Wei", email = "lumzhiwei@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "praw>=8.0.3",
+    "pydantic-ai>=2.54.0",
+    "sqlalchemy>=2.0.55",
+]
+
+[project.scripts]
+reddit-scrape = "reddit_scrape:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
