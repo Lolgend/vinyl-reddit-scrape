@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DeepSeek PydanticAI Extraction Prototype (Refined)</title>
+  <title>DeepSeek PydanticAI Extraction Prototype (Minimal)</title>
   <style>
     :root {
       --bg: #0d1117;
@@ -103,7 +103,6 @@
       align-items: center;
     }
 
-    /* Tabs */
     .tabs {
       display: flex;
       gap: 4px;
@@ -133,7 +132,6 @@
       color: var(--text);
     }
 
-    /* Steps */
     .steps-container {
       display: flex;
       flex-direction: column;
@@ -198,7 +196,6 @@
 
     .btn-secondary:hover { background: #30363d; }
 
-    /* State Inspector */
     .field-row {
       display: flex;
       justify-content: space-between;
@@ -289,7 +286,7 @@
 
   <header>
     <div style="display: flex; justify-content: space-between; align-items: baseline;">
-      <h1>DeepSeek PydanticAI Extraction Prototype (Refined)</h1>
+      <h1>DeepSeek PydanticAI Extraction Prototype (Minimal)</h1>
       <span class="badge badge-purple">Wayfinder #5 Prototype</span>
     </div>
     <div class="question-box">
@@ -317,37 +314,25 @@
     <!-- State Panel -->
     <div class="card">
       <h2>
-        <span>Extraction State & Normalized Relational Output</span>
+        <span>Processed Release Entities</span>
         <span id="status-badge" class="badge badge-green">Ready</span>
       </h2>
 
       <div class="field-row">
-        <span class="field-label">Raw Submission Title</span>
+        <span class="field-label">Reddit Submission Title</span>
         <span class="field-val" id="state-raw-title">-</span>
-      </div>
-      <div class="field-row">
-        <span class="field-label">Pre-Cleaned Title</span>
-        <span class="field-val" id="state-clean-title">-</span>
-      </div>
-      <div class="field-row">
-        <span class="field-label">Is Specific Vinyl Release?</span>
-        <span class="field-val" id="state-is-release">-</span>
       </div>
       <div class="field-row">
         <span class="field-label">Releases Extracted</span>
         <span class="field-val" id="state-releases-count">0</span>
       </div>
       <div class="field-row">
-        <span class="field-label">Noise / Album Check</span>
-        <span class="field-val" id="state-noise-check"><span class="badge badge-green">Valid Specific Release</span></span>
-      </div>
-      <div class="field-row">
-        <span class="field-label">LLM Extraction Reasoning</span>
-        <span class="field-val" id="state-reasoning" style="font-family: inherit; font-size: 12px;">-</span>
+        <span class="field-label">Status</span>
+        <span class="field-val" id="state-status"><span class="badge badge-green">Valid Specific Release</span></span>
       </div>
 
       <div style="margin-top: 14px;">
-        <h3 style="font-size: 13px; color: var(--text-muted); margin-bottom: 6px;">Extracted Release Entities</h3>
+        <h3 style="font-size: 13px; color: var(--text-muted); margin-bottom: 6px;">Relational Entities (Processed)</h3>
         <div id="releases-container">
           <!-- Entities populated here -->
         </div>
@@ -357,12 +342,12 @@
     <!-- Inspector & Raw JSON -->
     <div class="card">
       <h2>
-        <span>Schema Validation (Refined ExtractedRelease)</span>
+        <span>Relational Model Output</span>
         <span class="highlight-pill" id="current-step-label">Step 1: Ingestion</span>
       </h2>
 
       <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 10px;">
-        State representation passed to PostgreSQL persistence models (<code>releases</code>, <code>artists</code>, <code>release_artists</code>, <code>submission_releases</code>):
+        Clean data payload mapped to <code>releases</code>, <code>artists</code>, and <code>release_artists</code>:
       </div>
 
       <pre id="json-preview">{}</pre>
@@ -383,18 +368,12 @@
 
   <!-- Portable Logic Module -->
   <script>
-    /*
-     * PROTOTYPE LOGIC MODULE:
-     * Pure extraction & state transformation module matching prototype_extractor.py
-     */
     const PrototypeModule = (function() {
       const benchmarkData = {
         "multi_artist_split": {
           title: 'Converge / Dropdead - Split (7" /500)',
           category: "Multi-Artist Split Release",
-          desc: "Tags individual contributing artists ['Converge', 'Dropdead'] and creates combined billing 'Converge / Dropdead', capturing variant '7\" /500'.",
-          clean: 'Converge / Dropdead - Split (7" /500)',
-          is_vinyl_release: true,
+          desc: "Extracts individual artists ['Converge', 'Dropdead'], combined billing 'Converge / Dropdead', title 'Split', variant '7\" /500'.",
           releases: [
             {
               artists: ["Converge", "Dropdead"],
@@ -403,15 +382,12 @@
               variant: '7" /500',
               retailer: null
             }
-          ],
-          reasoning: "Specific split 7\" release with stated limitation of 500 copies; identified both artists separately and the title 'Split'."
+          ]
         },
         "multi_artist_collab": {
           title: "Kanye West & Ty Dolla $ign - Vultures 1 (Black 2LP)",
           category: "Multi-Artist Collaboration",
-          desc: "Extracts individual artists ['Kanye West', 'Ty Dolla $ign'] alongside combined billing 'Kanye West & Ty Dolla $ign', with variant 'Black 2LP'.",
-          clean: "Kanye West & Ty Dolla $ign - Vultures 1 (Black 2LP)",
-          is_vinyl_release: true,
+          desc: "Extracts individual artists ['Kanye West', 'Ty Dolla $ign'], combined billing 'Kanye West & Ty Dolla $ign', variant 'Black 2LP'.",
           releases: [
             {
               artists: ["Kanye West", "Ty Dolla $ign"],
@@ -420,15 +396,12 @@
               variant: "Black 2LP",
               retailer: null
             }
-          ],
-          reasoning: "Title announces a specific album release with collaboration billed with '&', so artists are split into individual tags and combined display."
+          ]
         },
         "audiophile_weight": {
           title: "Miles Davis – Kind of Blue (Mobile Fidelity 180g 45RPM 2LP Box)",
           category: "Audiophile Weight Variant (180g / 45RPM)",
-          desc: "Verifies unified 'variant' field capturing non-color pressing specifications: 180g, 45RPM, 2LP Box.",
-          clean: "Miles Davis - Kind of Blue (Mobile Fidelity 180g 45RPM 2LP Box)",
-          is_vinyl_release: true,
+          desc: "Captures non-color pressing specifications in variant: '180g 45RPM 2LP Box', retailer 'Mobile Fidelity'.",
           releases: [
             {
               artists: ["Miles Davis"],
@@ -437,15 +410,12 @@
               variant: "180g 45RPM 2LP Box",
               retailer: "Mobile Fidelity"
             }
-          ],
-          reasoning: "Title announces a specific album release: Miles Davis' 'Kind of Blue' as a Mobile Fidelity 180g 45RPM 2LP box set."
+          ]
         },
         "comma_artist_restock": {
           title: "RESTOCK: Tyler, The Creator - IGOR (Mint Green Special Edition LP)",
           category: "Restock with Specific Album Announced",
-          desc: "Restock notification that names a specific album ('IGOR') is retained. Preserves internal comma in 'Tyler, The Creator'.",
-          clean: "RESTOCK: Tyler, The Creator - IGOR (Mint Green Special Edition LP)",
-          is_vinyl_release: true,
+          desc: "Retained because specific album 'IGOR' is announced. Artists: ['Tyler, The Creator'], variant: 'Mint Green Special Edition LP'.",
           releases: [
             {
               artists: ["Tyler, The Creator"],
@@ -454,44 +424,27 @@
               variant: "Mint Green Special Edition LP",
               retailer: null
             }
-          ],
-          reasoning: "Restock announces a specific named album (IGOR) with variant (Mint Green). Qualifies as a valid vinyl release."
+          ]
         },
         "generic_restock_ignore": {
           title: "VMP Restocks: Fiona Apple, Outkast, The Mars Volta, DMX",
-          category: "Generic Restock (No Albums Named) -> IGNORED",
-          desc: "Per Rule #1: Restock notices that do NOT mention specific albums are ignored (is_vinyl_release=false, 0 releases) to avoid empty/hallucinated rows.",
-          clean: "VMP Restocks: Fiona Apple, Outkast, The Mars Volta, DMX",
-          is_vinyl_release: false,
-          releases: [],
-          reasoning: "Generic VMP restock announcement listing artists without any specific album titles; per rules this is not a specific vinyl release announcement."
+          category: "Generic Restock (No Albums Named) -> Ignored",
+          desc: "Ignored (0 releases) because no specific album titles are announced, avoiding empty or hallucinated records.",
+          releases: []
         },
         "discussion_ignore": {
           title: "[Discussion] What's your favorite pressing of In Rainbows?",
-          category: "Community Discussion -> IGNORED",
-          desc: "Per Rule #1: Community discussions, questions, and ISO requests are ignored entirely.",
-          clean: "[Discussion] What's your favorite pressing of In Rainbows?",
-          is_vinyl_release: false,
-          releases: [],
-          reasoning: "Post is a [Discussion] question asking about favorite pressings of an album, not an announcement of a specific vinyl release."
+          category: "Community Discussion -> Ignored",
+          desc: "Community discussions are filtered out (0 releases).",
+          releases: []
         }
       };
 
-      function preClean(rawTitle) {
-        return rawTitle.trim()
-          .replace(/[\u2010-\u2015\u2212]/g, '-')
-          .replace(/\s+/g, ' ');
-      }
-
       return {
         benchmarks: benchmarkData,
-        preClean: preClean,
       };
     })();
 
-    /*
-     * UI SHELL: Tabbed Guided Walkthroughs & State Rendering
-     */
     let currentScenarioKey = "multi_artist_split";
     let currentStep = 1;
     let currentState = {};
@@ -506,7 +459,6 @@
     ];
 
     function initUI() {
-      // Build tabs
       const tabsEl = document.getElementById("walkthrough-tabs");
       tabsEl.innerHTML = "";
       walkthroughKeys.forEach((key, index) => {
@@ -518,7 +470,6 @@
         tabsEl.appendChild(btn);
       });
 
-      // Build freeplay buttons
       const fpEl = document.getElementById("freeplay-buttons");
       fpEl.innerHTML = "";
       Object.keys(PrototypeModule.benchmarks).forEach((key) => {
@@ -528,7 +479,7 @@
         btn.textContent = item.category;
         btn.onclick = () => {
           selectScenario(key);
-          executeStep(4);
+          executeStep(2);
         };
         fpEl.appendChild(btn);
       });
@@ -559,25 +510,15 @@
     function renderSteps() {
       const stepsContainer = document.getElementById("steps-container");
       stepsContainer.innerHTML = `
-        <div class="step-item ${currentStep >= 1 ? (currentStep === 1 ? 'active' : 'completed') : ''}">
+        <div class="step-item ${currentStep === 1 ? 'active' : 'completed'}">
           <div class="step-number">1</div>
-          <div style="flex:1;"><strong>Step 1: Raw Submission Ingestion</strong> &mdash; Ingest unparsed Reddit post title</div>
-          <button class="btn ${currentStep === 1 ? '' : 'btn-secondary'}" onclick="executeStep(1)">Ingest Title</button>
+          <div style="flex:1;"><strong>Step 1: Submission Title</strong> &mdash; Raw Reddit post title</div>
+          <button class="btn ${currentStep === 1 ? '' : 'btn-secondary'}" onclick="executeStep(1)">Inspect Title</button>
         </div>
-        <div class="step-item ${currentStep >= 2 ? (currentStep === 2 ? 'active' : 'completed') : ''}">
+        <div class="step-item ${currentStep === 2 ? 'completed' : ''}">
           <div class="step-number">2</div>
-          <div style="flex:1;"><strong>Step 2: String Pre-Cleaning</strong> &mdash; Normalize unicode hyphens & whitespace</div>
-          <button class="btn ${currentStep === 2 ? '' : 'btn-secondary'}" onclick="executeStep(2)">Normalize Title</button>
-        </div>
-        <div class="step-item ${currentStep >= 3 ? (currentStep === 3 ? 'active' : 'completed') : ''}">
-          <div class="step-number">3</div>
-          <div style="flex:1;"><strong>Step 3: PydanticAI Semantic Extraction</strong> &mdash; Execute DeepSeek LLM extraction</div>
-          <button class="btn ${currentStep === 3 ? '' : 'btn-secondary'}" onclick="executeStep(3)">Run LLM Agent</button>
-        </div>
-        <div class="step-item ${currentStep >= 4 ? 'completed' : ''}">
-          <div class="step-number">4</div>
-          <div style="flex:1;"><strong>Step 4: Relational Schema Validation</strong> &mdash; Validate ExtractedRelease model</div>
-          <button class="btn ${currentStep === 4 ? '' : 'btn-secondary'}" onclick="executeStep(4)">Validate Schema</button>
+          <div style="flex:1;"><strong>Step 2: Extracted Release Entities</strong> &mdash; Processed relational output</div>
+          <button class="btn ${currentStep === 2 ? '' : 'btn-secondary'}" onclick="executeStep(2)">Extract Releases</button>
         </div>
       `;
     }
@@ -590,85 +531,45 @@
 
       if (step === 1) {
         currentState = {
-          step: "Raw Ingestion",
-          raw_title: scenario.title,
-          clean_title: "(not yet pre-cleaned)",
-          is_vinyl_release: "(pending classification)",
-          releases: [],
-          reasoning: "Awaiting LLM classification agent."
+          title: scenario.title,
+          releases: []
         };
         document.getElementById("status-badge").className = "badge badge-amber";
         document.getElementById("status-badge").textContent = "Ingested";
-        document.getElementById("current-step-label").textContent = "Step 1: Ingestion";
+        document.getElementById("current-step-label").textContent = "Step 1: Title Ingested";
       } else if (step === 2) {
         currentState = {
-          step: "Pre-Cleaned",
-          raw_title: scenario.title,
-          clean_title: PrototypeModule.preClean(scenario.title),
-          is_vinyl_release: "(pending classification)",
-          releases: [],
-          reasoning: "Whitespace and Unicode punctuation normalized."
+          releases: scenario.releases
         };
-        document.getElementById("status-badge").className = "badge badge-amber";
-        document.getElementById("status-badge").textContent = "Cleaned";
-        document.getElementById("current-step-label").textContent = "Step 2: Pre-Cleaned";
-      } else if (step === 3) {
-        currentState = {
-          step: "LLM Extracted",
-          raw_title: scenario.title,
-          clean_title: PrototypeModule.preClean(scenario.title),
-          is_vinyl_release: scenario.is_vinyl_release,
-          releases: scenario.releases,
-          reasoning: scenario.reasoning
-        };
-        document.getElementById("status-badge").className = scenario.is_vinyl_release ? "badge badge-green" : "badge badge-red";
-        document.getElementById("status-badge").textContent = scenario.is_vinyl_release ? "Extracted" : "Filtered Out";
-        document.getElementById("current-step-label").textContent = "Step 3: LLM Inference";
-      } else if (step === 4) {
-        currentState = {
-          step: "Validated Relational",
-          raw_title: scenario.title,
-          clean_title: PrototypeModule.preClean(scenario.title),
-          is_vinyl_release: scenario.is_vinyl_release,
-          releases: scenario.releases,
-          reasoning: scenario.reasoning,
-          database_action: scenario.is_vinyl_release 
-            ? "Ready for INSERT into releases, artists, release_artists, and submission_releases" 
-            : "Discarded / Flagged submissions.is_release = FALSE"
-        };
-        document.getElementById("status-badge").className = scenario.is_vinyl_release ? "badge badge-green" : "badge badge-red";
-        document.getElementById("status-badge").textContent = scenario.is_vinyl_release ? "Validated" : "Filtered";
-        document.getElementById("current-step-label").textContent = "Step 4: Relational Ready";
+        const hasReleases = scenario.releases.length > 0;
+        document.getElementById("status-badge").className = hasReleases ? "badge badge-green" : "badge badge-red";
+        document.getElementById("status-badge").textContent = hasReleases ? "Extracted" : "Ignored";
+        document.getElementById("current-step-label").textContent = "Step 2: Releases Processed";
       }
 
       renderState();
     }
 
     function renderState() {
-      document.getElementById("state-raw-title").textContent = currentState.raw_title || "-";
-      document.getElementById("state-clean-title").textContent = currentState.clean_title || "-";
-      document.getElementById("state-is-release").textContent = 
-        typeof currentState.is_vinyl_release === "boolean" 
-          ? (currentState.is_vinyl_release ? "YES (Specific Album Release)" : "NO (Filtered Out / Ignored)")
-          : currentState.is_vinyl_release;
+      const scenario = PrototypeModule.benchmarks[currentScenarioKey];
+      document.getElementById("state-raw-title").textContent = scenario.title || "-";
       
-      document.getElementById("state-releases-count").textContent = currentState.releases ? currentState.releases.length : 0;
-      document.getElementById("state-reasoning").textContent = currentState.reasoning || "-";
+      const count = currentState.releases ? currentState.releases.length : 0;
+      document.getElementById("state-releases-count").textContent = count;
 
-      const noiseEl = document.getElementById("state-noise-check");
-      if (currentState.is_vinyl_release === true) {
-        noiseEl.innerHTML = '<span class="badge badge-green">Specific Release Validated</span>';
-      } else if (currentState.is_vinyl_release === false) {
-        noiseEl.innerHTML = '<span class="badge badge-red">Ignored (Non-Specific / Discussion)</span>';
+      const statusEl = document.getElementById("state-status");
+      if (currentStep === 1) {
+        statusEl.innerHTML = '<span class="badge badge-amber">Awaiting Extraction</span>';
+      } else if (count > 0) {
+        statusEl.innerHTML = '<span class="badge badge-green">Specific Release Announced</span>';
       } else {
-        noiseEl.innerHTML = '<span class="badge badge-amber">Pending Check</span>';
+        statusEl.innerHTML = '<span class="badge badge-red">Ignored (No Album / Non-Release)</span>';
       }
 
-      // Render release entities
       const relContainer = document.getElementById("releases-container");
       relContainer.innerHTML = "";
       if (!currentState.releases || currentState.releases.length === 0) {
-        relContainer.innerHTML = '<div style="font-size: 12px; color: var(--text-muted); padding: 8px 0;">No active release records extracted for this state.</div>';
+        relContainer.innerHTML = '<div style="font-size: 12px; color: var(--text-muted); padding: 8px 0;">No releases extracted (filtered or pending).</div>';
       } else {
         currentState.releases.forEach((r, idx) => {
           const div = document.createElement("div");
@@ -676,12 +577,16 @@
           div.innerHTML = `
             <div class="release-title">#${idx + 1}: ${r.combined_artist || r.artists.join(', ')} - ${r.album_title}</div>
             <div class="field-row">
-              <span class="field-label">Individual Artists:</span>
+              <span class="field-label">Artists:</span>
               <span class="field-val">${r.artists.map(a => `<span class="highlight-pill">${a}</span>`).join(' ')}</span>
             </div>
             <div class="field-row">
-              <span class="field-label">Combined Billing:</span>
+              <span class="field-label">Combined Artist:</span>
               <span class="field-val">${r.combined_artist || "Single Artist"}</span>
+            </div>
+            <div class="field-row">
+              <span class="field-label">Album Title:</span>
+              <span class="field-val">${r.album_title}</span>
             </div>
             <div class="field-row">
               <span class="field-label">Variant:</span>
@@ -703,27 +608,22 @@
       const val = document.getElementById("custom-title-input").value.trim();
       if (!val) return;
 
-      const cleaned = PrototypeModule.preClean(val);
       const isNoise = val.toLowerCase().includes("[discussion]") || val.toLowerCase().includes("[iso]");
       currentState = {
-        step: "Custom Exploration",
-        raw_title: val,
-        clean_title: cleaned,
-        is_vinyl_release: !isNoise,
         releases: isNoise ? [] : [
           {
-            artists: ["(Inferred from title)"],
-            combined_artist: "(Inferred combined)",
-            album_title: "(Inferred album title)",
-            variant: "Parsed variant",
-            retailer: "Parsed retailer"
+            artists: ["Artist"],
+            combined_artist: "Artist",
+            album_title: "Album",
+            variant: "Variant",
+            retailer: "Retailer"
           }
-        ],
-        reasoning: "Custom input pre-cleaned. For live DeepSeek LLM execution on this custom string, invoke src/reddit_scrape/prototype_extractor.py with your prompt."
+        ]
       };
+      document.getElementById("state-raw-title").textContent = val;
       document.getElementById("status-badge").className = isNoise ? "badge badge-red" : "badge badge-green";
-      document.getElementById("status-badge").textContent = isNoise ? "Filtered" : "Custom Evaluated";
-      document.getElementById("current-step-label").textContent = "Custom Input";
+      document.getElementById("status-badge").textContent = isNoise ? "Ignored" : "Extracted";
+      document.getElementById("current-step-label").textContent = "Custom Output";
       renderState();
     }
 

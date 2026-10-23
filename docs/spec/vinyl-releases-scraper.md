@@ -162,46 +162,43 @@ class ExtractedRelease(BaseModel):
         description="Combined billing display string when multiple artists collaborate (e.g. 'Converge / Dropdead', 'Kanye West & Ty Dolla $ign')"
     )
     album_title: str = Field(
-        description="Clean title of the album, EP, single, or box set without variant/date noise"
+        description="Title of the album, EP, single, or box set"
     )
     variant: Optional[str] = Field(
         None,
-        description="Physical pressing variation (colorway, 180g, LP count, zoetrope, limitation text, etc.), e.g. 'Opaque Emerald LP', '180g 45RPM 2LP Box', 'Pink Swirl /500'"
+        description="Physical pressing variation (e.g. 'Opaque Emerald LP', '180g 45RPM 2LP Box', 'Pink /500')"
     )
     retailer: Optional[str] = Field(
         None,
-        description="Exclusive retailer, store, or record label (e.g., 'Rough Trade', 'Blood Records', 'Target', 'VMP')"
+        description="Exclusive retailer, store, or record label if mentioned (e.g. 'Rough Trade', 'Blood Records', 'Target')"
     )
 
 class ExtractionResult(BaseModel):
-    is_vinyl_release: bool = Field(
-        description="Whether this submission announces a specific vinyl album release. FALSE for discussions, questions, ISO, gear, or general restocks/sales that do NOT name specific album titles."
-    )
     releases: list[ExtractedRelease] = Field(
         default_factory=list,
-        description="List of distinct releases announced with specific album titles. Empty if non-release or generic non-specific store restock."
-    )
-    reasoning: Optional[str] = Field(
-        None,
-        description="Brief explanation of extraction decisions and filtration"
+        description="List of distinct releases announced with specific album titles. Empty if non-release or generic store restock."
     )
 ```
 
 ### System Prompt Design
 ```text
 You are an expert vinyl discography classifier specialized in parsing posts from r/vinylreleases.
-Subreddit titles follow patterns such as:
-- "[Pre-Order] [Release Date] Artist - Album (Format / Color / Pressing count) [Store Name]"
-- "Restock: Artist - Album (Variant details)"
-- "Artist - Album | Exclusive /500"
 
-Your task:
-1. Determine if the post announces a specific vinyl release (`is_vinyl_release`). Set to FALSE and return releases: [] for general discussion, questions, ISO requests, equipment advice, or non-specific restocks/sales without album titles.
-2. Extract all distinct vinyl releases that mention specific album titles.
-3. Clean artist and album names by removing noise tags, bracketed dates, and parenthetical variant markers.
-4. For multi-artist releases (collaborations or splits), extract each contributing artist in `artists` and provide the joint string in `combined_artist`.
-5. Capture physical pressing attributes (color, weight, limitation) in `variant`.
-6. NEVER hallucinate or infer artists/titles not present in the post.
+Rules:
+1. Non-Release / Generic Posts -> Return empty `releases: []`:
+   - Community discussions, questions, or polls (e.g. "[Discussion] ...")
+   - In-Search-Of requests (e.g. "[ISO] ...")
+   - Store sales or generic restock announcements that do NOT name specific album titles (e.g. "VMP Restocks: Artist A, Artist B", "Target Buy 2 Get 1 Free Sale")
+   
+2. Specific Release Announcements -> Extract each release:
+   - `artists`: List of individual artist/band names. For splits ('A / B') or collaborations ('A & B', 'A feat. B'), extract each artist as a separate list item. Keep multi-word/comma artist names intact (e.g. ["Tyler, The Creator"]).
+   - `combined_artist`: For multi-artist releases, provide the collaborative billing string (e.g. "Converge / Dropdead", "Kanye West & Ty Dolla $ign"). For single artist releases, provide the single artist name.
+   - `album_title`: Clean title of the album/single. Never hallucinate an album title if none is specified in the post.
+   - `variant`: The physical pressing variant details (e.g. "Opaque Emerald LP", "180g 45RPM 2LP Box", "Pink /500", "Clear Zoetrope").
+   - `retailer`: Exclusive seller or store if mentioned (e.g. "Blood Records", "Target", "Rough Trade", "VMP").
+
+3. Strict Anti-Hallucination:
+   - Only extract information explicitly stated in the post title. Do NOT guess or hallucinate missing album titles or artists.
 - "Restock: Artist - Album (Variant details)"
 - "Artist - Album | Exclusive /500"
 

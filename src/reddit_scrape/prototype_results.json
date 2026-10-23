@@ -2,13 +2,11 @@
   {
     "case": {
       "id": "canonical",
-      "category": "Canonical Subreddit Rule #3",
+      "category": "Canonical Post",
       "title": "Fontaines D.C. - Romance (Opaque Emerald LP) [$32.99]",
-      "expected_release": true,
-      "desc": "Standard title with price to strip and variant to capture."
+      "desc": "Standard single artist release with colorway variant."
     },
     "result": {
-      "is_vinyl_release": true,
       "releases": [
         {
           "artists": [
@@ -19,21 +17,18 @@
           "variant": "Opaque Emerald LP",
           "retailer": null
         }
-      ],
-      "reasoning": "Specific album release with artist, title, and colorway variant. Price is not a retailer, so retailer left null."
+      ]
     },
     "error": null
   },
   {
     "case": {
       "id": "preorder_variant",
-      "category": "Pre-Order & Variant with Limitation",
+      "category": "Pre-Order & Retailer Exclusive",
       "title": "[Pre-Order] [10/24] Charli XCX - Brat (Translucent Black Ice Vinyl /2000) [Rough Trade]",
-      "expected_release": true,
-      "desc": "Variant captures translucent black ice and /2000 limitation text cleanly."
+      "desc": "Variant captures translucent black ice and /2000 limitation text, retailer Rough Trade."
     },
     "result": {
-      "is_vinyl_release": true,
       "releases": [
         {
           "artists": [
@@ -44,8 +39,7 @@
           "variant": "Translucent Black Ice Vinyl /2000",
           "retailer": "Rough Trade"
         }
-      ],
-      "reasoning": "Post announces a specific pre-order for Charli XCX's 'Brat' with named variant and exclusive retailer."
+      ]
     },
     "error": null
   },
@@ -54,11 +48,9 @@
       "id": "audiophile_weight",
       "category": "Audiophile Weight Variant (180g / 45RPM)",
       "title": "Miles Davis \u2013 Kind of Blue (Mobile Fidelity 180g 45RPM 2LP Box)",
-      "expected_release": true,
-      "desc": "Tests non-color physical variant (180g, 45RPM, box)."
+      "desc": "Non-color physical variant (180g, 45RPM, box)."
     },
     "result": {
-      "is_vinyl_release": true,
       "releases": [
         {
           "artists": [
@@ -69,8 +61,7 @@
           "variant": "180g 45RPM 2LP Box",
           "retailer": "Mobile Fidelity"
         }
-      ],
-      "reasoning": "Title announces a specific album release: Miles Davis' \"Kind of Blue\" as a Mobile Fidelity 180g 45RPM 2LP box set."
+      ]
     },
     "error": null
   },
@@ -79,11 +70,9 @@
       "id": "multi_artist_split",
       "category": "Multi-Artist Split Release",
       "title": "Converge / Dropdead - Split (7\" /500)",
-      "expected_release": true,
       "desc": "Split release: individual artists ['Converge', 'Dropdead'] and combined 'Converge / Dropdead'."
     },
     "result": {
-      "is_vinyl_release": true,
       "releases": [
         {
           "artists": [
@@ -95,8 +84,7 @@
           "variant": "7\" /500",
           "retailer": null
         }
-      ],
-      "reasoning": "Specific split 7\" release with stated limitation of 500 copies; identified both artists separately and the title \"Split\". No retailer mentioned."
+      ]
     },
     "error": null
   },
@@ -105,11 +93,9 @@
       "id": "multi_artist_collab",
       "category": "Multi-Artist Collaboration",
       "title": "Kanye West & Ty Dolla $ign - Vultures 1 (Black 2LP)",
-      "expected_release": true,
       "desc": "Collaboration: individual artists ['Kanye West', 'Ty Dolla $ign'] and combined relation."
     },
     "result": {
-      "is_vinyl_release": true,
       "releases": [
         {
           "artists": [
@@ -121,8 +107,7 @@
           "variant": "Black 2LP",
           "retailer": null
         }
-      ],
-      "reasoning": "Title announces a specific album release with artist, title, and pressing variant (Black 2LP). Collaboration billed with '&', so artists split into two entries."
+      ]
     },
     "error": null
   },
@@ -131,11 +116,9 @@
       "id": "comma_artist_restock",
       "category": "Internal Comma in Artist with Specific Album",
       "title": "RESTOCK: Tyler, The Creator - IGOR (Mint Green Special Edition LP)",
-      "expected_release": true,
-      "desc": "Valid restock because specific album 'IGOR' is announced."
+      "desc": "Specific album 'IGOR' restock with pressing variant."
     },
     "result": {
-      "is_vinyl_release": true,
       "releases": [
         {
           "artists": [
@@ -146,8 +129,7 @@
           "variant": "Mint Green Special Edition LP",
           "retailer": null
         }
-      ],
-      "reasoning": "The post announces a restock of a specific named album (IGOR by Tyler, The Creator) with a pressing variant (Mint Green Special Edition LP). \"Restock\" alone is generic, but since a specific album title is named, it qualifies as a vinyl release."
+      ]
     },
     "error": null
   },
@@ -156,11 +138,9 @@
       "id": "hyphen_band",
       "category": "Hyphen in Band Name",
       "title": "blink-182 - Enema of the State",
-      "expected_release": true,
-      "desc": "Artist is 'blink-182' without breaking on hyphen."
+      "desc": "Band name 'blink-182' intact."
     },
     "result": {
-      "is_vinyl_release": true,
       "releases": [
         {
           "artists": [
@@ -171,8 +151,7 @@
           "variant": null,
           "retailer": null
         }
-      ],
-      "reasoning": "Title follows the standard \"Artist - Album\" format and names a specific album, so it's a release announcement. No variant or retailer info provided."
+      ]
     },
     "error": null
   },
@@ -181,11 +160,9 @@
       "id": "numbered_zoetrope",
       "category": "Zoetrope & Retailer Exclusive",
       "title": "The 1975 - Live at Gorilla (Clear 2LP, Hand-Numbered /500) [Blood Records Zoetrope]",
-      "expected_release": true,
-      "desc": "Retailer 'Blood Records', variant captures clear 2LP and numbered /500 zoetrope."
+      "desc": "Retailer 'Blood Records', variant captures clear 2LP, hand-numbered /500, zoetrope."
     },
     "result": {
-      "is_vinyl_release": true,
       "releases": [
         {
           "artists": [
@@ -193,71 +170,58 @@
           ],
           "combined_artist": "The 1975",
           "album_title": "Live at Gorilla",
-          "variant": "Clear 2LP, Hand-Numbered /500, Zoetrope",
+          "variant": "Clear 2LP, Hand-Numbered /500",
           "retailer": "Blood Records"
         }
-      ],
-      "reasoning": "Post title announces a specific album with identifiable title and pressing details; single artist release."
+      ]
     },
     "error": null
   },
   {
     "case": {
       "id": "generic_restock_ignore",
-      "category": "Generic Restock (No Albums Named) -> IGNORED",
+      "category": "Generic Restock (No Albums Named) -> Ignored",
       "title": "VMP Restocks: Fiona Apple, Outkast, The Mars Volta, DMX",
-      "expected_release": false,
-      "desc": "Should be ignored (is_vinyl_release=False, 0 releases) because no specific album titles are announced."
+      "desc": "No specific album titles -> returns empty releases: []."
     },
     "result": {
-      "is_vinyl_release": false,
-      "releases": [],
-      "reasoning": "Generic VMP restock announcement listing artists without any specific album titles; per rules this is not a specific vinyl release announcement."
+      "releases": []
     },
     "error": null
   },
   {
     "case": {
       "id": "storefront_sale_ignore",
-      "category": "Storefront Sale (No Albums Named) -> IGNORED",
+      "category": "Storefront Sale (No Albums Named) -> Ignored",
       "title": "Target Buy 2 Get 1 Free Sale on All Vinyl Records",
-      "expected_release": false,
-      "desc": "Store discount announcement without specific releases."
+      "desc": "Store discount announcement -> returns empty releases: []."
     },
     "result": {
-      "is_vinyl_release": false,
-      "releases": [],
-      "reasoning": "This is a generic storefront sale announcement (Target buy 2 get 1 free) with no specific album titles or artists named, so it is not a vinyl release announcement."
+      "releases": []
     },
     "error": null
   },
   {
     "case": {
       "id": "discussion_ignore",
-      "category": "Community Discussion -> IGNORED",
+      "category": "Community Discussion -> Ignored",
       "title": "[Discussion] What's your favorite pressing of In Rainbows?",
-      "expected_release": false,
-      "desc": "Community discussion filter."
+      "desc": "Community discussion -> returns empty releases: []."
     },
     "result": {
-      "is_vinyl_release": false,
-      "releases": [],
-      "reasoning": "Post is a [Discussion] question asking about favorite pressings of an album, not an announcement of a specific vinyl release."
+      "releases": []
     },
     "error": null
   },
   {
     "case": {
       "id": "iso_ignore",
-      "category": "In Search Of ([ISO]) -> IGNORED",
+      "category": "In Search Of ([ISO]) -> Ignored",
       "title": "[ISO] Looking for Blonde by Frank Ocean (Official Black Friday edition)",
-      "expected_release": false,
-      "desc": "Secondary marketplace request filter."
+      "desc": "Secondary marketplace request -> returns empty releases: []."
     },
     "result": {
-      "is_vinyl_release": false,
-      "releases": [],
-      "reasoning": "The post is an In-Search-Of ([ISO]) request, not an announcement of a vinyl release."
+      "releases": []
     },
     "error": null
   }
