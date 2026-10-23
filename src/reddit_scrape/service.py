@@ -146,14 +146,22 @@ class PollerService:
         self.hot_limit = hot_limit
 
         self._shutdown_event = threading.Event()
+        self._extraction_trigger = threading.Event()
+        self._extraction_lock = threading.Lock()
+        self._extraction_thread: Optional[threading.Thread] = None
 
     def stop(self) -> None:
         """Signal the poller service to initiate graceful termination."""
         self._shutdown_event.set()
+        self._extraction_trigger.set()
 
     def is_shutdown_requested(self) -> bool:
         """Return True if termination signal has been received."""
         return self._shutdown_event.is_set()
+
+    def trigger_extraction(self) -> None:
+        """Signal the background extraction worker that unextracted submissions are ready."""
+        self._extraction_trigger.set()
 
     def register_signal_handlers(self) -> None:
         """Register graceful shutdown handlers for SIGINT and SIGTERM."""
@@ -211,43 +219,44 @@ class PollerService:
         self, batch_size: Optional[int] = None
     ) -> int:
         """Query and process unextracted submissions through extraction and persistence."""
-        with self.session_factory() as session:
-            stmt = (
-                select(Submission.id, Submission.title, Submission.flair)
-                .where(
-                    Submission.is_extracted.is_(False),
-                    Submission.is_release.is_(True),
+        with self._extraction_lock:
+            with self.session_factory() as session:
+                stmt = (
+                    select(Submission.id, Submission.title, Submission.flair)
+                    .where(
+                        Submission.is_extracted.is_(False),
+                        Submission.is_release.is_(True),
+                    )
+                    .order_by(Submission.created_utc.asc())
                 )
-                .order_by(Submission.created_utc.asc())
-            )
-            if batch_size is not None:
-                stmt = stmt.limit(batch_size)
-            candidates = session.execute(stmt).all()
+                if batch_size is not None:
+                    stmt = stmt.limit(batch_size)
+                candidates = session.execute(stmt).all()
 
-        if not candidates:
-            return 0
+            if not candidates:
+                return 0
 
-        extracted_count = 0
-        for sub_id, title, flair in candidates:
-            if self._shutdown_event.is_set():
-                logger.info("Shutdown requested, pausing extraction queue.")
-                break
+            extracted_count = 0
+            for sub_id, title, flair in candidates:
+                if self._shutdown_event.is_set():
+                    logger.info("Shutdown requested, pausing extraction queue.")
+                    break
 
-            try:
-                extraction_result = self._extract(title, flair)
-                self.persistence_service.persist(
-                    submission_id=sub_id,
-                    releases=extraction_result,
-                )
-                extracted_count += 1
-            except Exception as exc:
-                logger.error(
-                    "Failed extraction or persistence for submission %s: %s",
-                    sub_id,
-                    exc,
-                )
+                try:
+                    extraction_result = self._extract(title, flair)
+                    self.persistence_service.persist(
+                        submission_id=sub_id,
+                        releases=extraction_result,
+                    )
+                    extracted_count += 1
+                except Exception as exc:
+                    logger.error(
+                        "Failed extraction or persistence for submission %s: %s",
+                        sub_id,
+                        exc,
+                    )
 
-        return extracted_count
+            return extracted_count
 
     def poll_and_extract_cycle(
         self,
@@ -276,8 +285,31 @@ class PollerService:
         """Run a single poll & extract cycle and return summary statistics."""
         return self.poll_and_extract_cycle(new_limit=new_limit, hot_limit=hot_limit)
 
+    def _extraction_worker_loop(self) -> None:
+        """Background extraction worker thread decoupled from ingestion polling."""
+        logger.info("Extraction background worker thread started.")
+        while not self._shutdown_event.is_set():
+            # Wait for signal or periodic timeout to check unextracted queue
+            self._extraction_trigger.wait(timeout=2.0)
+            self._extraction_trigger.clear()
+            if self._shutdown_event.is_set():
+                break
+
+            try:
+                extracted = self.process_unextracted_submissions()
+                if extracted > 0:
+                    logger.info(
+                        "Extracted and persisted %d release submissions in background",
+                        extracted,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "Error processing unextracted submissions in background: %s",
+                    exc,
+                )
+
     def run(self) -> None:
-        """Start the continuous background ingestion poller and extraction loop."""
+        """Start the continuous background ingestion poller with decoupled asynchronous extraction."""
         self.register_signal_handlers()
         logger.info(
             "Starting PollerService (new_interval=%ss, hot_interval=%ss)",
@@ -285,12 +317,22 @@ class PollerService:
             self.hot_poll_interval_seconds,
         )
 
-        # Run initial cycle on startup
+        # Start decoupled background extraction worker thread
+        self._extraction_thread = threading.Thread(
+            target=self._extraction_worker_loop,
+            name="ExtractionWorker",
+            daemon=True,
+        )
+        self._extraction_thread.start()
+
+        # Run initial discovery and tracking polls on startup
         try:
             logger.info("Executing initial discovery and tracking poll cycle...")
-            self.poll_and_extract_cycle()
+            self.poll_new()
+            self.poll_hot()
+            self.trigger_extraction()
         except Exception as exc:
-            logger.error("Error during initial poll and extract cycle: %s", exc)
+            logger.error("Error during initial poll cycle: %s", exc)
 
         last_new_poll = time.time()
         last_hot_poll = time.time()
@@ -301,13 +343,12 @@ class PollerService:
                     break
 
                 now = time.time()
-                did_poll = False
 
                 if now - last_new_poll >= self.poll_interval_seconds:
                     try:
                         logger.info("Executing discovery poll (/new)...")
                         self.poll_new()
-                        did_poll = True
+                        self.trigger_extraction()
                     except Exception as exc:
                         logger.error("Error during discovery poll (/new): %s", exc)
                     last_new_poll = time.time()
@@ -316,28 +357,17 @@ class PollerService:
                     try:
                         logger.info("Executing tracking poll (/hot)...")
                         self.poll_hot()
-                        did_poll = True
+                        self.trigger_extraction()
                     except Exception as exc:
                         logger.error("Error during tracking poll (/hot): %s", exc)
                     last_hot_poll = time.time()
-
-                if did_poll and not self._shutdown_event.is_set():
-                    try:
-                        extracted = self.process_unextracted_submissions()
-                        if extracted > 0:
-                            logger.info(
-                                "Extracted and persisted %d release submissions",
-                                extracted,
-                            )
-                    except Exception as exc:
-                        logger.error(
-                            "Error processing unextracted submissions: %s", exc
-                        )
 
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt received in run loop.")
         finally:
             self.stop()
+            if self._extraction_thread and self._extraction_thread.is_alive():
+                self._extraction_thread.join(timeout=5.0)
             logger.info("PollerService stopped cleanly.")
 
 

@@ -50,6 +50,10 @@ def test_filter_non_release_flairs():
     for valid_flair in ["Pre-Order", "New Release", "Restock", "Repress", "Vinyl", None]:
         assert should_ingest_submission("Some Title", valid_flair) is True
 
+    # Arbitrary keywords like PSA, warning, help are not filtered at ingestion stage
+    for non_filtered_title in ["[PSA] Release Delayed", "[Warning] Bootleg alert", "Help wanted", "Survey on vinyl"]:
+        assert should_ingest_submission(non_filtered_title, None) is True
+
 
 def test_ingest_new_submission_persists_submission_and_snapshot(session_factory):
     """Verify idempotent insert sets is_extracted=False, is_release=True, and appends a snapshot."""
@@ -217,7 +221,7 @@ def test_ingest_conflict_preserves_is_extracted_status(session_factory):
         assert sub.is_extracted is True
 
 
-def test_ingest_stream_skips_non_release_posts(session_factory):
+def test_ingest_stream_skips_non_release_submissions(session_factory):
     """Verify batch ingestion skips non-release flairs while persisting valid releases."""
     ingester = SubmissionIngester(session_factory)
     created_dt = datetime.now(timezone.utc)

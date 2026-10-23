@@ -26,7 +26,6 @@ def normalize_attribute(val: Optional[str], default_token: Optional[str] = None)
     """Normalize release metadata attribute for deterministic fingerprinting.
 
     Lowercases, collapses whitespace, normalizes unicode dashes to standard hyphens,
-    strips punctuation (retaining hyphens, alphanumeric characters, and whitespace),
     and falls back to default_token if empty or missing.
     """
     if val is None:
@@ -42,9 +41,6 @@ def normalize_attribute(val: Optional[str], default_token: Optional[str] = None)
 
     # Normalize unicode dashes (\u2010-\u2015 and \u2212) to standard ASCII hyphen
     cleaned = re.sub(r"[\u2010-\u2015\u2212]", "-", raw)
-
-    # Strip punctuation (excluding hyphens, word characters, and whitespace)
-    cleaned = re.sub(r"[^\w\s\-]", "", cleaned)
 
     # Collapse multiple whitespaces and lowercase
     cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
@@ -98,6 +94,7 @@ def persist_extracted_releases(
         release_items = list(releases)
 
     if not release_items:
+        sub.is_release = False
         sub.is_extracted = True
         sub.updated_at = func.now()
         session.flush()
@@ -146,15 +143,11 @@ def persist_extracted_releases(
         )
 
         for art_name in artist_names:
-            art_stmt = (
-                pg_insert(Artist)
-                .values(name=art_name)
-                .on_conflict_do_update(
-                    index_elements=[Artist.name],
-                    set_={"name": pg_insert(Artist).excluded.name},
-                )
-                .returning(Artist.id)
-            )
+            art_stmt = pg_insert(Artist).values(name=art_name)
+            art_stmt = art_stmt.on_conflict_do_update(
+                index_elements=[Artist.name],
+                set_={"name": art_stmt.excluded.name},
+            ).returning(Artist.id)
             art_id = session.execute(art_stmt).scalar_one()
 
             ra_stmt = (

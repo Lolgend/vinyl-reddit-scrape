@@ -412,6 +412,68 @@ class TestGracefulShutdown:
 
         assert service.is_shutdown_requested()
 
+    def test_asynchronous_extraction_decoupled_from_polling(self, session_factory):
+        """Verify LLM extraction executes in a decoupled background worker without blocking poller loop."""
+        import time
+
+        created_now = datetime.now(timezone.utc)
+        sub = RawSubmission(
+            id="async_rel_1",
+            title="Slow Artist - Async LP",
+            url="https://reddit.com/r/vinylreleases/async1",
+            permalink="/r/vinylreleases/comments/async1",
+            created_utc=created_now,
+            fullname="t3_async_rel_1",
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_new.return_value = [sub]
+        mock_adapter.fetch_hot.return_value = []
+
+        mock_worker = MagicMock()
+
+        # Simulate LLM API latency
+        def slow_extract(title, flair=None):
+            time.sleep(0.2)
+            return ExtractionResult(
+                releases=[
+                    ExtractedRelease(
+                        artists=["Slow Artist"],
+                        combined_artist="Slow Artist",
+                        album_title="Async LP",
+                    )
+                ]
+            )
+
+        mock_worker.extract = MagicMock(side_effect=slow_extract)
+
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=mock_worker,
+            poll_interval_seconds=1,
+            hot_poll_interval_seconds=1,
+        )
+
+        # Run service in background thread
+        poller_thread = threading.Thread(target=service.run, daemon=True)
+        poller_thread.start()
+
+        # Wait briefly for initial poll and background extraction to trigger and finish
+        time.sleep(0.6)
+        service.stop()
+        poller_thread.join(timeout=3.0)
+
+        # Verify release was extracted by the background worker
+        with session_factory() as session:
+            persisted_sub = session.get(Submission, "t3_async_rel_1")
+            assert persisted_sub is not None
+            assert persisted_sub.is_extracted is True
+
+            rel = session.execute(select(Release)).scalars().all()
+            assert len(rel) == 1
+            assert rel[0].album_title == "Async LP"
+
 
 class TestCliRunner:
     """Test CLI subcommand `run` invocation and flags."""

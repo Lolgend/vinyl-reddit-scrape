@@ -21,13 +21,13 @@ NON_RELEASE_FLAIRS: Set[str] = {
 }
 
 NON_RELEASE_TITLE_PATTERN = re.compile(
-    r"^\s*\[?(?:discussion|iso|question|psa|warning|help|survey|meta|advice|collection)\]?",
+    r"^\s*\[(?:discussion|iso|question|advice|collection)\]",
     re.IGNORECASE,
 )
 
 
 def should_ingest_submission(title: str, flair: Optional[str]) -> bool:
-    """Check whether a submission should be ingested based on flair and title patterns."""
+    """Check whether a submission should be ingested based on non-release flairs."""
     if flair and flair.strip().lower() in NON_RELEASE_FLAIRS:
         return False
 
@@ -35,6 +35,15 @@ def should_ingest_submission(title: str, flair: Optional[str]) -> bool:
         return False
 
     return True
+
+
+def coerce_to_utc_datetime(val: Any) -> datetime:
+    """Convert a timestamp (epoch float/int) or datetime to a timezone-aware UTC datetime."""
+    if isinstance(val, (int, float)):
+        return datetime.fromtimestamp(val, tz=timezone.utc)
+    elif isinstance(val, datetime):
+        return val if val.tzinfo is not None else val.replace(tzinfo=timezone.utc)
+    raise ValueError(f"Invalid created_utc format: {val}")
 
 
 @dataclass
@@ -57,11 +66,7 @@ class RawSubmission:
 
     def get_created_utc_datetime(self) -> datetime:
         """Convert created_utc to a timezone-aware UTC datetime."""
-        if isinstance(self.created_utc, (int, float)):
-            return datetime.fromtimestamp(self.created_utc, tz=timezone.utc)
-        elif self.created_utc.tzinfo is None:
-            return self.created_utc.replace(tzinfo=timezone.utc)
-        return self.created_utc
+        return coerce_to_utc_datetime(self.created_utc)
 
 
 @dataclass
@@ -185,20 +190,13 @@ class RedditSourceAdapter:
         if isinstance(item, RawSubmission):
             return item
 
-        def _to_dt(val: Any) -> datetime:
-            if isinstance(val, (int, float)):
-                return datetime.fromtimestamp(val, tz=timezone.utc)
-            elif isinstance(val, datetime):
-                return val if val.tzinfo is not None else val.replace(tzinfo=timezone.utc)
-            raise ValueError(f"Invalid created_utc format: {val}")
-
         if isinstance(item, dict):
             return RawSubmission(
                 id=item["id"],
                 title=item["title"],
                 url=item["url"],
                 permalink=item["permalink"],
-                created_utc=_to_dt(item["created_utc"]),
+                created_utc=coerce_to_utc_datetime(item["created_utc"]),
                 score=item.get("score", 0),
                 upvote_ratio=item.get("upvote_ratio", 1.0),
                 num_comments=item.get("num_comments", 0),
@@ -219,7 +217,7 @@ class RedditSourceAdapter:
             title=item.title,
             url=item.url,
             permalink=item.permalink,
-            created_utc=_to_dt(item.created_utc),
+            created_utc=coerce_to_utc_datetime(item.created_utc),
             score=getattr(item, "score", 0),
             upvote_ratio=getattr(item, "upvote_ratio", 1.0),
             num_comments=getattr(item, "num_comments", 0),

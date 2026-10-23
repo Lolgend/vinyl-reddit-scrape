@@ -92,21 +92,25 @@ class TestReleaseFingerprint:
         assert fp1 == fp2
         assert len(fp1) == 64
 
-    def test_punctuation_stripping(self):
-        """Punctuation like commas and quotes are stripped so equivalent titles match."""
+    def test_punctuation_preservation(self):
+        """Punctuation like '/', '&', and commas are preserved in normalized attributes and fingerprints."""
+        assert normalize_attribute("Pink /500") == "pink /500"
+        assert normalize_attribute("Converge / Dropdead") == "converge / dropdead"
+        assert normalize_attribute("Tyler, The Creator") == "tyler, the creator"
+
         fp1 = compute_release_fingerprint(
             combined_artist="Tyler, The Creator",
             album_title="IGOR",
-            variant="Mint Vinyl",
+            variant="Pink /500",
             retailer="Golf Wang",
         )
         fp2 = compute_release_fingerprint(
             combined_artist="Tyler The Creator",
             album_title="IGOR",
-            variant="Mint Vinyl",
+            variant="Pink 500",
             retailer="Golf Wang",
         )
-        assert fp1 == fp2
+        assert fp1 != fp2
 
     def test_unicode_dash_normalization(self):
         """Unicode dashes (\u2013, \u2014, etc.) normalize to hyphen."""
@@ -294,6 +298,7 @@ class TestReleasePersistence:
         with session_factory() as session:
             sub = session.get(Submission, "sub_disc")
             assert sub.is_extracted is True
+            assert sub.is_release is False
 
             releases = session.execute(select(Release)).scalars().all()
             assert len(releases) == 0
