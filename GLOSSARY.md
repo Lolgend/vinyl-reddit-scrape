@@ -13,8 +13,16 @@ A point-in-time timestamped observation of a submission's engagement metrics (sc
 _Avoid_: Metric check, poll log, vote record
 
 **Release**:
-A distinct vinyl record product or edition announced to the public, identified by artist, album title, format/variant, and retailer.
+A distinct vinyl record product or edition announced to the public, identified by artist(s), album title, variant, and retailer.
 _Avoid_: Record, vinyl, drop, product, item
+
+**Artist**:
+An individual musical creator, performer, composer, or band contributing to a release. Multi-artist releases associate each contributing artist individually alongside a combined billing.
+_Avoid_: Creator, musician, singer
+
+**Combined Artist**:
+The collaborative or split billing representation of multiple artists on a single release (e.g., `Converge / Dropdead` or `Kanye West & Ty Dolla $ign`).
+_Avoid_: Dual artist, joint name, multi-band
 
 **Variant**:
 A specific physical pressing variation of a release, such as color pressing, weight (e.g., 180g), or limited edition count.

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DeepSeek PydanticAI Extraction Prototype</title>
+  <title>DeepSeek PydanticAI Extraction Prototype (Refined)</title>
   <style>
     :root {
       --bg: #0d1117;
@@ -289,7 +289,7 @@
 
   <header>
     <div style="display: flex; justify-content: space-between; align-items: baseline;">
-      <h1>DeepSeek PydanticAI Extraction Prototype</h1>
+      <h1>DeepSeek PydanticAI Extraction Prototype (Refined)</h1>
       <span class="badge badge-purple">Wayfinder #5 Prototype</span>
     </div>
     <div class="question-box">
@@ -330,7 +330,7 @@
         <span class="field-val" id="state-clean-title">-</span>
       </div>
       <div class="field-row">
-        <span class="field-label">Is Vinyl Release?</span>
+        <span class="field-label">Is Specific Vinyl Release?</span>
         <span class="field-val" id="state-is-release">-</span>
       </div>
       <div class="field-row">
@@ -338,8 +338,8 @@
         <span class="field-val" id="state-releases-count">0</span>
       </div>
       <div class="field-row">
-        <span class="field-label">Hallucination Audit</span>
-        <span class="field-val" id="state-hallucination-audit"><span class="badge badge-green">Clean</span></span>
+        <span class="field-label">Noise / Album Check</span>
+        <span class="field-val" id="state-noise-check"><span class="badge badge-green">Valid Specific Release</span></span>
       </div>
       <div class="field-row">
         <span class="field-label">LLM Extraction Reasoning</span>
@@ -357,12 +357,12 @@
     <!-- Inspector & Raw JSON -->
     <div class="card">
       <h2>
-        <span>Schema Validation (ExtractedRelease)</span>
+        <span>Schema Validation (Refined ExtractedRelease)</span>
         <span class="highlight-pill" id="current-step-label">Step 1: Ingestion</span>
       </h2>
 
       <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 10px;">
-        State representation passed to downstream PostgreSQL persistence models (<code>releases</code> and <code>submission_releases</code>):
+        State representation passed to PostgreSQL persistence models (<code>releases</code>, <code>artists</code>, <code>release_artists</code>, <code>submission_releases</code>):
       </div>
 
       <pre id="json-preview">{}</pre>
@@ -388,114 +388,92 @@
      * Pure extraction & state transformation module matching prototype_extractor.py
      */
     const PrototypeModule = (function() {
-      // In-memory empirical evaluation cache captured from live DeepSeek test runs
       const benchmarkData = {
-        "split_release": {
+        "multi_artist_split": {
           title: 'Converge / Dropdead - Split (7" /500)',
-          category: "Multi-Artist / Split Release",
-          desc: "Validates that split albums between two bands are formatted without hallucinating or dropping either artist, parsing limitation /500.",
+          category: "Multi-Artist Split Release",
+          desc: "Tags individual contributing artists ['Converge', 'Dropdead'] and creates combined billing 'Converge / Dropdead', capturing variant '7\" /500'.",
           clean: 'Converge / Dropdead - Split (7" /500)',
           is_vinyl_release: true,
           releases: [
             {
-              artist: "Converge / Dropdead",
+              artists: ["Converge", "Dropdead"],
+              combined_artist: "Converge / Dropdead",
               album_title: "Split",
-              format_variant: '7" /500',
-              color_variant: null,
-              limitation_count: 500,
-              retailer: null,
-              is_soundtrack: false,
-              release_type: "unknown",
-              confidence: 0.92
+              variant: '7" /500',
+              retailer: null
             }
           ],
-          reasoning: "Title announces a vinyl release: split 7\" between Converge and Dropdead, limited to 500. Artist joined with '/' per split-release convention."
+          reasoning: "Specific split 7\" release with stated limitation of 500 copies; identified both artists separately and the title 'Split'."
         },
-        "hyphen_band": {
-          title: "blink-182 - Enema of the State",
-          category: "Hyphen in Band Name",
-          desc: "Proves that standard regex delimiter splitting (' - ') does NOT break bands with internal hyphens (blink-182).",
-          clean: "blink-182 - Enema of the State",
+        "multi_artist_collab": {
+          title: "Kanye West & Ty Dolla $ign - Vultures 1 (Black 2LP)",
+          category: "Multi-Artist Collaboration",
+          desc: "Extracts individual artists ['Kanye West', 'Ty Dolla $ign'] alongside combined billing 'Kanye West & Ty Dolla $ign', with variant 'Black 2LP'.",
+          clean: "Kanye West & Ty Dolla $ign - Vultures 1 (Black 2LP)",
           is_vinyl_release: true,
           releases: [
             {
-              artist: "blink-182",
-              album_title: "Enema of the State",
-              format_variant: null,
-              color_variant: null,
-              limitation_count: null,
-              retailer: null,
-              is_soundtrack: false,
-              release_type: "unknown",
-              confidence: 0.75
+              artists: ["Kanye West", "Ty Dolla $ign"],
+              combined_artist: "Kanye West & Ty Dolla $ign",
+              album_title: "Vultures 1",
+              variant: "Black 2LP",
+              retailer: null
             }
           ],
-          reasoning: "Treated as a vinyl release announcement with low specificity; artist correctly identified as 'blink-182' rather than splitting on the internal hyphen."
+          reasoning: "Title announces a specific album release with collaboration billed with '&', so artists are split into individual tags and combined display."
         },
-        "game_ost": {
-          title: "The Elder Scrolls IV: Oblivion (Game Soundtrack) (Oblivion Gate Orange 2LP)",
-          category: "Video Game OST (No Artist Delimiter)",
-          desc: "Tests OST titles where no artist delimiter exists. The model flags is_soundtrack=true and assigns 'Various Artists' without hallucinating a non-existent composer.",
-          clean: "The Elder Scrolls IV: Oblivion (Game Soundtrack) (Oblivion Gate Orange 2LP)",
+        "audiophile_weight": {
+          title: "Miles Davis – Kind of Blue (Mobile Fidelity 180g 45RPM 2LP Box)",
+          category: "Audiophile Weight Variant (180g / 45RPM)",
+          desc: "Verifies unified 'variant' field capturing non-color pressing specifications: 180g, 45RPM, 2LP Box.",
+          clean: "Miles Davis - Kind of Blue (Mobile Fidelity 180g 45RPM 2LP Box)",
           is_vinyl_release: true,
           releases: [
             {
-              artist: "Various Artists",
-              album_title: "The Elder Scrolls IV: Oblivion (Game Soundtrack)",
-              format_variant: "Oblivion Gate Orange 2LP",
-              color_variant: "Oblivion Gate Orange",
-              limitation_count: null,
-              retailer: null,
-              is_soundtrack: true,
-              release_type: "unknown",
-              confidence: 0.90
+              artists: ["Miles Davis"],
+              combined_artist: "Miles Davis",
+              album_title: "Kind of Blue",
+              variant: "180g 45RPM 2LP Box",
+              retailer: "Mobile Fidelity"
             }
           ],
-          reasoning: "Title announces a video game soundtrack vinyl variant (Oblivion Gate Orange 2LP). No composer named, so used 'Various Artists' with is_soundtrack=True."
+          reasoning: "Title announces a specific album release: Miles Davis' 'Kind of Blue' as a Mobile Fidelity 180g 45RPM 2LP box set."
         },
-        "zoetrope_numbered": {
-          title: "The 1975 - Live at Gorilla (Clear 2LP, Hand-Numbered /500) [Blood Records Zoetrope]",
-          category: "Numbered Zoetrope & Retailer Exclusive",
-          desc: "Extracts hand-numbered /500 limitation, retailer Blood Records, and format details.",
-          clean: "The 1975 - Live at Gorilla (Clear 2LP, Hand-Numbered /500) [Blood Records Zoetrope]",
+        "comma_artist_restock": {
+          title: "RESTOCK: Tyler, The Creator - IGOR (Mint Green Special Edition LP)",
+          category: "Restock with Specific Album Announced",
+          desc: "Restock notification that names a specific album ('IGOR') is retained. Preserves internal comma in 'Tyler, The Creator'.",
+          clean: "RESTOCK: Tyler, The Creator - IGOR (Mint Green Special Edition LP)",
           is_vinyl_release: true,
           releases: [
             {
-              artist: "The 1975",
-              album_title: "Live at Gorilla",
-              format_variant: "Clear 2LP, Hand-Numbered /500",
-              color_variant: "Clear",
-              limitation_count: 500,
-              retailer: "Blood Records",
-              is_soundtrack: false,
-              release_type: "new_release",
-              confidence: 0.97
+              artists: ["Tyler, The Creator"],
+              combined_artist: "Tyler, The Creator",
+              album_title: "IGOR",
+              variant: "Mint Green Special Edition LP",
+              retailer: null
             }
           ],
-          reasoning: "Clear vinyl announcement with pressing info. '/500' parsed to limitation_count 500. Retailer 'Blood Records' from bracketed tag."
+          reasoning: "Restock announces a specific named album (IGOR) with variant (Mint Green). Qualifies as a valid vinyl release."
         },
-        "batch_dump": {
+        "generic_restock_ignore": {
           title: "VMP Restocks: Fiona Apple, Outkast, The Mars Volta, DMX",
-          category: "Batch Multi-Item Restock Dump",
-          desc: "Crucial edge case: Multiple releases in one post. Validates 1-to-many relationship (submission_releases) and ensures the model does NOT invent album names.",
+          category: "Generic Restock (No Albums Named) -> IGNORED",
+          desc: "Per Rule #1: Restock notices that do NOT mention specific albums are ignored (is_vinyl_release=false, 0 releases) to avoid empty/hallucinated rows.",
           clean: "VMP Restocks: Fiona Apple, Outkast, The Mars Volta, DMX",
-          is_vinyl_release: true,
-          releases: [
-            { artist: "Fiona Apple", album_title: "", color_variant: null, limitation_count: null, retailer: "VMP", is_soundtrack: false, release_type: "restock", confidence: 0.60 },
-            { artist: "Outkast", album_title: "", color_variant: null, limitation_count: null, retailer: "VMP", is_soundtrack: false, release_type: "restock", confidence: 0.60 },
-            { artist: "The Mars Volta", album_title: "", color_variant: null, limitation_count: null, retailer: "VMP", is_soundtrack: false, release_type: "restock", confidence: 0.60 },
-            { artist: "DMX", album_title: "", color_variant: null, limitation_count: null, retailer: "VMP", is_soundtrack: false, release_type: "restock", confidence: 0.60 }
-          ],
-          reasoning: "Batch VMP restock announcement listing artists only, no album titles given — left album_title empty rather than hallucinating titles. Split into four ExtractedRelease entries, one per artist."
+          is_vinyl_release: false,
+          releases: [],
+          reasoning: "Generic VMP restock announcement listing artists without any specific album titles; per rules this is not a specific vinyl release announcement."
         },
-        "discussion_noise": {
+        "discussion_ignore": {
           title: "[Discussion] What's your favorite pressing of In Rainbows?",
-          category: "Community Discussion Filter",
-          desc: "Validates Tier 1/2 noise filtration. Sets is_vinyl_release=false and returns 0 releases, preventing pollution of the releases catalog.",
+          category: "Community Discussion -> IGNORED",
+          desc: "Per Rule #1: Community discussions, questions, and ISO requests are ignored entirely.",
           clean: "[Discussion] What's your favorite pressing of In Rainbows?",
           is_vinyl_release: false,
           releases: [],
-          reasoning: "Title is tagged [Discussion] and asks for opinions on pressings of Radiohead's 'In Rainbows' rather than announcing a specific release, so no release data is extracted."
+          reasoning: "Post is a [Discussion] question asking about favorite pressings of an album, not an announcement of a specific vinyl release."
         }
       };
 
@@ -514,17 +492,17 @@
     /*
      * UI SHELL: Tabbed Guided Walkthroughs & State Rendering
      */
-    let currentScenarioKey = "split_release";
+    let currentScenarioKey = "multi_artist_split";
     let currentStep = 1;
     let currentState = {};
 
     const walkthroughKeys = [
-      "split_release",
-      "hyphen_band",
-      "game_ost",
-      "zoetrope_numbered",
-      "batch_dump",
-      "discussion_noise"
+      "multi_artist_split",
+      "multi_artist_collab",
+      "audiophile_weight",
+      "comma_artist_restock",
+      "generic_restock_ignore",
+      "discussion_ignore"
     ];
 
     function initUI() {
@@ -562,7 +540,6 @@
       currentScenarioKey = key;
       currentStep = 1;
 
-      // Update tab active classes
       document.querySelectorAll(".tab-btn").forEach((btn, i) => {
         btn.classList.toggle("active", walkthroughKeys[i] === key);
       });
@@ -575,7 +552,6 @@
         <div style="color: var(--text-muted);">${scenario.desc}</div>
       `;
 
-      // Render steps
       renderSteps();
       executeStep(1);
     }
@@ -645,8 +621,8 @@
           releases: scenario.releases,
           reasoning: scenario.reasoning
         };
-        document.getElementById("status-badge").className = "badge badge-green";
-        document.getElementById("status-badge").textContent = "Extracted";
+        document.getElementById("status-badge").className = scenario.is_vinyl_release ? "badge badge-green" : "badge badge-red";
+        document.getElementById("status-badge").textContent = scenario.is_vinyl_release ? "Extracted" : "Filtered Out";
         document.getElementById("current-step-label").textContent = "Step 3: LLM Inference";
       } else if (step === 4) {
         currentState = {
@@ -656,10 +632,12 @@
           is_vinyl_release: scenario.is_vinyl_release,
           releases: scenario.releases,
           reasoning: scenario.reasoning,
-          database_action: scenario.is_vinyl_release ? "Ready for INSERT into releases and submission_releases" : "Discarded / Flagged is_release = FALSE"
+          database_action: scenario.is_vinyl_release 
+            ? "Ready for INSERT into releases, artists, release_artists, and submission_releases" 
+            : "Discarded / Flagged submissions.is_release = FALSE"
         };
-        document.getElementById("status-badge").className = "badge badge-green";
-        document.getElementById("status-badge").textContent = "Validated";
+        document.getElementById("status-badge").className = scenario.is_vinyl_release ? "badge badge-green" : "badge badge-red";
+        document.getElementById("status-badge").textContent = scenario.is_vinyl_release ? "Validated" : "Filtered";
         document.getElementById("current-step-label").textContent = "Step 4: Relational Ready";
       }
 
@@ -671,27 +649,19 @@
       document.getElementById("state-clean-title").textContent = currentState.clean_title || "-";
       document.getElementById("state-is-release").textContent = 
         typeof currentState.is_vinyl_release === "boolean" 
-          ? (currentState.is_vinyl_release ? "YES (True)" : "NO (False)")
+          ? (currentState.is_vinyl_release ? "YES (Specific Album Release)" : "NO (Filtered Out / Ignored)")
           : currentState.is_vinyl_release;
       
       document.getElementById("state-releases-count").textContent = currentState.releases ? currentState.releases.length : 0;
       document.getElementById("state-reasoning").textContent = currentState.reasoning || "-";
 
-      // Hallucination check
-      let hasHallucination = false;
-      if (currentState.releases && currentState.releases.length > 0) {
-        currentState.releases.forEach(r => {
-          // If title was missing in prompt but hallucinated
-          if (currentScenarioKey === "batch_dump" && r.album_title.length > 0) {
-            hasHallucination = true;
-          }
-        });
-      }
-      const hallEl = document.getElementById("state-hallucination-audit");
-      if (hasHallucination) {
-        hallEl.innerHTML = '<span class="badge badge-red">HALLUCINATION DETECTED</span>';
+      const noiseEl = document.getElementById("state-noise-check");
+      if (currentState.is_vinyl_release === true) {
+        noiseEl.innerHTML = '<span class="badge badge-green">Specific Release Validated</span>';
+      } else if (currentState.is_vinyl_release === false) {
+        noiseEl.innerHTML = '<span class="badge badge-red">Ignored (Non-Specific / Discussion)</span>';
       } else {
-        hallEl.innerHTML = '<span class="badge badge-green">0 Hallucinations Verified</span>';
+        noiseEl.innerHTML = '<span class="badge badge-amber">Pending Check</span>';
       }
 
       // Render release entities
@@ -704,37 +674,28 @@
           const div = document.createElement("div");
           div.className = "release-box";
           div.innerHTML = `
-            <div class="release-title">#${idx + 1}: ${r.artist || "Unknown Artist"} - ${r.album_title || "(No Album Specified)"}</div>
+            <div class="release-title">#${idx + 1}: ${r.combined_artist || r.artists.join(', ')} - ${r.album_title}</div>
             <div class="field-row">
-              <span class="field-label">Color Variant:</span>
-              <span class="field-val">${r.color_variant || "None"}</span>
+              <span class="field-label">Individual Artists:</span>
+              <span class="field-val">${r.artists.map(a => `<span class="highlight-pill">${a}</span>`).join(' ')}</span>
             </div>
             <div class="field-row">
-              <span class="field-label">Limitation Count:</span>
-              <span class="field-val">${r.limitation_count ? r.limitation_count.toLocaleString() : "None"}</span>
+              <span class="field-label">Combined Billing:</span>
+              <span class="field-val">${r.combined_artist || "Single Artist"}</span>
+            </div>
+            <div class="field-row">
+              <span class="field-label">Variant:</span>
+              <span class="field-val">${r.variant || "Standard"}</span>
             </div>
             <div class="field-row">
               <span class="field-label">Retailer:</span>
               <span class="field-val">${r.retailer || "None"}</span>
-            </div>
-            <div class="field-row">
-              <span class="field-label">Soundtrack?</span>
-              <span class="field-val">${r.is_soundtrack ? "YES" : "NO"}</span>
-            </div>
-            <div class="field-row">
-              <span class="field-label">Release Event:</span>
-              <span class="field-val"><span class="badge badge-purple">${r.release_type}</span></span>
-            </div>
-            <div class="field-row">
-              <span class="field-label">Confidence:</span>
-              <span class="field-val">${(r.confidence * 100).toFixed(0)}%</span>
             </div>
           `;
           relContainer.appendChild(div);
         });
       }
 
-      // JSON preview
       document.getElementById("json-preview").textContent = JSON.stringify(currentState, null, 2);
     }
 
@@ -743,33 +704,29 @@
       if (!val) return;
 
       const cleaned = PrototypeModule.preClean(val);
+      const isNoise = val.toLowerCase().includes("[discussion]") || val.toLowerCase().includes("[iso]");
       currentState = {
         step: "Custom Exploration",
         raw_title: val,
         clean_title: cleaned,
-        is_vinyl_release: !val.toLowerCase().includes("[discussion]") && !val.toLowerCase().includes("[iso]"),
-        releases: [
+        is_vinyl_release: !isNoise,
+        releases: isNoise ? [] : [
           {
-            artist: "(Inference in live prototype_extractor.py)",
-            album_title: "(Run python prototype_extractor.py for live API)",
-            format_variant: "Parsed",
-            color_variant: "Parsed",
-            limitation_count: null,
-            retailer: "Parsed",
-            is_soundtrack: false,
-            release_type: "new_release",
-            confidence: 0.95
+            artists: ["(Inferred from title)"],
+            combined_artist: "(Inferred combined)",
+            album_title: "(Inferred album title)",
+            variant: "Parsed variant",
+            retailer: "Parsed retailer"
           }
         ],
         reasoning: "Custom input pre-cleaned. For live DeepSeek LLM execution on this custom string, invoke src/reddit_scrape/prototype_extractor.py with your prompt."
       };
-      document.getElementById("status-badge").className = "badge badge-green";
-      document.getElementById("status-badge").textContent = "Custom Evaluated";
+      document.getElementById("status-badge").className = isNoise ? "badge badge-red" : "badge badge-green";
+      document.getElementById("status-badge").textContent = isNoise ? "Filtered" : "Custom Evaluated";
       document.getElementById("current-step-label").textContent = "Custom Input";
       renderState();
     }
 
-    // Initialize on load
     window.addEventListener("DOMContentLoaded", initUI);
   </script>
 </body>

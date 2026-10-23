@@ -1,18 +1,21 @@
-# Technical Specification: r/vinylreleases Ingestion & Hype Intelligence Engine
+# Technical Specification: r/vinylreleases Ingestion & Structured Release Extraction Pipeline
 
 ## 1. Overview & System Architecture
 
-The system discovers, extracts, tracks, and ranks vinyl record announcements posted to `r/vinylreleases`. It converts community-submitted unstructured posts into clean relational data using DeepSeek via `pydantic-ai`, measures community engagement over time using periodic time-series snapshots, and computes an engagement velocity hype score stored in PostgreSQL.
+The system discovers, extracts, and tracks vinyl record announcements posted to `r/vinylreleases`. It converts community-submitted unstructured posts into clean relational data using DeepSeek via `pydantic-ai`, and captures periodic time-series metric snapshots stored in PostgreSQL.
+
+Downstream analytics (such as engagement velocity calculation, freshness decay scoring, and leaderboard generation) are explicitly decoupled from this ingestion pipeline and consume the historical time-series data captured in `submission_snapshots`.
 
 ```mermaid
 flowchart TD
-    subgraph Reddit["Reddit API"]
-        SubNew["r/vinylreleases/new"]
-        SubHot["r/vinylreleases/hot"]
+    subgraph Reddit["Reddit API (r/vinylreleases)"]
+        SubNew["r/vinylreleases/new (5m poll)"]
+        SubHot["r/vinylreleases/hot (15m poll)"]
     end
 
     subgraph Poller["Ingestion Poller (PRAW)"]
-        Fetch["Fetch Submissions (Every 5-15 min)"]
+        FetchNew["Fetch New Submissions"]
+        FetchHot["Fetch Active / Hot Submissions"]
         FilterFlairs{"Check Flair\n(Exclude Discussion/ISO)"}
     end
 
@@ -21,37 +24,36 @@ flowchart TD
         T_Snapshots[("submission_snapshots")]
         T_Releases[("releases")]
         T_SubRel[("submission_releases")]
-        T_Hype[("hype_metrics")]
     end
 
     subgraph Extractor["LLM Extraction Layer (DeepSeek + PydanticAI)"]
-        PreClean["Pre-cleaning (Strip tags, markdown)"]
+        Queue["Unextracted Queue\n(is_extracted = FALSE)"]
+        PreClean["Pre-cleaning (Strip tags, normalize dashes)"]
         DeepSeekAgent["DeepSeek Chat Agent\n(Structured Output)"]
         ValidateSchema["Pydantic Validation (ExtractedRelease)"]
     end
 
-    subgraph HypeEngine["Hype Velocity Calculator"]
-        DiffCalc["Calculate Velocity (ΔScore/Δt, ΔComments/Δt)"]
-        DecayCalc["Apply Freshness Decay"]
-        RankTable["Update Hype Leaderboard"]
+    subgraph Downstream["Downstream Backend / Analytics (Decoupled)"]
+        AnalyticsEngine["Velocity, Decay & Leaderboards"]
     end
 
-    SubNew --> Fetch
-    SubHot --> Fetch
-    Fetch --> FilterFlairs
-    FilterFlairs -->|Valid| T_Submissions
-    Fetch --> T_Snapshots
+    SubNew --> FetchNew
+    SubHot --> FetchHot
+    FetchNew --> FilterFlairs
+    FilterFlairs -->|Valid Release Candidate| T_Submissions
+    FilterFlairs -->|Initial Snapshot| T_Snapshots
 
-    T_Submissions -->|Unextracted Submission| PreClean
+    FetchHot -->|Update Metadata / Flair| T_Submissions
+    FetchHot -->|Append Timestamped Metric| T_Snapshots
+
+    T_Submissions --> Queue
+    Queue --> PreClean
     PreClean --> DeepSeekAgent
     DeepSeekAgent --> ValidateSchema
     ValidateSchema --> T_Releases
     ValidateSchema --> T_SubRel
 
-    T_Snapshots --> DiffCalc
-    DiffCalc --> DecayCalc
-    DecayCalc --> T_Hype
-    T_Hype --> RankTable
+    T_Snapshots -.->|Time-Series Read| AnalyticsEngine
 ```
 
 ---
@@ -89,48 +91,51 @@ CREATE TABLE IF NOT EXISTS submission_snapshots (
     score INT NOT NULL,
     upvote_ratio FLOAT NOT NULL,
     num_comments INT NOT NULL,
+    flair TEXT,
     captured_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_snapshots_sub_time ON submission_snapshots(submission_id, captured_at DESC);
 
--- 3. Normalized Releases
+-- 3. Normalized Artists
+CREATE TABLE IF NOT EXISTS artists (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_artists_name ON artists(name);
+
+-- 4. Normalized Releases
 CREATE TABLE IF NOT EXISTS releases (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    artist VARCHAR(255) NOT NULL,
+    combined_artist VARCHAR(255) NOT NULL,
     album_title VARCHAR(255) NOT NULL,
-    format_variant TEXT,
+    variant TEXT,
     retailer_name VARCHAR(255),
     purchase_url TEXT,
-    release_type VARCHAR(32) NOT NULL DEFAULT 'new_release',
-    confidence_score FLOAT NOT NULL DEFAULT 1.0,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_releases_artist ON releases(artist);
+CREATE INDEX IF NOT EXISTS idx_releases_combined_artist ON releases(combined_artist);
 CREATE INDEX IF NOT EXISTS idx_releases_album ON releases(album_title);
 
--- 4. Many-to-Many Association
+-- 5. Release-Artist Many-to-Many Association
+CREATE TABLE IF NOT EXISTS release_artists (
+    release_id UUID NOT NULL REFERENCES releases(id) ON DELETE CASCADE,
+    artist_id UUID NOT NULL REFERENCES artists(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (release_id, artist_id)
+);
+
+-- 6. Submission-Release Many-to-Many Association
 CREATE TABLE IF NOT EXISTS submission_releases (
     submission_id VARCHAR(32) NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
     release_id UUID NOT NULL REFERENCES releases(id) ON DELETE CASCADE,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (submission_id, release_id)
 );
-
--- 5. Calculated Hype Metrics
-CREATE TABLE IF NOT EXISTS hype_metrics (
-    submission_id VARCHAR(32) PRIMARY KEY REFERENCES submissions(id) ON DELETE CASCADE,
-    current_score INT NOT NULL DEFAULT 0,
-    current_comments INT NOT NULL DEFAULT 0,
-    upvote_velocity_1h FLOAT NOT NULL DEFAULT 0.0,
-    comment_velocity_1h FLOAT NOT NULL DEFAULT 0.0,
-    hype_index FLOAT NOT NULL DEFAULT 0.0,
-    last_calculated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_hype_index ON hype_metrics(hype_index DESC);
 ```
 
 ---
@@ -145,31 +150,40 @@ Utilize PydanticAI's OpenAI-compatible model layer connected to DeepSeek's API e
 
 ### Structured Output Schema
 ```python
-from typing import Literal, Optional
+from typing import Optional
 from pydantic import BaseModel, Field
 
 class ExtractedRelease(BaseModel):
-    artist: str = Field(description="Name of the musical artist or group")
-    album_title: str = Field(description="Name of the album, EP, single, or soundtrack")
-    format_variant: Optional[str] = Field(
-        None, description="Color pressing, vinyl weight, limitation (e.g., 'Pink Swirl /500', '180g 2LP')"
+    artists: list[str] = Field(
+        description="List of individual contributing artist or band names (e.g. ['Converge', 'Dropdead'] or ['Kanye West', 'Ty Dolla $ign'] or ['Charli XCX'])"
+    )
+    combined_artist: Optional[str] = Field(
+        None,
+        description="Combined billing display string when multiple artists collaborate (e.g. 'Converge / Dropdead', 'Kanye West & Ty Dolla $ign')"
+    )
+    album_title: str = Field(
+        description="Clean title of the album, EP, single, or box set without variant/date noise"
+    )
+    variant: Optional[str] = Field(
+        None,
+        description="Physical pressing variation (colorway, 180g, LP count, zoetrope, limitation text, etc.), e.g. 'Opaque Emerald LP', '180g 45RPM 2LP Box', 'Pink Swirl /500'"
     )
     retailer: Optional[str] = Field(
-        None, description="Retailer, exclusive seller, or record label (e.g., 'Blood Records', 'Target', 'Rough Trade')"
-    )
-    release_type: Literal['new_release', 'pre_order', 'restock', 'repress', 'bootleg', 'unknown'] = Field(
-        'new_release', description="The release event indicated by the title or flair"
-    )
-    confidence: float = Field(
-        ge=0.0, le=1.0, description="Confidence in the extraction accuracy from 0.0 to 1.0"
+        None,
+        description="Exclusive retailer, store, or record label (e.g., 'Rough Trade', 'Blood Records', 'Target', 'VMP')"
     )
 
 class ExtractionResult(BaseModel):
     is_vinyl_release: bool = Field(
-        description="Whether this submission represents an actual vinyl release announcement or drop"
+        description="Whether this submission announces a specific vinyl album release. FALSE for discussions, questions, ISO, gear, or general restocks/sales that do NOT name specific album titles."
     )
     releases: list[ExtractedRelease] = Field(
-        default_factory=list, description="List of releases extracted from the submission title"
+        default_factory=list,
+        description="List of distinct releases announced with specific album titles. Empty if non-release or generic non-specific store restock."
+    )
+    reasoning: Optional[str] = Field(
+        None,
+        description="Brief explanation of extraction decisions and filtration"
     )
 ```
 
@@ -178,6 +192,16 @@ class ExtractionResult(BaseModel):
 You are an expert vinyl discography classifier specialized in parsing posts from r/vinylreleases.
 Subreddit titles follow patterns such as:
 - "[Pre-Order] [Release Date] Artist - Album (Format / Color / Pressing count) [Store Name]"
+- "Restock: Artist - Album (Variant details)"
+- "Artist - Album | Exclusive /500"
+
+Your task:
+1. Determine if the post announces a specific vinyl release (`is_vinyl_release`). Set to FALSE and return releases: [] for general discussion, questions, ISO requests, equipment advice, or non-specific restocks/sales without album titles.
+2. Extract all distinct vinyl releases that mention specific album titles.
+3. Clean artist and album names by removing noise tags, bracketed dates, and parenthetical variant markers.
+4. For multi-artist releases (collaborations or splits), extract each contributing artist in `artists` and provide the joint string in `combined_artist`.
+5. Capture physical pressing attributes (color, weight, limitation) in `variant`.
+6. NEVER hallucinate or infer artists/titles not present in the post.
 - "Restock: Artist - Album (Variant details)"
 - "Artist - Album | Exclusive /500"
 
@@ -195,33 +219,60 @@ Your task:
 
 1. **Client**: Python `praw.Reddit` with `client_id`, `client_secret`, and descriptive `user_agent`.
 2. **Target Endpoints**:
-   - `reddit.subreddit("vinylreleases").new(limit=50)`: Captured on every cycle to catch new announcements immediately.
-   - `reddit.subreddit("vinylreleases").hot(limit=30)`: Captured to update active engagement snapshots for high-activity drops.
+   - `reddit.subreddit("vinylreleases").new(limit=50)`: Polled every 5 minutes to capture new announcements immediately.
+   - `reddit.subreddit("vinylreleases").hot(limit=50)`: Polled every 15 minutes to capture updated engagement metrics and track lifecycle flair updates.
 3. **Filtering**:
    - Skip posts with explicit non-release flairs: `Discussion`, `Question`, `Collection`, `Advice`, `ISO`.
 4. **Idempotency**:
    - Upsert `Submission` record on conflict (`ON CONFLICT (reddit_id) DO UPDATE ...`).
-   - Append `SubmissionSnapshot` record with current `score`, `upvote_ratio`, `num_comments`.
+   - Append `SubmissionSnapshot` record on each observation cycle with current `score`, `upvote_ratio`, `num_comments`, and `flair`.
 
 ---
 
-## 5. Hype Velocity & Analytics Engine
+## 5. Polling Lifecycle & State Management
 
-### 5.1 Velocity Calculation
-Given two snapshots $S_1 = (t_1, \text{score}_1, \text{comments}_1)$ and $S_2 = (t_2, \text{score}_2, \text{comments}_2)$ where $\Delta t = t_2 - t_1$ in hours:
+The ingestion pipeline runs continuously on two complementary polling schedules to balance immediate discovery with ongoing engagement metric tracking:
 
-$$\text{Upvote Velocity } V_u = \max\left(0, \frac{\text{score}_2 - \text{score}_1}{\Delta t}\right)$$
+### 5.1 Discovery Polling (`r/vinylreleases/new`)
+- **Interval**: Every 5 minutes (`POLL_INTERVAL_SECONDS = 300`).
+- **Endpoint**: `reddit.subreddit("vinylreleases").new(limit=50)`.
+- **Logic**:
+  1. Filter out submissions with non-release flairs (`Discussion`, `Question`, `ISO`, etc.).
+  2. Perform an idempotent upsert into `submissions`:
+     ```sql
+     INSERT INTO submissions (id, reddit_id, title, url, permalink, flair, author, is_self, selftext, created_utc, is_extracted, is_release)
+     VALUES (:id, :reddit_id, :title, :url, :permalink, :flair, :author, :is_self, :selftext, :created_utc, FALSE, TRUE)
+     ON CONFLICT (reddit_id) DO UPDATE SET
+         flair = EXCLUDED.flair,
+         updated_at = CURRENT_TIMESTAMP;
+     ```
+  3. If newly inserted, queue for LLM extraction (`is_extracted = FALSE`).
+  4. Append initial metric observation to `submission_snapshots`:
+     ```sql
+     INSERT INTO submission_snapshots (submission_id, score, upvote_ratio, num_comments, flair, captured_at)
+     VALUES (:submission_id, :score, :upvote_ratio, :num_comments, :flair, CURRENT_TIMESTAMP);
+     ```
 
-$$\text{Comment Velocity } V_c = \max\left(0, \frac{\text{comments}_2 - \text{comments}_1}{\Delta t}\right)$$
+### 5.2 Active Tracking Polling (`r/vinylreleases/hot`)
+- **Interval**: Every 15 minutes.
+- **Endpoint**: `reddit.subreddit("vinylreleases").hot(limit=50)`.
+- **Logic**:
+  1. For active submissions appearing in `/hot`, update latest submission metadata:
+     - Check if the submission flair has mutated (notably transitions to `SOLD OUT` or `EXPIRED`).
+     - Update `submissions.flair` and `submissions.updated_at`.
+  2. Append an updated metric observation to `submission_snapshots` with the current `score`, `upvote_ratio`, `num_comments`, and current `flair`.
+  3. If an active hot submission was missed during previous `/new` cycles, insert it and queue for extraction.
 
-### 5.2 Freshness Decay Factor
-To prevent older, permanently popular posts from dominating the live leaderboard over newly breaking releases, apply a power decay based on post age $t_{\text{age}}$ (in hours):
-
-$$D(t) = \frac{1}{\left(1 + \frac{t_{\text{age}}}{24}\right)^{1.3}}$$
-
-### 5.3 Compound Hype Index
-$$H = \left(w_u \cdot V_u + w_c \cdot V_c \cdot (1 + \log_{10}(1 + \text{comments}_2))\right) \cdot D(t)$$
-*Default Weights*: $w_u = 1.0$, $w_c = 2.5$ (comments reflect active community discussion and variant demand).
+### 5.3 Extraction Worker Lifecycle
+- An asynchronous worker queries pending submissions:
+  ```sql
+  SELECT id, title, flair FROM submissions WHERE is_extracted = FALSE AND is_release = TRUE ORDER BY created_utc ASC LIMIT 10;
+  ```
+- Executes string pre-cleaning and passes the cleaned title/flair to DeepSeek (`deepseek-chat`) via PydanticAI.
+- In a single transaction:
+  - Inserts extracted `releases` records.
+  - Links them to `submissions` via `submission_releases`.
+  - Sets `is_extracted = TRUE` on the submission record.
 
 ---
 
@@ -243,5 +294,6 @@ DEEPSEEK_MODEL=deepseek-chat
 
 # Polling Intervals
 POLL_INTERVAL_SECONDS=300
+HOT_POLL_INTERVAL_SECONDS=900
 SNAPSHOT_RETENTION_DAYS=30
 ```
