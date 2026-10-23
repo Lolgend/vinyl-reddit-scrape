@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DeepSeek PydanticAI Extraction Prototype (Minimal)</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --border: #30363d;
+      --accent: #238636;
+      --accent-hover: #2ea043;
+      --accent-blue: #58a6ff;
+      --text: #c9d1d9;
+      --text-muted: #8b949e;
+      --text-bright: #f0f6fc;
+      --badge-green-bg: #23863626;
+      --badge-green-text: #3fb950;
+      --badge-amber-bg: #d2992226;
+      --badge-amber-text: #d29922;
+      --badge-red-bg: #da363326;
+      --badge-red-text: #f85149;
+      --badge-purple-bg: #8957e526;
+      --badge-purple-text: #a371f7;
+      --code-bg: #0b0e14;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding: 24px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    header {
+      margin-bottom: 24px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 16px;
+    }
+
+    h1 {
+      font-size: 24px;
+      font-weight: 600;
+      color: var(--text-bright);
+      margin-bottom: 8px;
+    }
+
+    .question-box {
+      background: #1f242c;
+      border-left: 4px solid var(--accent-blue);
+      padding: 12px 16px;
+      border-radius: 0 6px 6px 0;
+      font-size: 14px;
+      color: var(--text-bright);
+      margin-bottom: 16px;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 500;
+      border-radius: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .badge-green { background: var(--badge-green-bg); color: var(--badge-green-text); }
+    .badge-amber { background: var(--badge-amber-bg); color: var(--badge-amber-text); }
+    .badge-red { background: var(--badge-red-bg); color: var(--badge-red-text); }
+    .badge-purple { background: var(--badge-purple-bg); color: var(--badge-purple-text); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 16px;
+    }
+
+    .card h2 {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text-bright);
+      margin-bottom: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 4px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 16px;
+      overflow-x: auto;
+    }
+
+    .tab-btn {
+      background: none;
+      border: none;
+      color: var(--text-muted);
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      white-space: nowrap;
+    }
+
+    .tab-btn.active {
+      color: var(--accent-blue);
+      border-bottom-color: var(--accent-blue);
+    }
+
+    .tab-btn:hover:not(.active) {
+      color: var(--text);
+    }
+
+    .steps-container {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    .step-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: #0d1117;
+      border: 1px solid var(--border);
+      padding: 8px 12px;
+      border-radius: 6px;
+    }
+
+    .step-number {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: #21262d;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .step-item.active .step-number {
+      background: var(--accent-blue);
+      color: #fff;
+    }
+
+    .step-item.completed .step-number {
+      background: var(--accent);
+      color: #fff;
+    }
+
+    .btn {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      border-radius: 4px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .btn:hover { background: var(--accent-hover); }
+
+    .btn-secondary {
+      background: #21262d;
+      color: var(--text-bright);
+      border: 1px solid var(--border);
+    }
+
+    .btn-secondary:hover { background: #30363d; }
+
+    .field-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 6px 0;
+      border-bottom: 1px solid #21262d;
+      font-size: 13px;
+    }
+
+    .field-label {
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    .field-val {
+      color: var(--text-bright);
+      font-family: monospace;
+      max-width: 65%;
+      text-align: right;
+      word-break: break-word;
+    }
+
+    .release-box {
+      background: #0b0e14;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 12px;
+      margin-top: 10px;
+    }
+
+    .release-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--accent-blue);
+      margin-bottom: 8px;
+    }
+
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 10px;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      overflow-x: auto;
+      color: #79c0ff;
+      max-height: 250px;
+    }
+
+    .freeplay-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .custom-input-group {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .custom-input {
+      flex: 1;
+      background: #0d1117;
+      border: 1px solid var(--border);
+      color: var(--text-bright);
+      padding: 6px 10px;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+
+    .custom-input:focus {
+      outline: none;
+      border-color: var(--accent-blue);
+    }
+
+    .highlight-pill {
+      background: #1f6feb26;
+      color: #58a6ff;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 500;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div style="display: flex; justify-content: space-between; align-items: baseline;">
+      <h1>DeepSeek PydanticAI Extraction Prototype (Minimal)</h1>
+      <span class="badge badge-purple">Wayfinder #5 Prototype</span>
+    </div>
+    <div class="question-box">
+      <strong>Core Question Under Test:</strong> Does a minimal PydanticAI prototype using <code>deepseek-chat</code> accurately parse complex vinyl release post titles (including multi-artist releases, pre-orders, and complex color variants) into structured <code>ExtractedRelease</code> objects without hallucinating artists or album titles?
+    </div>
+  </header>
+
+  <!-- Walkthrough Scenarios -->
+  <div class="card" style="margin-bottom: 20px;">
+    <h2>
+      <span>Guided Walkthrough Scenarios</span>
+      <span id="scenario-counter" style="font-size: 12px; color: var(--text-muted);">Scenario 1 of 6</span>
+    </h2>
+    <div class="tabs" id="walkthrough-tabs">
+      <!-- Tabs populated via JS -->
+    </div>
+    <div id="scenario-info" style="margin-bottom: 12px; font-size: 13px; color: var(--text);"></div>
+    
+    <div class="steps-container" id="steps-container">
+      <!-- Steps buttons -->
+    </div>
+  </div>
+
+  <div class="grid">
+    <!-- State Panel -->
+    <div class="card">
+      <h2>
+        <span>Processed Release Entities</span>
+        <span id="status-badge" class="badge badge-green">Ready</span>
+      </h2>
+
+      <div class="field-row">
+        <span class="field-label">Reddit Submission Title</span>
+        <span class="field-val" id="state-raw-title">-</span>
+      </div>
+      <div class="field-row">
+        <span class="field-label">Releases Extracted</span>
+        <span class="field-val" id="state-releases-count">0</span>
+      </div>
+      <div class="field-row">
+        <span class="field-label">Status</span>
+        <span class="field-val" id="state-status"><span class="badge badge-green">Valid Specific Release</span></span>
+      </div>
+
+      <div style="margin-top: 14px;">
+        <h3 style="font-size: 13px; color: var(--text-muted); margin-bottom: 6px;">Relational Entities (Processed)</h3>
+        <div id="releases-container">
+          <!-- Entities populated here -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Inspector & Raw JSON -->
+    <div class="card">
+      <h2>
+        <span>Relational Model Output</span>
+        <span class="highlight-pill" id="current-step-label">Step 1: Ingestion</span>
+      </h2>
+
+      <div style="font-size: 12px; color: var(--text-muted); margin-bottom: 10px;">
+        Clean data payload mapped to <code>releases</code>, <code>artists</code>, and <code>release_artists</code>:
+      </div>
+
+      <pre id="json-preview">{}</pre>
+
+      <div style="margin-top: 16px;">
+        <h3 style="font-size: 13px; color: var(--text-bright); margin-bottom: 8px;">Free-Play Benchmarks</h3>
+        <div class="freeplay-bar" id="freeplay-buttons">
+          <!-- Freeplay quick triggers -->
+        </div>
+
+        <div class="custom-input-group">
+          <input type="text" id="custom-title-input" class="custom-input" placeholder="Type or paste custom Reddit post title...">
+          <button class="btn btn-secondary" onclick="runCustomTitle()">Inspect</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Portable Logic Module -->
+  <script>
+    const PrototypeModule = (function() {
+      const benchmarkData = {
+        "multi_artist_split": {
+          title: 'Converge / Dropdead - Split (7" /500)',
+          category: "Multi-Artist Split Release",
+          desc: "Extracts individual artists ['Converge', 'Dropdead'], combined billing 'Converge / Dropdead', title 'Split', variant '7\" /500'.",
+          releases: [
+            {
+              artists: ["Converge", "Dropdead"],
+              combined_artist: "Converge / Dropdead",
+              album_title: "Split",
+              variant: '7" /500',
+              retailer: null
+            }
+          ]
+        },
+        "multi_artist_collab": {
+          title: "Kanye West & Ty Dolla $ign - Vultures 1 (Black 2LP)",
+          category: "Multi-Artist Collaboration",
+          desc: "Extracts individual artists ['Kanye West', 'Ty Dolla $ign'], combined billing 'Kanye West & Ty Dolla $ign', variant 'Black 2LP'.",
+          releases: [
+            {
+              artists: ["Kanye West", "Ty Dolla $ign"],
+              combined_artist: "Kanye West & Ty Dolla $ign",
+              album_title: "Vultures 1",
+              variant: "Black 2LP",
+              retailer: null
+            }
+          ]
+        },
+        "audiophile_weight": {
+          title: "Miles Davis – Kind of Blue (Mobile Fidelity 180g 45RPM 2LP Box)",
+          category: "Audiophile Weight Variant (180g / 45RPM)",
+          desc: "Captures non-color pressing specifications in variant: '180g 45RPM 2LP Box', retailer 'Mobile Fidelity'.",
+          releases: [
+            {
+              artists: ["Miles Davis"],
+              combined_artist: "Miles Davis",
+              album_title: "Kind of Blue",
+              variant: "180g 45RPM 2LP Box",
+              retailer: "Mobile Fidelity"
+            }
+          ]
+        },
+        "comma_artist_restock": {
+          title: "RESTOCK: Tyler, The Creator - IGOR (Mint Green Special Edition LP)",
+          category: "Restock with Specific Album Announced",
+          desc: "Retained because specific album 'IGOR' is announced. Artists: ['Tyler, The Creator'], variant: 'Mint Green Special Edition LP'.",
+          releases: [
+            {
+              artists: ["Tyler, The Creator"],
+              combined_artist: "Tyler, The Creator",
+              album_title: "IGOR",
+              variant: "Mint Green Special Edition LP",
+              retailer: null
+            }
+          ]
+        },
+        "generic_restock_ignore": {
+          title: "VMP Restocks: Fiona Apple, Outkast, The Mars Volta, DMX",
+          category: "Generic Restock (No Albums Named) -> Ignored",
+          desc: "Ignored (0 releases) because no specific album titles are announced, avoiding empty or hallucinated records.",
+          releases: []
+        },
+        "discussion_ignore": {
+          title: "[Discussion] What's your favorite pressing of In Rainbows?",
+          category: "Community Discussion -> Ignored",
+          desc: "Community discussions are filtered out (0 releases).",
+          releases: []
+        }
+      };
+
+      return {
+        benchmarks: benchmarkData,
+      };
+    })();
+
+    let currentScenarioKey = "multi_artist_split";
+    let currentStep = 1;
+    let currentState = {};
+
+    const walkthroughKeys = [
+      "multi_artist_split",
+      "multi_artist_collab",
+      "audiophile_weight",
+      "comma_artist_restock",
+      "generic_restock_ignore",
+      "discussion_ignore"
+    ];
+
+    function initUI() {
+      const tabsEl = document.getElementById("walkthrough-tabs");
+      tabsEl.innerHTML = "";
+      walkthroughKeys.forEach((key, index) => {
+        const item = PrototypeModule.benchmarks[key];
+        const btn = document.createElement("button");
+        btn.className = `tab-btn ${key === currentScenarioKey ? "active" : ""}`;
+        btn.textContent = `${index + 1}. ${item.category}`;
+        btn.onclick = () => selectScenario(key);
+        tabsEl.appendChild(btn);
+      });
+
+      const fpEl = document.getElementById("freeplay-buttons");
+      fpEl.innerHTML = "";
+      Object.keys(PrototypeModule.benchmarks).forEach((key) => {
+        const item = PrototypeModule.benchmarks[key];
+        const btn = document.createElement("button");
+        btn.className = "btn btn-secondary";
+        btn.textContent = item.category;
+        btn.onclick = () => {
+          selectScenario(key);
+          executeStep(2);
+        };
+        fpEl.appendChild(btn);
+      });
+
+      selectScenario(currentScenarioKey);
+    }
+
+    function selectScenario(key) {
+      currentScenarioKey = key;
+      currentStep = 1;
+
+      document.querySelectorAll(".tab-btn").forEach((btn, i) => {
+        btn.classList.toggle("active", walkthroughKeys[i] === key);
+      });
+
+      const scenario = PrototypeModule.benchmarks[key];
+      const index = walkthroughKeys.indexOf(key) + 1;
+      document.getElementById("scenario-counter").textContent = `Scenario ${index} of ${walkthroughKeys.length}`;
+      document.getElementById("scenario-info").innerHTML = `
+        <div style="font-weight: 600; color: var(--text-bright); margin-bottom: 4px;">${scenario.category}</div>
+        <div style="color: var(--text-muted);">${scenario.desc}</div>
+      `;
+
+      renderSteps();
+      executeStep(1);
+    }
+
+    function renderSteps() {
+      const stepsContainer = document.getElementById("steps-container");
+      stepsContainer.innerHTML = `
+        <div class="step-item ${currentStep === 1 ? 'active' : 'completed'}">
+          <div class="step-number">1</div>
+          <div style="flex:1;"><strong>Step 1: Submission Title</strong> &mdash; Raw Reddit post title</div>
+          <button class="btn ${currentStep === 1 ? '' : 'btn-secondary'}" onclick="executeStep(1)">Inspect Title</button>
+        </div>
+        <div class="step-item ${currentStep === 2 ? 'completed' : ''}">
+          <div class="step-number">2</div>
+          <div style="flex:1;"><strong>Step 2: Extracted Release Entities</strong> &mdash; Processed relational output</div>
+          <button class="btn ${currentStep === 2 ? '' : 'btn-secondary'}" onclick="executeStep(2)">Extract Releases</button>
+        </div>
+      `;
+    }
+
+    function executeStep(step) {
+      currentStep = step;
+      renderSteps();
+
+      const scenario = PrototypeModule.benchmarks[currentScenarioKey];
+
+      if (step === 1) {
+        currentState = {
+          title: scenario.title,
+          releases: []
+        };
+        document.getElementById("status-badge").className = "badge badge-amber";
+        document.getElementById("status-badge").textContent = "Ingested";
+        document.getElementById("current-step-label").textContent = "Step 1: Title Ingested";
+      } else if (step === 2) {
+        currentState = {
+          releases: scenario.releases
+        };
+        const hasReleases = scenario.releases.length > 0;
+        document.getElementById("status-badge").className = hasReleases ? "badge badge-green" : "badge badge-red";
+        document.getElementById("status-badge").textContent = hasReleases ? "Extracted" : "Ignored";
+        document.getElementById("current-step-label").textContent = "Step 2: Releases Processed";
+      }
+
+      renderState();
+    }
+
+    function renderState() {
+      const scenario = PrototypeModule.benchmarks[currentScenarioKey];
+      document.getElementById("state-raw-title").textContent = scenario.title || "-";
+      
+      const count = currentState.releases ? currentState.releases.length : 0;
+      document.getElementById("state-releases-count").textContent = count;
+
+      const statusEl = document.getElementById("state-status");
+      if (currentStep === 1) {
+        statusEl.innerHTML = '<span class="badge badge-amber">Awaiting Extraction</span>';
+      } else if (count > 0) {
+        statusEl.innerHTML = '<span class="badge badge-green">Specific Release Announced</span>';
+      } else {
+        statusEl.innerHTML = '<span class="badge badge-red">Ignored (No Album / Non-Release)</span>';
+      }
+
+      const relContainer = document.getElementById("releases-container");
+      relContainer.innerHTML = "";
+      if (!currentState.releases || currentState.releases.length === 0) {
+        relContainer.innerHTML = '<div style="font-size: 12px; color: var(--text-muted); padding: 8px 0;">No releases extracted (filtered or pending).</div>';
+      } else {
+        currentState.releases.forEach((r, idx) => {
+          const div = document.createElement("div");
+          div.className = "release-box";
+          div.innerHTML = `
+            <div class="release-title">#${idx + 1}: ${r.combined_artist || r.artists.join(', ')} - ${r.album_title}</div>
+            <div class="field-row">
+              <span class="field-label">Artists:</span>
+              <span class="field-val">${r.artists.map(a => `<span class="highlight-pill">${a}</span>`).join(' ')}</span>
+            </div>
+            <div class="field-row">
+              <span class="field-label">Combined Artist:</span>
+              <span class="field-val">${r.combined_artist || "Single Artist"}</span>
+            </div>
+            <div class="field-row">
+              <span class="field-label">Album Title:</span>
+              <span class="field-val">${r.album_title}</span>
+            </div>
+            <div class="field-row">
+              <span class="field-label">Variant:</span>
+              <span class="field-val">${r.variant || "Standard"}</span>
+            </div>
+            <div class="field-row">
+              <span class="field-label">Retailer:</span>
+              <span class="field-val">${r.retailer || "None"}</span>
+            </div>
+          `;
+          relContainer.appendChild(div);
+        });
+      }
+
+      document.getElementById("json-preview").textContent = JSON.stringify(currentState, null, 2);
+    }
+
+    function runCustomTitle() {
+      const val = document.getElementById("custom-title-input").value.trim();
+      if (!val) return;
+
+      const isNoise = val.toLowerCase().includes("[discussion]") || val.toLowerCase().includes("[iso]");
+      currentState = {
+        releases: isNoise ? [] : [
+          {
+            artists: ["Artist"],
+            combined_artist: "Artist",
+            album_title: "Album",
+            variant: "Variant",
+            retailer: "Retailer"
+          }
+        ]
+      };
+      document.getElementById("state-raw-title").textContent = val;
+      document.getElementById("status-badge").className = isNoise ? "badge badge-red" : "badge badge-green";
+      document.getElementById("status-badge").textContent = isNoise ? "Ignored" : "Extracted";
+      document.getElementById("current-step-label").textContent = "Custom Output";
+      renderState();
+    }
+
+    window.addEventListener("DOMContentLoaded", initUI);
+  </script>
+</body>
+</html>

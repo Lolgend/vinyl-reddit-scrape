@@ -1,0 +1,228 @@
+[
+  {
+    "case": {
+      "id": "canonical",
+      "category": "Canonical Post",
+      "title": "Fontaines D.C. - Romance (Opaque Emerald LP) [$32.99]",
+      "desc": "Standard single artist release with colorway variant."
+    },
+    "result": {
+      "releases": [
+        {
+          "artists": [
+            "Fontaines D.C."
+          ],
+          "combined_artist": "Fontaines D.C.",
+          "album_title": "Romance",
+          "variant": "Opaque Emerald LP",
+          "retailer": null
+        }
+      ]
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "preorder_variant",
+      "category": "Pre-Order & Retailer Exclusive",
+      "title": "[Pre-Order] [10/24] Charli XCX - Brat (Translucent Black Ice Vinyl /2000) [Rough Trade]",
+      "desc": "Variant captures translucent black ice and /2000 limitation text, retailer Rough Trade."
+    },
+    "result": {
+      "releases": [
+        {
+          "artists": [
+            "Charli XCX"
+          ],
+          "combined_artist": "Charli XCX",
+          "album_title": "Brat",
+          "variant": "Translucent Black Ice Vinyl /2000",
+          "retailer": "Rough Trade"
+        }
+      ]
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "audiophile_weight",
+      "category": "Audiophile Weight Variant (180g / 45RPM)",
+      "title": "Miles Davis \u2013 Kind of Blue (Mobile Fidelity 180g 45RPM 2LP Box)",
+      "desc": "Non-color physical variant (180g, 45RPM, box)."
+    },
+    "result": {
+      "releases": [
+        {
+          "artists": [
+            "Miles Davis"
+          ],
+          "combined_artist": "Miles Davis",
+          "album_title": "Kind of Blue",
+          "variant": "180g 45RPM 2LP Box",
+          "retailer": "Mobile Fidelity"
+        }
+      ]
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "multi_artist_split",
+      "category": "Multi-Artist Split Release",
+      "title": "Converge / Dropdead - Split (7\" /500)",
+      "desc": "Split release: individual artists ['Converge', 'Dropdead'] and combined 'Converge / Dropdead'."
+    },
+    "result": {
+      "releases": [
+        {
+          "artists": [
+            "Converge",
+            "Dropdead"
+          ],
+          "combined_artist": "Converge / Dropdead",
+          "album_title": "Split",
+          "variant": "7\" /500",
+          "retailer": null
+        }
+      ]
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "multi_artist_collab",
+      "category": "Multi-Artist Collaboration",
+      "title": "Kanye West & Ty Dolla $ign - Vultures 1 (Black 2LP)",
+      "desc": "Collaboration: individual artists ['Kanye West', 'Ty Dolla $ign'] and combined relation."
+    },
+    "result": {
+      "releases": [
+        {
+          "artists": [
+            "Kanye West",
+            "Ty Dolla $ign"
+          ],
+          "combined_artist": "Kanye West & Ty Dolla $ign",
+          "album_title": "Vultures 1",
+          "variant": "Black 2LP",
+          "retailer": null
+        }
+      ]
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "comma_artist_restock",
+      "category": "Internal Comma in Artist with Specific Album",
+      "title": "RESTOCK: Tyler, The Creator - IGOR (Mint Green Special Edition LP)",
+      "desc": "Specific album 'IGOR' restock with pressing variant."
+    },
+    "result": {
+      "releases": [
+        {
+          "artists": [
+            "Tyler, The Creator"
+          ],
+          "combined_artist": "Tyler, The Creator",
+          "album_title": "IGOR",
+          "variant": "Mint Green Special Edition LP",
+          "retailer": null
+        }
+      ]
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "hyphen_band",
+      "category": "Hyphen in Band Name",
+      "title": "blink-182 - Enema of the State",
+      "desc": "Band name 'blink-182' intact."
+    },
+    "result": {
+      "releases": [
+        {
+          "artists": [
+            "blink-182"
+          ],
+          "combined_artist": "blink-182",
+          "album_title": "Enema of the State",
+          "variant": null,
+          "retailer": null
+        }
+      ]
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "numbered_zoetrope",
+      "category": "Zoetrope & Retailer Exclusive",
+      "title": "The 1975 - Live at Gorilla (Clear 2LP, Hand-Numbered /500) [Blood Records Zoetrope]",
+      "desc": "Retailer 'Blood Records', variant captures clear 2LP, hand-numbered /500, zoetrope."
+    },
+    "result": {
+      "releases": [
+        {
+          "artists": [
+            "The 1975"
+          ],
+          "combined_artist": "The 1975",
+          "album_title": "Live at Gorilla",
+          "variant": "Clear 2LP, Hand-Numbered /500",
+          "retailer": "Blood Records"
+        }
+      ]
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "generic_restock_ignore",
+      "category": "Generic Restock (No Albums Named) -> Ignored",
+      "title": "VMP Restocks: Fiona Apple, Outkast, The Mars Volta, DMX",
+      "desc": "No specific album titles -> returns empty releases: []."
+    },
+    "result": {
+      "releases": []
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "storefront_sale_ignore",
+      "category": "Storefront Sale (No Albums Named) -> Ignored",
+      "title": "Target Buy 2 Get 1 Free Sale on All Vinyl Records",
+      "desc": "Store discount announcement -> returns empty releases: []."
+    },
+    "result": {
+      "releases": []
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "discussion_ignore",
+      "category": "Community Discussion -> Ignored",
+      "title": "[Discussion] What's your favorite pressing of In Rainbows?",
+      "desc": "Community discussion -> returns empty releases: []."
+    },
+    "result": {
+      "releases": []
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "iso_ignore",
+      "category": "In Search Of ([ISO]) -> Ignored",
+      "title": "[ISO] Looking for Blonde by Frank Ocean (Official Black Friday edition)",
+      "desc": "Secondary marketplace request -> returns empty releases: []."
+    },
+    "result": {
+      "releases": []
+    },
+    "error": null
+  }
+]
