@@ -32,9 +32,22 @@ from reddit_scrape.models import (
     SubmissionRelease,
     SubmissionSnapshot,
 )
+from reddit_scrape.persistence import (
+    STANDARD_TOKEN,
+    ReleasePersistenceService,
+    compute_release_fingerprint,
+    normalize_attribute,
+    persist_extracted_releases,
+)
 from reddit_scrape.retention import (
     get_default_retention_days,
     purge_snapshots,
+)
+from reddit_scrape.service import (
+    CycleStats,
+    PollerService,
+    ServiceConfig,
+    validate_environment,
 )
 
 __all__ = [
@@ -66,12 +79,24 @@ __all__ = [
     "create_extraction_agent",
     "extract_releases",
     "pre_clean_title",
+    # Persistence
+    "STANDARD_TOKEN",
+    "ReleasePersistenceService",
+    "compute_release_fingerprint",
+    "normalize_attribute",
+    "persist_extracted_releases",
     # Retention
     "get_default_retention_days",
     "purge_snapshots",
+    # Service
+    "CycleStats",
+    "PollerService",
+    "ServiceConfig",
+    "validate_environment",
 ]
 
 
 def main() -> None:
     from reddit_scrape.cli import main as cli_main
+
     cli_main()
