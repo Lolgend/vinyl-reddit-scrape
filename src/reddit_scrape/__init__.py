@@ -32,6 +32,10 @@ from reddit_scrape.models import (
     SubmissionRelease,
     SubmissionSnapshot,
 )
+from reddit_scrape.retention import (
+    get_default_retention_days,
+    purge_snapshots,
+)
 
 __all__ = [
     # Database
@@ -62,8 +66,12 @@ __all__ = [
     "create_extraction_agent",
     "extract_releases",
     "pre_clean_title",
+    # Retention
+    "get_default_retention_days",
+    "purge_snapshots",
 ]
 
 
 def main() -> None:
-    print("Reddit Scrape Pipeline")
+    from reddit_scrape.cli import main as cli_main
+    cli_main()
