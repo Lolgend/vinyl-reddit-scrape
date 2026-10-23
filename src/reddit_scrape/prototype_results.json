@@ -1,0 +1,488 @@
+[
+  {
+    "case": {
+      "id": "canonical",
+      "category": "Canonical Subreddit Rule #3",
+      "title": "Fontaines D.C. - Romance (Opaque Emerald LP) [$32.99]",
+      "expected": {
+        "is_vinyl_release": true,
+        "count": 1,
+        "artist": "Fontaines D.C.",
+        "album_title": "Romance",
+        "color_variant": "Opaque Emerald",
+        "retailer": null
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "Fontaines D.C.",
+          "album_title": "Romance",
+          "format_variant": "Opaque Emerald LP",
+          "color_variant": "Opaque Emerald",
+          "limitation_count": null,
+          "retailer": null,
+          "is_soundtrack": false,
+          "release_type": "new_release",
+          "confidence": 0.97
+        }
+      ],
+      "reasoning": "Title clearly announces a vinyl variant. Price ($32.99) stripped from album title; colorway extracted as 'Opaque Emerald'. No retailer given, so retailer left null."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "preorder_limitation",
+      "category": "Pre-Order & Numbered Limitation",
+      "title": "[Pre-Order] [10/24] Charli XCX - Brat (Translucent Black Ice Vinyl /2000) [Rough Trade]",
+      "expected": {
+        "is_vinyl_release": true,
+        "count": 1,
+        "artist": "Charli XCX",
+        "album_title": "Brat",
+        "limitation_count": 2000,
+        "retailer": "Rough Trade",
+        "release_type": "pre_order"
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "Charli XCX",
+          "album_title": "Brat",
+          "format_variant": "Translucent Black Ice Vinyl",
+          "color_variant": "Translucent Black Ice",
+          "limitation_count": 2000,
+          "retailer": "Rough Trade",
+          "is_soundtrack": false,
+          "release_type": "pre_order",
+          "confidence": 0.97
+        }
+      ],
+      "reasoning": "Title includes [Pre-Order] tag and date 10/24, indicating a pre-order release. Artist 'Charli XCX', album 'Brat'. Variant 'Translucent Black Ice Vinyl' with /2000 limitation parsed as 2000. Retailer bracketed as Rough Trade. Not a soundtrack."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "retailer_exclusive",
+      "category": "Retailer Exclusive & Colorway",
+      "title": "Chappell Roan - The Rise and Fall of a Midwest Princess (Pink Target Exclusive LP)",
+      "expected": {
+        "is_vinyl_release": true,
+        "count": 1,
+        "artist": "Chappell Roan",
+        "album_title": "The Rise and Fall of a Midwest Princess",
+        "color_variant": "Pink",
+        "retailer": "Target"
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "Chappell Roan",
+          "album_title": "The Rise and Fall of a Midwest Princess",
+          "format_variant": "LP",
+          "color_variant": "Pink",
+          "limitation_count": null,
+          "retailer": "Target",
+          "is_soundtrack": false,
+          "release_type": "new_release",
+          "confidence": 0.97
+        }
+      ],
+      "reasoning": "Title clearly names artist, album, and a Target-exclusive pink LP variant. No limitation count given; 'Exclusive LP' treated as format/retailer exclusivity rather than a specific numbered pressing."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "zoetrope_numbered",
+      "category": "Hand-Numbered Zoetrope Limitation",
+      "title": "The 1975 - Live at Gorilla (Clear 2LP, Hand-Numbered /500) [Blood Records Zoetrope]",
+      "expected": {
+        "is_vinyl_release": true,
+        "count": 1,
+        "artist": "The 1975",
+        "album_title": "Live at Gorilla",
+        "limitation_count": 500,
+        "retailer": "Blood Records"
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "The 1975",
+          "album_title": "Live at Gorilla",
+          "format_variant": "Clear 2LP, Hand-Numbered",
+          "color_variant": "Clear",
+          "limitation_count": 500,
+          "retailer": "Blood Records",
+          "is_soundtrack": false,
+          "release_type": "new_release",
+          "confidence": 0.97
+        }
+      ],
+      "reasoning": "Clear vinyl announcement with pressing info. Artist 'The 1975' extracted verbatim; title 'Live at Gorilla' stripped of format details. '/500' parsed to limitation_count 500. Retailer 'Blood Records' from bracketed tag; 'Zoetrope' noted but colorway is Clear."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "unicode_dash",
+      "category": "Unicode En-dash & Audiophile",
+      "title": "Miles Davis \u2013 Kind of Blue (Mobile Fidelity 180g 45RPM 2LP Box)",
+      "expected": {
+        "is_vinyl_release": true,
+        "count": 1,
+        "artist": "Miles Davis",
+        "album_title": "Kind of Blue",
+        "format_variant": "Mobile Fidelity 180g 45RPM 2LP Box"
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "Miles Davis",
+          "album_title": "Kind of Blue",
+          "format_variant": "Mobile Fidelity 180g 45RPM 2LP Box",
+          "color_variant": null,
+          "limitation_count": null,
+          "retailer": "Mobile Fidelity",
+          "is_soundtrack": false,
+          "release_type": "repress",
+          "confidence": 0.9
+        }
+      ],
+      "reasoning": "Title announces a vinyl edition (Mobile Fidelity 180g 45RPM 2LP box) of Miles Davis' Kind of Blue. No color variant or limitation count given; retailer/label identified as Mobile Fidelity. Release type inferred as repress since it is a reissue/audiophile edition of a classic album, though it could be treated as a new release of that pressing \u2014 confidence reduced slightly for that ambiguity."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "comma_artist_restock",
+      "category": "Internal Comma in Artist & Restock Tag",
+      "title": "RESTOCK: Tyler, The Creator - IGOR (Mint Green Special Edition LP)",
+      "expected": {
+        "is_vinyl_release": true,
+        "count": 1,
+        "artist": "Tyler, The Creator",
+        "album_title": "IGOR",
+        "release_type": "restock",
+        "color_variant": "Mint Green"
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "Tyler, The Creator",
+          "album_title": "IGOR",
+          "format_variant": "Mint Green Special Edition LP",
+          "color_variant": "Mint Green",
+          "limitation_count": null,
+          "retailer": null,
+          "is_soundtrack": false,
+          "release_type": "restock",
+          "confidence": 0.97
+        }
+      ],
+      "reasoning": "Title explicitly indicates a restock of Tyler, The Creator's IGOR in a Mint Green Special Edition LP. No retailer or limitation count specified."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "hyphenated_band",
+      "category": "Hyphen in Band Name",
+      "title": "blink-182 - Enema of the State",
+      "expected": {
+        "is_vinyl_release": true,
+        "count": 1,
+        "artist": "blink-182",
+        "album_title": "Enema of the State"
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "blink-182",
+          "album_title": "Enema of the State",
+          "format_variant": null,
+          "color_variant": null,
+          "limitation_count": null,
+          "retailer": null,
+          "is_soundtrack": false,
+          "release_type": "unknown",
+          "confidence": 0.75
+        }
+      ],
+      "reasoning": "Title is a bare Artist - Album format with no variant, retailer, or date info. Treated as a vinyl release announcement with low specificity; release_type unknown since no explicit pre-order/repress/restock language is present."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "soundtrack_no_hyphen",
+      "category": "Video Game OST without Artist Delimiter",
+      "title": "The Elder Scrolls IV: Oblivion (Game Soundtrack) (Oblivion Gate Orange 2LP)",
+      "expected": {
+        "is_vinyl_release": true,
+        "count": 1,
+        "is_soundtrack": true,
+        "color_variant": "Oblivion Gate Orange"
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "Various Artists",
+          "album_title": "The Elder Scrolls IV: Oblivion (Game Soundtrack)",
+          "format_variant": "Oblivion Gate Orange 2LP",
+          "color_variant": "Oblivion Gate Orange",
+          "limitation_count": null,
+          "retailer": null,
+          "is_soundtrack": true,
+          "release_type": "unknown",
+          "confidence": 0.9
+        }
+      ],
+      "reasoning": "Title announces a video game soundtrack vinyl variant (Oblivion Gate Orange 2LP). No composer named, so used 'Various Artists' with is_soundtrack=True. No retailer, limitation, or explicit release event given, so release_type is 'unknown'."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "composer_soundtrack",
+      "category": "Film Score with Composer",
+      "title": "Hans Zimmer - Dune: Part Two (Original Motion Picture Soundtrack)",
+      "expected": {
+        "is_vinyl_release": true,
+        "count": 1,
+        "artist": "Hans Zimmer",
+        "album_title": "Dune: Part Two",
+        "is_soundtrack": true
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "Hans Zimmer",
+          "album_title": "Dune: Part Two (Original Motion Picture Soundtrack)",
+          "format_variant": null,
+          "color_variant": null,
+          "limitation_count": null,
+          "retailer": null,
+          "is_soundtrack": true,
+          "release_type": "new_release",
+          "confidence": 0.95
+        }
+      ],
+      "reasoning": "Title is a clear release announcement for Hans Zimmer's Dune: Part Two soundtrack. No color variant, limitation, or retailer info present, so those fields are left null. Flagged as a soundtrack release."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "split_release",
+      "category": "Split Release Multi-Artist",
+      "title": "Converge / Dropdead - Split (7\" /500)",
+      "expected": {
+        "is_vinyl_release": true,
+        "count": 1,
+        "artist": "Converge / Dropdead",
+        "limitation_count": 500
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "Converge / Dropdead",
+          "album_title": "Split",
+          "format_variant": "7\"",
+          "color_variant": null,
+          "limitation_count": 500,
+          "retailer": null,
+          "is_soundtrack": false,
+          "release_type": "unknown",
+          "confidence": 0.92
+        }
+      ],
+      "reasoning": "Title announces a vinyl release: split 7\" between Converge and Dropdead, limited to 500. Artist joined with '/' per split-release convention. No color, retailer, or explicit release event specified, so those default to null/'unknown'."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "self_titled",
+      "category": "Self-Titled Album",
+      "title": "Paramore - Paramore (Indie Exclusive Tangerine Vinyl)",
+      "expected": {
+        "is_vinyl_release": true,
+        "count": 1,
+        "artist": "Paramore",
+        "album_title": "Paramore",
+        "color_variant": "Tangerine"
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "Paramore",
+          "album_title": "Paramore",
+          "format_variant": "Indie Exclusive Tangerine Vinyl",
+          "color_variant": "Tangerine",
+          "limitation_count": null,
+          "retailer": "Indie Exclusive",
+          "is_soundtrack": false,
+          "release_type": "new_release",
+          "confidence": 0.93
+        }
+      ],
+      "reasoning": "Self-titled Paramore album announced with indie exclusive tangerine vinyl. No limitation count given. 'Indie Exclusive' treated as retailer/availability descriptor."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "bootleg",
+      "category": "Bootleg Tagging",
+      "title": "[BOOTLEG] Frank Ocean - Nostalgia, Ultra (Orange Vinyl)",
+      "expected": {
+        "is_vinyl_release": true,
+        "count": 1,
+        "artist": "Frank Ocean",
+        "album_title": "Nostalgia, Ultra",
+        "release_type": "bootleg",
+        "color_variant": "Orange"
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "Frank Ocean",
+          "album_title": "Nostalgia, Ultra",
+          "format_variant": "Orange Vinyl",
+          "color_variant": "Orange",
+          "limitation_count": null,
+          "retailer": null,
+          "is_soundtrack": false,
+          "release_type": "bootleg",
+          "confidence": 0.98
+        }
+      ],
+      "reasoning": "Title is a bootleg vinyl announcement for Frank Ocean's mixtape Nostalgia, Ultra on orange vinyl. Color extracted from parentheses; no retailer or limitation specified. Tagged as bootleg per the [BOOTLEG] prefix."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "multi_item_dump",
+      "category": "Batch Multi-Item Restock Dump",
+      "title": "VMP Restocks: Fiona Apple, Outkast, The Mars Volta, DMX",
+      "expected": {
+        "is_vinyl_release": true,
+        "retailer": "VMP",
+        "release_type": "restock",
+        "min_releases": 4
+      }
+    },
+    "result": {
+      "is_vinyl_release": true,
+      "releases": [
+        {
+          "artist": "Fiona Apple",
+          "album_title": "",
+          "format_variant": null,
+          "color_variant": null,
+          "limitation_count": null,
+          "retailer": "VMP",
+          "is_soundtrack": false,
+          "release_type": "restock",
+          "confidence": 0.6
+        },
+        {
+          "artist": "Outkast",
+          "album_title": "",
+          "format_variant": null,
+          "color_variant": null,
+          "limitation_count": null,
+          "retailer": "VMP",
+          "is_soundtrack": false,
+          "release_type": "restock",
+          "confidence": 0.6
+        },
+        {
+          "artist": "The Mars Volta",
+          "album_title": "",
+          "format_variant": null,
+          "color_variant": null,
+          "limitation_count": null,
+          "retailer": "VMP",
+          "is_soundtrack": false,
+          "release_type": "restock",
+          "confidence": 0.6
+        },
+        {
+          "artist": "DMX",
+          "album_title": "",
+          "format_variant": null,
+          "color_variant": null,
+          "limitation_count": null,
+          "retailer": "VMP",
+          "is_soundtrack": false,
+          "release_type": "restock",
+          "confidence": 0.6
+        }
+      ],
+      "reasoning": "Batch VMP restock announcement listing artists only, no album titles given \u2014 left album_title empty rather than hallucinating titles. Split into four ExtractedRelease entries, one per artist, with retailer VMP and release_type restock. Moderate confidence due to lack of album titles/variant info."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "discussion_filter",
+      "category": "Discussion Filter (Non-Release)",
+      "title": "[Discussion] What's your favorite pressing of In Rainbows?",
+      "expected": {
+        "is_vinyl_release": false,
+        "count": 0
+      }
+    },
+    "result": {
+      "is_vinyl_release": false,
+      "releases": [],
+      "reasoning": "Title is tagged [Discussion] and asks for opinions on pressings of Radiohead's 'In Rainbows' rather than announcing a specific release, so no release data is extracted."
+    },
+    "error": null
+  },
+  {
+    "case": {
+      "id": "iso_filter",
+      "category": "In Search Of (ISO) Filter (Non-Release)",
+      "title": "[ISO] Looking for Blonde by Frank Ocean (Official Black Friday edition)",
+      "expected": {
+        "is_vinyl_release": false,
+        "count": 0
+      }
+    },
+    "result": {
+      "is_vinyl_release": false,
+      "releases": [],
+      "reasoning": "Title is tagged [ISO] (In Search Of), indicating a buyer looking for an existing release rather than announcing a release, so is_vinyl_release is False and no releases are extracted."
+    },
+    "error": null
+  }
+]
