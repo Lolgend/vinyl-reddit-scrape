@@ -1,3 +1,5 @@
-# Time-Series Velocity for Hype Scoring
+# Time-Series Snapshots for Ingestion & Decoupled Downstream Scoring
 
-Newly announced releases initially have zero comments and a single upvote, making a one-time static metric check ineffective for detecting real community hype. We decided to capture periodic timestamped snapshots of engagement metrics and compute velocity ($\Delta \text{score}/\Delta t$, $\Delta \text{comments}/\Delta t$) with time-decay weighting. This surfaces breaking drops and surging re-presses based on momentum rather than cumulative age bias.
+Newly announced releases initially have zero comments and a single upvote, making a one-time static metric check ineffective for detecting real community momentum or stock status mutations (e.g. `SOLD OUT`). 
+
+We decided to capture periodic timestamped snapshots of engagement metrics (`submission_snapshots`) within the ingestion pipeline to preserve historical time-series data. However, calculating derived engagement velocity ($\Delta \text{score}/\Delta t$, $\Delta \text{comments}/\Delta t$), freshness decay parameterization, and leaderboard ranking windows is decoupled from the scraper engine and deferred to downstream analytics/backend services. This maintains a clean single responsibility for the scraper: high-fidelity ingestion, raw metric logging, and structured release extraction.
