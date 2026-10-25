@@ -238,10 +238,9 @@ class TestBenchmarkFixtures:
         import json
 
         json_path = (
-            Path(__file__).parent.parent
-            / "src"
-            / "reddit_scrape"
-            / "prototype_results.json"
+            Path(__file__).parent
+            / "fixtures"
+            / "benchmark_cases.json"
         )
         assert json_path.exists(), f"Missing fixture file at {json_path}"
 
