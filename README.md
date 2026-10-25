@@ -1,6 +1,6 @@
 # Reddit Vinyl Releases Scraper
 
-Continuous dual-loop Reddit scraper and structured entity extraction pipeline for `r/vinylreleases`. Ingests community announcements, tracks engagement velocity and flair mutations, extracts multi-artist discography releases using DeepSeek LLM via PydanticAI with chunked array batching and automatic single-submission fallback, and persists normalized relational vinyl entities in PostgreSQL.
+Continuous dual-loop Reddit scraper and structured entity extraction pipeline for `r/vinylreleases`. Ingests community announcements, tracks engagement velocity and flair mutations, extracts multi-artist discography releases using DeepSeek LLM via PydanticAI with array batching and automatic single-submission fallback, and persists normalized relational vinyl entities in PostgreSQL.
 
 ---
 
@@ -21,7 +21,7 @@ flowchart TD
     end
 
     subgraph ExtractionEngine["Batch Extraction Engine"]
-        Chunker["Chunk Partitioning (size: llm_batch_size)"]
+        Batcher["Batch Partitioning (size: llm_batch_size)"]
         LLMBatch["DeepSeek LLM (Batch Array Prompt)"]
         Fallback["Single-Submission Fallback"]
     end
@@ -36,8 +36,8 @@ flowchart TD
     PNew -->|Upsert submissions & log discoveries| SubTable
     PHot -->|Update engagement & mutate flairs| SubTable
     PNew -.->|Signal unextracted ready| BQueue
-    BQueue --> Chunker
-    Chunker --> LLMBatch
+    BQueue --> Batcher
+    Batcher --> LLMBatch
     LLMBatch -->|Success| Worker
     LLMBatch -.->|Error or Omission| Fallback
     Fallback --> Worker
@@ -46,8 +46,8 @@ flowchart TD
 
 The pipeline operates with:
 - **Dual-loop ingestion**: `/new` polls discover new release announcements, while `/hot` polls monitor engagement velocity and flair mutations (e.g. `SOLD OUT`).
-- **Decoupled extraction worker**: Ingestion loops enqueue unextracted candidate submissions without blocking on LLM inference. A background worker processes candidates in chunked batches.
-- **Array batch extraction with automated fallback**: Bounded candidate chunks (default: 5 submissions) are evaluated simultaneously in structured array prompts. If a batch call fails or omits submissions, the worker falls back to individual extraction per submission to guarantee zero data loss.
+- **Decoupled extraction worker**: Ingestion loops enqueue unextracted candidate submissions without blocking on LLM inference. A background worker processes candidates in bounded batches.
+- **Array batch extraction with automated fallback**: Bounded candidate batches (default: 5 submissions) are evaluated simultaneously in structured array prompts. If a batch call fails or omits submissions, the worker falls back to individual extraction per submission to guarantee zero data loss.
 
 ---
 
@@ -77,11 +77,22 @@ Configure a `.env` file at the repository root:
 | `DEEPSEEK_API_KEY` | **Yes** | - | API key for DeepSeek LLM (alias: `DEEPSEEK_KEY`) |
 | `DEEPSEEK_BASE_URL` | No | `https://api.deepseek.com` | Base URL for DeepSeek API endpoint |
 | `DEEPSEEK_MODEL` | No | `deepseek-chat` | Model name for extraction (`deepseek-chat`) |
-| `LLM_THINKING_LEVEL` | No | `low` | Reasoning effort (`none`, `minimal`, `low`, `medium`, `high`, `max`) |
+| `LLM_THINKING_LEVEL` | No | Model-aware (`none` for chat, `low` for reasoning) | Reasoning effort (`none`, `minimal`, `low`, `medium`, `high`, `max`) |
 | `LLM_BATCH_SIZE` | No | `5` | Submissions batched per LLM extraction call (positive integer) |
 | `POLL_INTERVAL_SECONDS` | No | `300` | Discovery poll interval for `/new` (seconds) |
 | `HOT_POLL_INTERVAL_SECONDS` | No | `900` | Metric tracking poll interval for `/hot` (seconds) |
 | `SNAPSHOT_RETENTION_DAYS` | No | `30` | Default retention threshold for snapshot pruning |
+
+### Database Setup & Migrations
+
+PostgreSQL tables, foreign key relationships, and indexes are managed declaratively via SQLAlchemy metadata:
+
+- **Automatic Initialization**: When running the poller service (`reddit-scrape run`), `reddit_scrape.db.init_db()` is called automatically on startup to ensure all relational tables and indexes exist.
+- **Manual Initialization**: Tables can also be created or verified directly via Python:
+  ```powershell
+  uv run python -c "from reddit_scrape.db import init_db; init_db()"
+  ```
+- **Migrations**: Declarative tables are created idempotently via `Base.metadata.create_all()`. For automated operational deployments, invoking `init_db()` guarantees database readiness before service execution.
 
 ---
 
@@ -110,7 +121,7 @@ uv run python -m reddit_scrape.cli run --llm-batch-size 8 --thinking-level mediu
 - `-v`, `--verbose`: Enable verbose stream logging (configures root logger to `INFO` level with standard timestamped format).
 - `--log-level`: Set explicit logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`).
 - `--llm-batch-size`: Number of submissions batched per LLM extraction prompt (default: `LLM_BATCH_SIZE` or `5`).
-- `--thinking-level`: LLM reasoning effort level (`none`, `minimal`, `low`, `medium`, `high`, `max`; default: `LLM_THINKING_LEVEL` or `low`).
+- `--thinking-level`: LLM reasoning effort level (`none`, `minimal`, `low`, `medium`, `high`, `max`; default: `LLM_THINKING_LEVEL` or model-aware default).
 - `--new-interval`: Polling interval in seconds for `/new` (default: `POLL_INTERVAL_SECONDS` or `300`).
 - `--hot-interval`: Polling interval in seconds for `/hot` (default: `HOT_POLL_INTERVAL_SECONDS` or `900`).
 - `--new-limit`: Number of submissions to fetch per `/new` poll (default: `50`).
@@ -132,7 +143,7 @@ uv run python -m reddit_scrape.cli purge-snapshots --days 14 --batch-size 10000
 
 ## Batch Extraction & Resilience Engine
 
-For high throughput during backlogs, `PollerService` partitions candidate submissions into bounded chunks (`llm_batch_size`). Submissions within each chunk are evaluated simultaneously by `ExtractionWorker.extract_batch` using a structured schema:
+For high throughput during backlogs, `PollerService` partitions candidate submissions into bounded batches (`llm_batch_size`). Submissions within each batch are evaluated simultaneously by `ExtractionWorker.extract_batch` using a structured schema:
 
 ```python
 class BatchExtractedItem(BaseModel):
@@ -145,8 +156,8 @@ class BatchExtractionResult(BaseModel):
 
 ### Fault Tolerance & Isolation
 1. **Batch Exception Fallback**: If an entire batch request fails (network error, timeout, or schema parsing), the worker catches the error and immediately falls back to extracting each submission individually.
-2. **Omission Fallback**: If the LLM omits one or more submission IDs in its response, missing submissions are automatically extracted via individual fallback.
-3. **Queue Pause on Shutdown**: When `SIGINT` or `SIGTERM` is received, running chunks complete cleanly, and subsequent chunks are paused until restart.
+2. **Omission Fallback**: If the LLM omits one or more submission IDs in its response, missing submissions are automatically extracted via individual fallback. Any failure during individual extraction is safely handled without failing other submissions.
+3. **Queue Pause on Shutdown**: When `SIGINT` or `SIGTERM` is received, running batches complete cleanly, and subsequent batches are paused until restart.
 
 See [ADR 0006: Array Batch Extraction with Automated Single-Submission Fallback](docs/adr/0006-array-batch-extraction-with-fallback.md) for architectural details.
 

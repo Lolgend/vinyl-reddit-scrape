@@ -18,7 +18,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from reddit_scrape.db import get_database_url, get_session_factory
-from reddit_scrape.extraction import ExtractionResult, ExtractionWorker
+from reddit_scrape.extraction import (
+    ExtractionResult,
+    ExtractionWorker,
+    get_default_thinking_level,
+)
 from reddit_scrape.ingestion import (
     IngestionStats,
     RedditSourceAdapter,
@@ -45,7 +49,7 @@ class ServiceConfig:
     reddit_user_agent: str = "python:vinyl-releases-scraper:v0.1.0"
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
-    llm_thinking_level: str = "low"
+    llm_thinking_level: str = "none"
     llm_batch_size: int = 5
 
 
@@ -104,16 +108,15 @@ def validate_environment(
     deepseek_model = env.get("DEEPSEEK_MODEL", "deepseek-chat")
 
     raw_thinking_level = env.get("LLM_THINKING_LEVEL")
-    if raw_thinking_level is None or not str(raw_thinking_level).strip():
-        thinking_level = "low"
-    else:
+    if raw_thinking_level is not None and str(raw_thinking_level).strip():
         thinking_level = str(raw_thinking_level).strip().lower()
-
-    if thinking_level not in VALID_THINKING_LEVELS:
-        raise ValueError(
-            f"Invalid LLM_THINKING_LEVEL: {raw_thinking_level}. "
-            f"Allowed: {', '.join(sorted(VALID_THINKING_LEVELS))}"
-        )
+        if thinking_level not in VALID_THINKING_LEVELS:
+            raise ValueError(
+                f"Invalid LLM_THINKING_LEVEL: {raw_thinking_level}. "
+                f"Allowed: {', '.join(sorted(VALID_THINKING_LEVELS))}"
+            )
+    else:
+        thinking_level = get_default_thinking_level(str(deepseek_model))
 
     raw_batch_size = env.get("LLM_BATCH_SIZE")
     if raw_batch_size is None or not str(raw_batch_size).strip():
@@ -182,14 +185,18 @@ class _AsyncRunner:
 
     def stop(self) -> None:
         with self._lock:
+            is_current_thread = (
+                self._thread is not None and threading.current_thread() == self._thread
+            )
             if self._loop is not None and self._loop.is_running():
                 self._loop.call_soon_threadsafe(self._loop.stop)
-            if self._thread is not None and self._thread.is_alive():
-                self._thread.join(timeout=5.0)
-            if self._loop is not None and not self._loop.is_closed():
-                self._loop.close()
-            self._loop = None
-            self._thread = None
+            if not is_current_thread:
+                if self._thread is not None and self._thread.is_alive():
+                    self._thread.join(timeout=5.0)
+                if self._loop is not None and not self._loop.is_closed():
+                    self._loop.close()
+                self._loop = None
+                self._thread = None
 
 
 class PollerService:
@@ -236,7 +243,7 @@ class PollerService:
         try:
             if hasattr(self, "_async_runner"):
                 self._async_runner.stop()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     def stop(self) -> None:
@@ -282,24 +289,18 @@ class PollerService:
         return res
 
     def _extract_batch(
-        self, chunk_tuples: list[tuple[str, str, str | None]]
+        self, batch_tuples: list[tuple[str, str, str | None]]
     ) -> dict[str, ExtractionResult]:
         """Invoke extraction worker batch extraction, handling both sync and async return values."""
         if hasattr(self.extraction_worker, "extract_batch"):
-            try:
-                res = self.extraction_worker.extract_batch(chunk_tuples)
-                if inspect.iscoroutine(res):
-                    res = self._run_coroutine(res)
-                if isinstance(res, dict):
-                    return res
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "extract_batch failed (%s: %s); falling back to single extraction",
-                    type(exc).__name__,
-                    exc,
-                )
+            res = self.extraction_worker.extract_batch(batch_tuples)
+            if inspect.iscoroutine(res):
+                res = self._run_coroutine(res)
+            if isinstance(res, dict):
+                return res
+
         results: dict[str, ExtractionResult] = {}
-        for sub_id, title, flair in chunk_tuples:
+        for sub_id, title, flair in batch_tuples:
             try:
                 results[sub_id] = self._extract(title, flair)
             except Exception as exc:  # noqa: BLE001
@@ -324,6 +325,16 @@ class PollerService:
         if fetch_limit <= 0:
             return IngestionStats()
         items = self.reddit_adapter.fetch_hot(limit=fetch_limit)
+        if items:
+            logger.info("Polled /hot: tracked %d active submission(s)", len(items))
+            for item in items:
+                logger.debug(
+                    "  - [%s] (score=%d, comments=%d) %s",
+                    item.id,
+                    item.score,
+                    item.num_comments,
+                    item.title,
+                )
         return self.ingester.ingest_submissions(items)
 
     def process_unextracted_submissions(
@@ -347,26 +358,26 @@ class PollerService:
             if not candidates:
                 return 0
 
-            chunk_size = max(1, self.llm_batch_size)
-            chunks = [
-                candidates[i : i + chunk_size]
-                for i in range(0, len(candidates), chunk_size)
+            partition_size = max(1, self.llm_batch_size)
+            batches = [
+                candidates[i : i + partition_size]
+                for i in range(0, len(candidates), partition_size)
             ]
 
             extracted_count = 0
-            for chunk in chunks:
+            for batch in batches:
                 if self._shutdown_event.is_set():
                     logger.info("Shutdown requested, pausing extraction queue.")
                     break
 
-                chunk_tuples = [(sub_id, title, flair) for sub_id, title, flair in chunk]
+                batch_tuples = [(sub_id, title, flair) for sub_id, title, flair in batch]
                 start_time = time.perf_counter()
                 try:
-                    batch_results = self._extract_batch(chunk_tuples)
+                    batch_results = self._extract_batch(batch_tuples)
                 except Exception as exc:  # noqa: BLE001
                     logger.error(
-                        "Batch extraction failed for chunk of %d submissions: %s",
-                        len(chunk),
+                        "Batch extraction failed for batch of %d submissions: %s",
+                        len(batch),
                         exc,
                     )
                     continue
@@ -374,11 +385,11 @@ class PollerService:
                 elapsed = time.perf_counter() - start_time
                 logger.info(
                     "Batch extraction completed for %d submissions in %.2fs",
-                    len(chunk),
+                    len(batch),
                     elapsed,
                 )
 
-                for sub_id, title, flair in chunk:
+                for sub_id, title, flair in batch:
                     try:
                         result = batch_results.get(sub_id)
                         if result is None:
@@ -445,7 +456,7 @@ class PollerService:
                         "Extracted and persisted %d release submissions in background",
                         extracted,
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "Error processing unextracted submissions in background: %s",
                     exc,
@@ -474,7 +485,7 @@ class PollerService:
             self.poll_new()
             self.poll_hot()
             self.trigger_extraction()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.error("Error during initial poll cycle: %s", exc)
 
         last_new_poll = time.time()
@@ -492,7 +503,7 @@ class PollerService:
                         logger.info("Executing discovery poll (/new)...")
                         self.poll_new()
                         self.trigger_extraction()
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         logger.error("Error during discovery poll (/new): %s", exc)
                     last_new_poll = time.time()
 
@@ -501,7 +512,7 @@ class PollerService:
                         logger.info("Executing tracking poll (/hot)...")
                         self.poll_hot()
                         self.trigger_extraction()
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         logger.error("Error during tracking poll (/hot): %s", exc)
                     last_hot_poll = time.time()
 
