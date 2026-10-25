@@ -53,15 +53,11 @@ class RawSubmission:
     id: str  # Reddit base36 identifier (e.g. '123abc')
     title: str
     url: str
-    permalink: str
     created_utc: datetime | float | int
     score: int = 0
     upvote_ratio: float = 1.0
     num_comments: int = 0
     flair: Optional[str] = None
-    author: Optional[str] = None
-    is_self: bool = False
-    selftext: Optional[str] = None
     fullname: Optional[str] = None  # Reddit fullname (e.g. 't3_123abc')
 
     def get_created_utc_datetime(self) -> datetime:
@@ -100,11 +96,7 @@ class SubmissionIngester:
             reddit_id=item.id,
             title=item.title,
             url=item.url,
-            permalink=item.permalink,
             flair=item.flair,
-            author=item.author,
-            is_self=item.is_self,
-            selftext=item.selftext,
             latest_score=item.score,
             latest_upvote_ratio=item.upvote_ratio,
             latest_num_comments=item.num_comments,
@@ -136,7 +128,6 @@ class SubmissionIngester:
             score=item.score,
             upvote_ratio=item.upvote_ratio,
             num_comments=item.num_comments,
-            flair=item.flair,
         )
         session.add(snapshot)
 
@@ -195,36 +186,24 @@ class RedditSourceAdapter:
                 id=item["id"],
                 title=item["title"],
                 url=item["url"],
-                permalink=item["permalink"],
                 created_utc=coerce_to_utc_datetime(item["created_utc"]),
                 score=item.get("score", 0),
                 upvote_ratio=item.get("upvote_ratio", 1.0),
                 num_comments=item.get("num_comments", 0),
                 flair=item.get("flair") or item.get("link_flair_text"),
-                author=item.get("author"),
-                is_self=item.get("is_self", False),
-                selftext=item.get("selftext"),
                 fullname=item.get("fullname") or item.get("name"),
             )
 
         # Assuming PRAW Submission object
-        author_name = None
-        if hasattr(item, "author") and item.author:
-            author_name = getattr(item.author, "name", str(item.author))
-
         return RawSubmission(
             id=item.id,
             title=item.title,
             url=item.url,
-            permalink=item.permalink,
             created_utc=coerce_to_utc_datetime(item.created_utc),
             score=getattr(item, "score", 0),
             upvote_ratio=getattr(item, "upvote_ratio", 1.0),
             num_comments=getattr(item, "num_comments", 0),
             flair=getattr(item, "link_flair_text", None) or getattr(item, "flair", None),
-            author=author_name,
-            is_self=getattr(item, "is_self", False),
-            selftext=getattr(item, "selftext", None),
             fullname=getattr(item, "name", None) or getattr(item, "fullname", None),
         )
 

@@ -67,10 +67,7 @@ def test_purge_old_snapshots_keeps_recent(session_factory):
             reddit_id="t3_retention1",
             title="Daft Punk - Discovery (Gatefold 2LP)",
             url="https://example.com/daft-punk",
-            permalink="/r/vinylreleases/comments/retention1/daft_punk",
             flair="Sold Out",
-            author="collector1",
-            is_self=False,
             latest_score=250,
             latest_upvote_ratio=0.98,
             latest_num_comments=45,
@@ -102,7 +99,6 @@ def test_purge_old_snapshots_keeps_recent(session_factory):
             score=10,
             upvote_ratio=1.0,
             num_comments=2,
-            flair="New Release",
             captured_at=now - timedelta(days=45),
         )
         snap_old2 = SubmissionSnapshot(
@@ -110,7 +106,6 @@ def test_purge_old_snapshots_keeps_recent(session_factory):
             score=50,
             upvote_ratio=0.95,
             num_comments=12,
-            flair="New Release",
             captured_at=now - timedelta(days=35),
         )
         snap_recent1 = SubmissionSnapshot(
@@ -118,7 +113,6 @@ def test_purge_old_snapshots_keeps_recent(session_factory):
             score=180,
             upvote_ratio=0.97,
             num_comments=30,
-            flair="Pre-Order",
             captured_at=now - timedelta(days=15),
         )
         snap_recent2 = SubmissionSnapshot(
@@ -126,7 +120,6 @@ def test_purge_old_snapshots_keeps_recent(session_factory):
             score=250,
             upvote_ratio=0.98,
             num_comments=45,
-            flair="Sold Out",
             captured_at=now - timedelta(days=2),
         )
         session.add_all([snap_old1, snap_old2, snap_recent1, snap_recent2])
@@ -177,7 +170,6 @@ def test_purge_chunked_batched_deletion(session_factory):
             reddit_id="t3_retention2",
             title="Radiohead - OK Computer",
             url="https://example.com/radiohead",
-            permalink="/r/vinylreleases/comments/retention2/radiohead",
             latest_score=300,
             latest_upvote_ratio=0.99,
             latest_num_comments=80,
@@ -227,7 +219,6 @@ def test_purge_when_no_snapshots_eligible(session_factory):
             reddit_id="t3_retention3",
             title="The Beatles - Abbey Road",
             url="https://example.com/beatles",
-            permalink="/r/vinylreleases/comments/retention3/beatles",
             latest_score=100,
             latest_upvote_ratio=0.95,
             latest_num_comments=10,
@@ -279,7 +270,6 @@ def test_cli_purge_snapshots(session_factory, monkeypatch, capsys):
             reddit_id="t3_cli1",
             title="Pink Floyd - The Dark Side of the Moon",
             url="https://example.com/pink-floyd",
-            permalink="/r/vinylreleases/comments/cli1/pink_floyd",
             latest_score=500,
             latest_upvote_ratio=0.99,
             latest_num_comments=120,
@@ -329,7 +319,6 @@ def test_cli_default_env_var(session_factory, monkeypatch, capsys):
             reddit_id="t3_clienv",
             title="Fleetwood Mac - Rumours",
             url="https://example.com/fleetwood",
-            permalink="/r/vinylreleases/comments/clienv/fleetwood",
             latest_score=150,
             latest_upvote_ratio=0.96,
             latest_num_comments=30,

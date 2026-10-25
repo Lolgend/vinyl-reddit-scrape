@@ -25,11 +25,7 @@ class Submission(Base):
     reddit_id = Column(String(16), nullable=False, unique=True, index=True)
     title = Column(Text, nullable=False)
     url = Column(Text, nullable=False)
-    permalink = Column(Text, nullable=False)
     flair = Column(Text, nullable=True)
-    author = Column(String(64), nullable=True)
-    is_self = Column(Boolean, nullable=False, default=False)
-    selftext = Column(Text, nullable=True)
     latest_score = Column(Integer, nullable=False, default=0)
     latest_upvote_ratio = Column(Float, nullable=False, default=1.0)
     latest_num_comments = Column(Integer, nullable=False, default=0)
@@ -66,7 +62,6 @@ class SubmissionSnapshot(Base):
     score = Column(Integer, nullable=False)
     upvote_ratio = Column(Float, nullable=False)
     num_comments = Column(Integer, nullable=False)
-    flair = Column(Text, nullable=True)
     captured_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (

@@ -102,8 +102,8 @@ flowchart TD
 - **Flair Filtering**: Immediately filters out posts tagged with `Discussion`, `Question`, `Collection`, `Advice`, or `ISO`.
 - **Submission Upsert**:
   ```sql
-  INSERT INTO submissions (id, reddit_id, title, url, permalink, flair, author, is_self, selftext, latest_score, latest_upvote_ratio, latest_num_comments, created_utc, is_extracted, is_release)
-  VALUES (:id, :reddit_id, :title, :url, :permalink, :flair, :author, :is_self, :selftext, :score, :upvote_ratio, :num_comments, :created_utc, FALSE, TRUE)
+  INSERT INTO submissions (id, reddit_id, title, url, flair, latest_score, latest_upvote_ratio, latest_num_comments, created_utc, is_extracted, is_release)
+  VALUES (:id, :reddit_id, :title, :url, :flair, :score, :upvote_ratio, :num_comments, :created_utc, FALSE, TRUE)
   ON CONFLICT (reddit_id) DO UPDATE SET
       flair = EXCLUDED.flair,
       latest_score = EXCLUDED.latest_score,
@@ -113,8 +113,8 @@ flowchart TD
   ```
 - **Unconditional Snapshot Logging**: Appends metric observations on each observation cycle:
   ```sql
-  INSERT INTO submission_snapshots (submission_id, score, upvote_ratio, num_comments, flair, captured_at)
-  VALUES (:submission_id, :score, :upvote_ratio, :num_comments, :flair, CURRENT_TIMESTAMP);
+  INSERT INTO submission_snapshots (submission_id, score, upvote_ratio, num_comments, captured_at)
+  VALUES (:submission_id, :score, :upvote_ratio, :num_comments, CURRENT_TIMESTAMP);
   ```
 
 ### 2. PostgreSQL Relational Storage & DDL
@@ -126,11 +126,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     reddit_id VARCHAR(16) NOT NULL UNIQUE,
     title TEXT NOT NULL,
     url TEXT NOT NULL,
-    permalink TEXT NOT NULL,
     flair TEXT,
-    author VARCHAR(64),
-    is_self BOOLEAN DEFAULT FALSE,
-    selftext TEXT,
     latest_score INT DEFAULT 0,
     latest_upvote_ratio FLOAT DEFAULT 1.0,
     latest_num_comments INT DEFAULT 0,
@@ -151,7 +147,6 @@ CREATE TABLE IF NOT EXISTS submission_snapshots (
     score INT NOT NULL,
     upvote_ratio FLOAT NOT NULL,
     num_comments INT NOT NULL,
-    flair TEXT,
     captured_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
