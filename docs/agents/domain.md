@@ -49,3 +49,7 @@ If the concept you need isn't in the glossary yet, that's a signal: either you'r
 If your output contradicts an existing ADR, surface it explicitly rather than silently overriding:
 
 > _Contradicts ADR-0007 (event-sourced orders), but worth reopening because…_
+
+## Keep ADRs and Glossary in sync during implementation
+
+When implementing a ticket that changes a schema, persistence invariant, or cursor rule documented in `GLOSSARY.md` or `docs/adr/`, update the relevant glossary entry or ADR in the same change.

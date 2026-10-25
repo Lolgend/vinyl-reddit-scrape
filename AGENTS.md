@@ -9,14 +9,14 @@ Package manager & runner is `uv`.
 ### Toolchain & Commands
 - Run tests: `uv run pytest` (Always use `BypassSandbox: true`)
 - Type check: `uv run mypy src tests` (Always use `BypassSandbox: true`)
-- Lint / format: `uv run ruff check .`
+- Lint / format: `uv run ruff check .` (Always use `BypassSandbox: true`)
 - GitHub CLI: `gh` (Always use `BypassSandbox: true`)
-- Git write ops (`git branch`, `git worktree`): Always use `BypassSandbox: true`
+- Git commands (`git status`, `git diff`, `git log`, `git branch`, `git worktree`, and any `git` operation inside`.worktrees/`): Always use `BypassSandbox: true`
 - PowerShell: Chain commands with `;`, not `&&`
 
 ### Asynchronous Tasks
 
-Long-running commands (>5-10s) transition to background tasks automatically. Do not poll `manage_task(Action="status")` in a loop; the system provides reactive wakeup upon task completion.
+End your turn immediately** (call no more tools) after calling `invoke_subagent` or when `run_command` transitions to a background task. The runtime wakes you automatically when the subagent replies or the task finishes. Never call `manage_subagents(Action="list")` or `manage_task(Action="status")` to wait for completion.
 
 ## Agent skills
 
