@@ -68,6 +68,12 @@ def create_parser() -> argparse.ArgumentParser:
         default=50,
         help="Limit of submissions to fetch per /hot poll (default: 50)",
     )
+    run_parser.add_argument(
+        "--thinking-level",
+        choices=["none", "minimal", "low", "medium", "high", "max"],
+        default=None,
+        help="Reasoning effort level for LLM extraction (default: LLM_THINKING_LEVEL or low)",
+    )
 
     return parser
 
@@ -102,12 +108,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.hot_interval is not None
             else config.hot_poll_interval_seconds
         )
+        thinking_level = args.thinking_level or config.llm_thinking_level
 
         service = PollerService(
             poll_interval_seconds=new_interval,
             hot_poll_interval_seconds=hot_interval,
             new_limit=args.new_limit,
             hot_limit=args.hot_limit,
+            thinking_level=thinking_level,
         )
 
         if args.once:

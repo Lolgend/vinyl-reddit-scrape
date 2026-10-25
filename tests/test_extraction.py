@@ -113,6 +113,32 @@ class TestAgentConfiguration:
         assert agent is not None
         assert agent.output_type == ExtractionResult
 
+    def test_create_extraction_agent_thinking_level_none(self):
+        agent = create_extraction_agent(api_key="sk-test", thinking_level="none")
+        assert agent.model_settings == {"thinking": False}
+
+        agent_upper = create_extraction_agent(api_key="sk-test", thinking_level="NONE")
+        assert agent_upper.model_settings == {"thinking": False}
+
+    @pytest.mark.parametrize("level", ["minimal", "low", "medium", "high", "max"])
+    def test_create_extraction_agent_thinking_levels(self, level):
+        agent = create_extraction_agent(api_key="sk-test", thinking_level=level)
+        assert agent.model_settings == {"thinking": level}
+
+    def test_create_extraction_agent_thinking_level_env_var(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        monkeypatch.setenv("LLM_THINKING_LEVEL", "medium")
+        agent = create_extraction_agent()
+        assert agent.model_settings == {"thinking": "medium"}
+
+        monkeypatch.setenv("LLM_THINKING_LEVEL", "none")
+        agent_none = create_extraction_agent()
+        assert agent_none.model_settings == {"thinking": False}
+
+        monkeypatch.delenv("LLM_THINKING_LEVEL", raising=False)
+        agent_default = create_extraction_agent()
+        assert agent_default.model_settings == {"thinking": "low"}
+
 
 class TestExtractionAsyncLogic:
     @pytest.mark.asyncio
@@ -230,6 +256,42 @@ class TestExtractionAsyncLogic:
         assert len(res.releases) == 1
         assert res.releases[0].artists == ["Recovered Artist"]
         assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_extraction_worker_propagates_thinking_level(self, monkeypatch):
+        captured_kwargs = {}
+
+        def fake_create_agent(**kwargs):
+            captured_kwargs.update(kwargs)
+            return Agent(
+                TestModel(custom_output_args={"releases": []}),
+                output_type=ExtractionResult,
+                system_prompt=EXTRACTION_SYSTEM_PROMPT,
+            )
+
+        monkeypatch.setattr("reddit_scrape.extraction.create_extraction_agent", fake_create_agent)
+        worker = ExtractionWorker(thinking_level="minimal")
+        assert worker.thinking_level == "minimal"
+
+        agent = worker._get_agent()
+        assert agent is not None
+        assert captured_kwargs.get("thinking_level") == "minimal"
+
+        # Also verify recovery propagates thinking_level
+        captured_kwargs.clear()
+        call_count = 0
+
+        async def fake_extract_releases(title, flair=None, agent=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("Event loop is closed")
+            return ExtractionResult(releases=[])
+
+        monkeypatch.setattr("reddit_scrape.extraction.extract_releases", fake_extract_releases)
+        await worker.extract("Sample Title")
+        assert call_count == 2
+        assert captured_kwargs.get("thinking_level") == "minimal"
 
 
 class TestBenchmarkFixtures:
