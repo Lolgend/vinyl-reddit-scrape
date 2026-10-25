@@ -47,6 +47,7 @@ from reddit_scrape.service import (
     CycleStats,
     PollerService,
     ServiceConfig,
+    VALID_THINKING_LEVELS,
     validate_environment,
 )
 
@@ -92,6 +93,7 @@ __all__ = [
     "CycleStats",
     "PollerService",
     "ServiceConfig",
+    "VALID_THINKING_LEVELS",
     "validate_environment",
 ]
 

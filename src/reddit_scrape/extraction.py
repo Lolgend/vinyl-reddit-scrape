@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
 
 load_dotenv()
 
@@ -104,6 +105,7 @@ def create_extraction_agent(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     model_name: Optional[str] = None,
+    thinking_level: Optional[str] = None,
 ) -> Agent[None, ExtractionResult]:
     """Create a PydanticAI Agent configured for DeepSeek chat."""
     key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY")
@@ -113,6 +115,13 @@ def create_extraction_agent(
         )
     url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     model = model_name or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+    level = thinking_level or os.getenv("LLM_THINKING_LEVEL", "low")
+    model_settings: ModelSettings
+    if level.lower() == "none":
+        model_settings = {"thinking": False}
+    else:
+        model_settings = {"thinking": level.lower()}
 
     provider = OpenAIProvider(
         base_url=url,
@@ -124,6 +133,7 @@ def create_extraction_agent(
         chat_model,
         output_type=ExtractionResult,
         system_prompt=EXTRACTION_SYSTEM_PROMPT,
+        model_settings=model_settings,
     )
 
 
@@ -146,13 +156,18 @@ async def extract_releases(
 class ExtractionWorker:
     """Worker encapsulating release extraction logic and agent lifecycle."""
 
-    def __init__(self, agent: Optional[Agent] = None) -> None:
+    def __init__(
+        self,
+        agent: Optional[Agent] = None,
+        thinking_level: Optional[str] = None,
+    ) -> None:
         self.agent = agent
+        self.thinking_level = thinking_level
         self._owns_agent = agent is None
 
     def _get_agent(self) -> Agent:
         if self.agent is None:
-            self.agent = create_extraction_agent()
+            self.agent = create_extraction_agent(thinking_level=self.thinking_level)
         return self.agent
 
     async def extract(
@@ -166,7 +181,7 @@ class ExtractionWorker:
             return await extract_releases(title, flair=flair, agent=agent)
         except RuntimeError as exc:
             if "Event loop is closed" in str(exc) and self._owns_agent:
-                self.agent = create_extraction_agent()
+                self.agent = create_extraction_agent(thinking_level=self.thinking_level)
                 return await extract_releases(title, flair=flair, agent=self.agent)
             raise
 

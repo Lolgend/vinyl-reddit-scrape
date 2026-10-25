@@ -25,6 +25,8 @@ from reddit_scrape.persistence import ReleasePersistenceService
 
 logger = logging.getLogger(__name__)
 
+VALID_THINKING_LEVELS = {"none", "minimal", "low", "medium", "high", "max"}
+
 
 @dataclass
 class ServiceConfig:
@@ -39,6 +41,7 @@ class ServiceConfig:
     reddit_user_agent: str = "python:vinyl-releases-scraper:v0.1.0"
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
+    llm_thinking_level: str = "low"
 
 
 def validate_environment(
@@ -95,6 +98,18 @@ def validate_environment(
     deepseek_base_url = env.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     deepseek_model = env.get("DEEPSEEK_MODEL", "deepseek-chat")
 
+    raw_thinking_level = env.get("LLM_THINKING_LEVEL")
+    if raw_thinking_level is None or not str(raw_thinking_level).strip():
+        thinking_level = "low"
+    else:
+        thinking_level = str(raw_thinking_level).strip().lower()
+
+    if thinking_level not in VALID_THINKING_LEVELS:
+        raise ValueError(
+            f"Invalid LLM_THINKING_LEVEL: {raw_thinking_level}. "
+            f"Allowed: {', '.join(sorted(VALID_THINKING_LEVELS))}"
+        )
+
     return ServiceConfig(
         reddit_client_id=str(reddit_client_id),
         reddit_client_secret=str(reddit_client_secret),
@@ -105,6 +120,7 @@ def validate_environment(
         reddit_user_agent=str(reddit_user_agent),
         deepseek_base_url=str(deepseek_base_url),
         deepseek_model=str(deepseek_model),
+        llm_thinking_level=thinking_level,
     )
 
 
@@ -173,10 +189,14 @@ class PollerService:
         hot_poll_interval_seconds: int = 900,
         new_limit: int = 50,
         hot_limit: int = 50,
+        thinking_level: Optional[str] = None,
     ) -> None:
         self.session_factory = session_factory or get_session_factory()
         self.reddit_adapter = reddit_adapter or RedditSourceAdapter()
-        self.extraction_worker = extraction_worker or ExtractionWorker()
+        self.thinking_level = thinking_level
+        self.extraction_worker = extraction_worker or ExtractionWorker(
+            thinking_level=thinking_level
+        )
         self.persistence_service = persistence_service or ReleasePersistenceService(
             self.session_factory
         )
@@ -418,5 +438,6 @@ __all__ = [
     "CycleStats",
     "PollerService",
     "ServiceConfig",
+    "VALID_THINKING_LEVELS",
     "validate_environment",
 ]

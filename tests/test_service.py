@@ -109,6 +109,53 @@ class TestEnvironmentValidation:
         assert config.poll_interval_seconds == 60
         assert config.hot_poll_interval_seconds == 180
 
+    def test_validate_environment_thinking_level_default(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_key",
+        }
+        config = validate_environment(env)
+        assert config.llm_thinking_level == "low"
+
+    @pytest.mark.parametrize(
+        "level,expected",
+        [
+            ("none", "none"),
+            ("minimal", "minimal"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+            ("NONE", "none"),
+            ("Medium", "medium"),
+            ("MAX", "max"),
+        ],
+    )
+    def test_validate_environment_thinking_level_valid(self, level, expected):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_key",
+            "LLM_THINKING_LEVEL": level,
+        }
+        config = validate_environment(env)
+        assert config.llm_thinking_level == expected
+
+    @pytest.mark.parametrize("invalid_level", ["ultra", "off", "1", "false", "turbo"])
+    def test_validate_environment_thinking_level_invalid(self, invalid_level):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_key",
+            "LLM_THINKING_LEVEL": invalid_level,
+        }
+        with pytest.raises(ValueError, match="Invalid LLM_THINKING_LEVEL"):
+            validate_environment(env)
+
     @pytest.mark.parametrize(
         "missing_key",
         [
@@ -427,6 +474,12 @@ class TestPollerServiceEndToEnd:
         assert stats.extracted_count == 3
         service.stop()
 
+    def test_poller_service_propagates_thinking_level_to_worker(self):
+        service = PollerService(session_factory=MagicMock(), thinking_level="high")
+        assert service.thinking_level == "high"
+        assert service.extraction_worker.thinking_level == "high"
+        service.stop()
+
     def test_async_runner_lifecycle(self):
         runner = _AsyncRunner()
 
@@ -591,4 +644,5 @@ class TestCliRunner:
             hot_poll_interval_seconds=180,
             new_limit=50,
             hot_limit=50,
+            thinking_level="low",
         )
