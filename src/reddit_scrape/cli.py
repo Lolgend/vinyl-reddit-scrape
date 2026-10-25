@@ -1,12 +1,25 @@
 """Command-line interface for the Reddit scrape pipeline."""
 
 import argparse
+import logging
 import sys
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 from reddit_scrape.db import init_db
 from reddit_scrape.retention import get_default_retention_days, purge_snapshots
 from reddit_scrape.service import PollerService, validate_environment
+
+
+def configure_logging(verbose: bool = False, log_level: str | None = None) -> None:
+    """Configure standard stream logging formatting and level."""
+    if verbose or log_level:
+        level = getattr(logging, log_level.upper()) if log_level else logging.INFO
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            force=True,
+        )
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -45,6 +58,19 @@ def create_parser() -> argparse.ArgumentParser:
         help="Run a single poll and extraction cycle and exit",
     )
     run_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Enable verbose stream logging",
+    )
+    run_parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default=None,
+        help="Set explicit logging level",
+    )
+    run_parser.add_argument(
         "--new-interval",
         type=int,
         default=None,
@@ -74,11 +100,17 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="Reasoning effort level for LLM extraction (default: LLM_THINKING_LEVEL or low)",
     )
+    run_parser.add_argument(
+        "--llm-batch-size",
+        type=int,
+        default=None,
+        help="Submissions batched per LLM extraction call (default: LLM_BATCH_SIZE or 5)",
+    )
 
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Main CLI entrypoint."""
     parser = create_parser()
     args = parser.parse_args(argv)
@@ -90,6 +122,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.command == "run":
+        configure_logging(verbose=args.verbose, log_level=args.log_level)
+
         try:
             config = validate_environment()
         except ValueError as exc:
@@ -109,6 +143,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             else config.hot_poll_interval_seconds
         )
         thinking_level = args.thinking_level or config.llm_thinking_level
+        llm_batch_size = (
+            args.llm_batch_size
+            if args.llm_batch_size is not None
+            else config.llm_batch_size
+        )
 
         service = PollerService(
             poll_interval_seconds=new_interval,
@@ -116,6 +155,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             new_limit=args.new_limit,
             hot_limit=args.hot_limit,
             thinking_level=thinking_level,
+            llm_batch_size=llm_batch_size,
         )
 
         if args.once:
@@ -137,3 +177,4 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

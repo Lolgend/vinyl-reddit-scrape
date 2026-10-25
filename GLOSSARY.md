@@ -12,6 +12,10 @@ _Avoid_: Post, thread, article, listing
 A point-in-time timestamped observation of a submission's engagement metrics (score, upvote ratio, comment count).
 _Avoid_: Metric check, poll log, vote record
 
+**Extraction Batch**:
+A bounded chunk of unextracted candidate submissions (default: 5) evaluated simultaneously in a single LLM prompt with automated fallback to single-submission extraction on failure.
+_Avoid_: Request chunk, extraction group, bulk prompt
+
 **Release**:
 A distinct vinyl record product or edition announced to the public, identified by artist(s), album title, variant, and retailer.
 _Avoid_: Record, vinyl, drop, product, item
