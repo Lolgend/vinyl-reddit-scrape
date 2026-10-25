@@ -8,10 +8,16 @@ from reddit_scrape.db import (
     init_db,
 )
 from reddit_scrape.extraction import (
+    BATCH_EXTRACTION_SYSTEM_PROMPT,
     EXTRACTION_SYSTEM_PROMPT,
+    BatchExtractedItem,
+    BatchExtractionResult,
     ExtractedRelease,
     ExtractionResult,
     ExtractionWorker,
+    build_batch_extraction_prompt,
+    build_extraction_prompt,
+    create_batch_extraction_agent,
     create_extraction_agent,
     extract_releases,
     pre_clean_title,
@@ -44,6 +50,7 @@ from reddit_scrape.retention import (
     purge_snapshots,
 )
 from reddit_scrape.service import (
+    VALID_THINKING_LEVELS,
     CycleStats,
     PollerService,
     ServiceConfig,
@@ -72,10 +79,16 @@ __all__ = [
     "SubmissionIngester",
     "should_ingest_submission",
     # Extraction
+    "BATCH_EXTRACTION_SYSTEM_PROMPT",
+    "BatchExtractedItem",
+    "BatchExtractionResult",
     "EXTRACTION_SYSTEM_PROMPT",
     "ExtractedRelease",
     "ExtractionResult",
     "ExtractionWorker",
+    "build_batch_extraction_prompt",
+    "build_extraction_prompt",
+    "create_batch_extraction_agent",
     "create_extraction_agent",
     "extract_releases",
     "pre_clean_title",
@@ -92,6 +105,7 @@ __all__ = [
     "CycleStats",
     "PollerService",
     "ServiceConfig",
+    "VALID_THINKING_LEVELS",
     "validate_environment",
 ]
 

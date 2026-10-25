@@ -3,27 +3,37 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
-from dataclasses import dataclass
 import inspect
 import logging
 import os
 import signal
 import threading
 import time
-from typing import Any, Coroutine, Mapping, Optional
+from collections.abc import Coroutine, Mapping
+from dataclasses import dataclass
+from typing import Any
 
 from dotenv import load_dotenv
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from reddit_scrape.db import get_database_url, get_session_factory
-from reddit_scrape.extraction import ExtractionResult, ExtractionWorker
-from reddit_scrape.ingestion import IngestionStats, RedditSourceAdapter, SubmissionIngester
+from reddit_scrape.extraction import (
+    ExtractionResult,
+    ExtractionWorker,
+    get_default_thinking_level,
+)
+from reddit_scrape.ingestion import (
+    IngestionStats,
+    RedditSourceAdapter,
+    SubmissionIngester,
+)
 from reddit_scrape.models import Submission
 from reddit_scrape.persistence import ReleasePersistenceService
 
 logger = logging.getLogger(__name__)
+
+VALID_THINKING_LEVELS = {"none", "minimal", "low", "medium", "high", "max"}
 
 
 @dataclass
@@ -39,10 +49,12 @@ class ServiceConfig:
     reddit_user_agent: str = "python:vinyl-releases-scraper:v0.1.0"
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
+    llm_thinking_level: str = "none"
+    llm_batch_size: int = 5
 
 
 def validate_environment(
-    env: Optional[Mapping[str, str]] = None,
+    env: Mapping[str, str] | None = None,
 ) -> ServiceConfig:
     """Validate required environment variables and return parsed ServiceConfig.
 
@@ -95,6 +107,28 @@ def validate_environment(
     deepseek_base_url = env.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     deepseek_model = env.get("DEEPSEEK_MODEL", "deepseek-chat")
 
+    raw_thinking_level = env.get("LLM_THINKING_LEVEL")
+    if raw_thinking_level is not None and str(raw_thinking_level).strip():
+        thinking_level = str(raw_thinking_level).strip().lower()
+        if thinking_level not in VALID_THINKING_LEVELS:
+            raise ValueError(
+                f"Invalid LLM_THINKING_LEVEL: {raw_thinking_level}. "
+                f"Allowed: {', '.join(sorted(VALID_THINKING_LEVELS))}"
+            )
+    else:
+        thinking_level = get_default_thinking_level(str(deepseek_model))
+
+    raw_batch_size = env.get("LLM_BATCH_SIZE")
+    if raw_batch_size is None or not str(raw_batch_size).strip():
+        llm_batch_size = 5
+    else:
+        try:
+            llm_batch_size = int(str(raw_batch_size).strip())
+        except ValueError:
+            raise ValueError("LLM_BATCH_SIZE must be a positive integer")
+        if llm_batch_size <= 0:
+            raise ValueError("LLM_BATCH_SIZE must be a positive integer")
+
     return ServiceConfig(
         reddit_client_id=str(reddit_client_id),
         reddit_client_secret=str(reddit_client_secret),
@@ -105,6 +139,8 @@ def validate_environment(
         reddit_user_agent=str(reddit_user_agent),
         deepseek_base_url=str(deepseek_base_url),
         deepseek_model=str(deepseek_model),
+        llm_thinking_level=thinking_level,
+        llm_batch_size=llm_batch_size,
     )
 
 
@@ -121,8 +157,8 @@ class _AsyncRunner:
     """Manages a persistent background event loop to execute coroutines safely across threads."""
 
     def __init__(self) -> None:
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
 
     def _ensure_started(self) -> None:
@@ -149,14 +185,18 @@ class _AsyncRunner:
 
     def stop(self) -> None:
         with self._lock:
+            is_current_thread = (
+                self._thread is not None and threading.current_thread() == self._thread
+            )
             if self._loop is not None and self._loop.is_running():
                 self._loop.call_soon_threadsafe(self._loop.stop)
-            if self._thread is not None and self._thread.is_alive():
-                self._thread.join(timeout=5.0)
-            if self._loop is not None and not self._loop.is_closed():
-                self._loop.close()
-            self._loop = None
-            self._thread = None
+            if not is_current_thread:
+                if self._thread is not None and self._thread.is_alive():
+                    self._thread.join(timeout=5.0)
+                if self._loop is not None and not self._loop.is_closed():
+                    self._loop.close()
+                self._loop = None
+                self._thread = None
 
 
 class PollerService:
@@ -164,19 +204,25 @@ class PollerService:
 
     def __init__(
         self,
-        session_factory: Optional[sessionmaker[Session]] = None,
-        reddit_adapter: Optional[RedditSourceAdapter] = None,
-        extraction_worker: Optional[ExtractionWorker] = None,
-        persistence_service: Optional[ReleasePersistenceService] = None,
-        ingester: Optional[SubmissionIngester] = None,
+        session_factory: sessionmaker[Session] | None = None,
+        reddit_adapter: RedditSourceAdapter | None = None,
+        extraction_worker: ExtractionWorker | None = None,
+        persistence_service: ReleasePersistenceService | None = None,
+        ingester: SubmissionIngester | None = None,
         poll_interval_seconds: int = 300,
         hot_poll_interval_seconds: int = 900,
         new_limit: int = 50,
         hot_limit: int = 50,
+        thinking_level: str | None = None,
+        llm_batch_size: int = 5,
     ) -> None:
         self.session_factory = session_factory or get_session_factory()
         self.reddit_adapter = reddit_adapter or RedditSourceAdapter()
-        self.extraction_worker = extraction_worker or ExtractionWorker()
+        self.thinking_level = thinking_level
+        self.llm_batch_size = llm_batch_size
+        self.extraction_worker = extraction_worker or ExtractionWorker(
+            thinking_level=thinking_level
+        )
         self.persistence_service = persistence_service or ReleasePersistenceService(
             self.session_factory
         )
@@ -190,14 +236,14 @@ class PollerService:
         self._shutdown_event = threading.Event()
         self._extraction_trigger = threading.Event()
         self._extraction_lock = threading.Lock()
-        self._extraction_thread: Optional[threading.Thread] = None
+        self._extraction_thread: threading.Thread | None = None
         self._async_runner = _AsyncRunner()
 
     def __del__(self) -> None:
         try:
             if hasattr(self, "_async_runner"):
                 self._async_runner.stop()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     def stop(self) -> None:
@@ -235,31 +281,74 @@ class PollerService:
         """Safely execute an asynchronous coroutine using the persistent event loop runner."""
         return self._async_runner.run(coro)
 
-    def _extract(self, title: str, flair: Optional[str]) -> ExtractionResult:
+    def _extract(self, title: str, flair: str | None) -> ExtractionResult:
         """Invoke extraction worker, handling both sync and async return values."""
         res = self.extraction_worker.extract(title, flair=flair)
         if inspect.iscoroutine(res):
             return self._run_coroutine(res)
         return res
 
-    def poll_new(self, limit: Optional[int] = None) -> IngestionStats:
+    def _extract_batch(
+        self, batch_tuples: list[tuple[str, str, str | None]]
+    ) -> dict[str, ExtractionResult]:
+        """Invoke extraction worker batch extraction, handling both sync and async return values."""
+        if hasattr(self.extraction_worker, "extract_batch"):
+            try:
+                res = self.extraction_worker.extract_batch(
+                    batch_tuples, batch_size=self.llm_batch_size
+                )
+                if inspect.iscoroutine(res):
+                    res = self._run_coroutine(res)
+            except TypeError as exc:
+                if "batch_size" in str(exc):
+                    res = self.extraction_worker.extract_batch(batch_tuples)
+                    if inspect.iscoroutine(res):
+                        res = self._run_coroutine(res)
+                else:
+                    raise
+            if isinstance(res, dict):
+                return res
+
+        results: dict[str, ExtractionResult] = {}
+        for sub_id, title, flair in batch_tuples:
+            try:
+                results[sub_id] = self._extract(title, flair)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed extraction for submission %s: %s", sub_id, exc)
+        return results
+
+    def poll_new(self, limit: int | None = None) -> IngestionStats:
         """Poll r/vinylreleases/new for recent release discovery."""
         fetch_limit = limit if limit is not None else self.new_limit
         if fetch_limit <= 0:
             return IngestionStats()
         items = self.reddit_adapter.fetch_new(limit=fetch_limit)
+        if items:
+            logger.info("Discovered %d new submission(s)", len(items))
+            for item in items:
+                logger.info("  - [%s] %s", item.id, item.title)
         return self.ingester.ingest_submissions(items)
 
-    def poll_hot(self, limit: Optional[int] = None) -> IngestionStats:
+    def poll_hot(self, limit: int | None = None) -> IngestionStats:
         """Poll r/vinylreleases/hot for active engagement updates and flair mutation."""
         fetch_limit = limit if limit is not None else self.hot_limit
         if fetch_limit <= 0:
             return IngestionStats()
         items = self.reddit_adapter.fetch_hot(limit=fetch_limit)
+        if items:
+            logger.info("Polled /hot: tracked %d active submission(s)", len(items))
+            for item in items:
+                logger.debug(
+                    "  - [%s] (score=%d, comments=%d) %s",
+                    item.id,
+                    item.score,
+                    item.num_comments,
+                    item.title,
+                )
         return self.ingester.ingest_submissions(items)
 
     def process_unextracted_submissions(
-        self, batch_size: Optional[int] = None
+        self, batch_size: int | None = None
     ) -> int:
         """Query and process unextracted submissions through extraction and persistence."""
         with self._extraction_lock:
@@ -279,32 +368,64 @@ class PollerService:
             if not candidates:
                 return 0
 
+            partition_size = max(1, self.llm_batch_size)
+            batches = [
+                candidates[i : i + partition_size]
+                for i in range(0, len(candidates), partition_size)
+            ]
+
             extracted_count = 0
-            for sub_id, title, flair in candidates:
+            for batch in batches:
                 if self._shutdown_event.is_set():
                     logger.info("Shutdown requested, pausing extraction queue.")
                     break
 
+                batch_tuples = [(sub_id, title, flair) for sub_id, title, flair in batch]
+                start_time = time.perf_counter()
                 try:
-                    extraction_result = self._extract(title, flair)
-                    self.persistence_service.persist(
-                        submission_id=sub_id,
-                        releases=extraction_result,
-                    )
-                    extracted_count += 1
-                except Exception as exc:
+                    batch_results = self._extract_batch(batch_tuples)
+                except Exception as exc:  # noqa: BLE001
                     logger.error(
-                        "Failed extraction or persistence for submission %s: %s",
-                        sub_id,
+                        "Batch extraction failed for batch of %d submissions: %s",
+                        len(batch),
                         exc,
                     )
+                    continue
+
+                elapsed = time.perf_counter() - start_time
+                logger.info(
+                    "Batch extraction completed for %d submissions in %.2fs",
+                    len(batch),
+                    elapsed,
+                )
+
+                for sub_id, title, flair in batch:
+                    try:
+                        result = batch_results.get(sub_id)
+                        if result is None:
+                            logger.error(
+                                "No extraction result found for submission %s",
+                                sub_id,
+                            )
+                            continue
+                        self.persistence_service.persist(
+                            submission_id=sub_id,
+                            releases=result,
+                        )
+                        extracted_count += 1
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "Failed extraction or persistence for submission %s: %s",
+                            sub_id,
+                            exc,
+                        )
 
             return extracted_count
 
     def poll_and_extract_cycle(
         self,
-        new_limit: Optional[int] = None,
-        hot_limit: Optional[int] = None,
+        new_limit: int | None = None,
+        hot_limit: int | None = None,
     ) -> CycleStats:
         """Execute a complete polling and extraction cycle."""
         n_limit = self.new_limit if new_limit is None else new_limit
@@ -322,8 +443,8 @@ class PollerService:
 
     def run_once(
         self,
-        new_limit: Optional[int] = None,
-        hot_limit: Optional[int] = None,
+        new_limit: int | None = None,
+        hot_limit: int | None = None,
     ) -> CycleStats:
         """Run a single poll & extract cycle and return summary statistics."""
         return self.poll_and_extract_cycle(new_limit=new_limit, hot_limit=hot_limit)
@@ -345,7 +466,7 @@ class PollerService:
                         "Extracted and persisted %d release submissions in background",
                         extracted,
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "Error processing unextracted submissions in background: %s",
                     exc,
@@ -374,7 +495,12 @@ class PollerService:
             self.poll_new()
             self.poll_hot()
             self.trigger_extraction()
-        except Exception as exc:
+            logger.info(
+                "Initial poll cycle completed. Poller active (next discovery poll in %ds, tracking poll in %ds).",
+                self.poll_interval_seconds,
+                self.hot_poll_interval_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001
             logger.error("Error during initial poll cycle: %s", exc)
 
         last_new_poll = time.time()
@@ -392,7 +518,7 @@ class PollerService:
                         logger.info("Executing discovery poll (/new)...")
                         self.poll_new()
                         self.trigger_extraction()
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         logger.error("Error during discovery poll (/new): %s", exc)
                     last_new_poll = time.time()
 
@@ -401,7 +527,7 @@ class PollerService:
                         logger.info("Executing tracking poll (/hot)...")
                         self.poll_hot()
                         self.trigger_extraction()
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         logger.error("Error during tracking poll (/hot): %s", exc)
                     last_hot_poll = time.time()
 
@@ -415,6 +541,7 @@ class PollerService:
 
 
 __all__ = [
+    "VALID_THINKING_LEVELS",
     "CycleStats",
     "PollerService",
     "ServiceConfig",

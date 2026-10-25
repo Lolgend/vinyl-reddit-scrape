@@ -1,5 +1,3 @@
-import os
-import signal
 import threading
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -38,7 +36,7 @@ def engine():
         eng = get_engine()
         init_db(eng)
         return eng
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         pytest.skip(f"Database unavailable: {exc}")
 
 
@@ -108,6 +106,99 @@ class TestEnvironmentValidation:
         config = validate_environment(env)
         assert config.poll_interval_seconds == 60
         assert config.hot_poll_interval_seconds == 180
+
+    def test_validate_environment_thinking_level_default(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_key",
+        }
+        config = validate_environment(env)
+        # Default for deepseek-chat is none
+        assert config.llm_thinking_level == "none"
+
+    def test_validate_environment_thinking_level_default_reasoning(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_key",
+            "DEEPSEEK_MODEL": "deepseek-reasoner",
+        }
+        config = validate_environment(env)
+        # Default for reasoning model is low
+        assert config.llm_thinking_level == "low"
+
+    @pytest.mark.parametrize(
+        "level,expected",
+        [
+            ("none", "none"),
+            ("minimal", "minimal"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+            ("NONE", "none"),
+            ("Medium", "medium"),
+            ("MAX", "max"),
+        ],
+    )
+    def test_validate_environment_thinking_level_valid(self, level, expected):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_key",
+            "LLM_THINKING_LEVEL": level,
+        }
+        config = validate_environment(env)
+        assert config.llm_thinking_level == expected
+
+    @pytest.mark.parametrize("invalid_level", ["ultra", "off", "1", "false", "turbo"])
+    def test_validate_environment_thinking_level_invalid(self, invalid_level):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_key",
+            "LLM_THINKING_LEVEL": invalid_level,
+        }
+        with pytest.raises(ValueError, match="Invalid LLM_THINKING_LEVEL"):
+            validate_environment(env)
+
+    def test_validate_environment_llm_batch_size_default(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_key",
+        }
+        config = validate_environment(env)
+        assert config.llm_batch_size == 5
+
+    def test_validate_environment_llm_batch_size_custom(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_key",
+            "LLM_BATCH_SIZE": "10",
+        }
+        config = validate_environment(env)
+        assert config.llm_batch_size == 10
+
+    @pytest.mark.parametrize("invalid_size", ["0", "-1", "-10", "abc"])
+    def test_validate_environment_llm_batch_size_invalid(self, invalid_size):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_key",
+            "LLM_BATCH_SIZE": invalid_size,
+        }
+        with pytest.raises(ValueError, match="LLM_BATCH_SIZE must be a positive integer"):
+            validate_environment(env)
 
     @pytest.mark.parametrize(
         "missing_key",
@@ -427,6 +518,12 @@ class TestPollerServiceEndToEnd:
         assert stats.extracted_count == 3
         service.stop()
 
+    def test_poller_service_propagates_thinking_level_to_worker(self):
+        service = PollerService(session_factory=MagicMock(), thinking_level="high")
+        assert service.thinking_level == "high"
+        assert service.extraction_worker.thinking_level == "high"
+        service.stop()
+
     def test_async_runner_lifecycle(self):
         runner = _AsyncRunner()
 
@@ -534,6 +631,334 @@ class TestGracefulShutdown:
             assert rel[0].album_title == "Async LP"
 
 
+class TestBatchQueueProcessing:
+    """Test batch queue partitioning, extraction execution, and graceful pause."""
+
+    def test_poller_service_llm_batch_size_configuration(self):
+        service_default = PollerService(session_factory=MagicMock())
+        assert service_default.llm_batch_size == 5
+        service_default.stop()
+
+        service_custom = PollerService(session_factory=MagicMock(), llm_batch_size=8)
+        assert service_custom.llm_batch_size == 8
+        service_custom.stop()
+
+    def test_process_unextracted_submissions_batches(self, session_factory):
+        created_now = datetime.now(timezone.utc)
+        subs = [
+            RawSubmission(
+                id=f"batch_sub_{i}",
+                title=f"Artist {i} - Album {i}",
+                url=f"https://reddit.com/r/vinylreleases/batch{i}",
+                permalink=f"/r/vinylreleases/comments/batch{i}",
+                created_utc=created_now,
+                fullname=f"t3_batch_sub_{i}",
+            )
+            for i in range(7)
+        ]
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_new.return_value = subs
+        mock_adapter.fetch_hot.return_value = []
+
+        batch_calls = []
+
+        async def fake_extract_batch(batch_tuples):
+            batch_calls.append(len(batch_tuples))
+            return {
+                sub_id: ExtractionResult(
+                    releases=[
+                        ExtractedRelease(
+                            artists=["Test Artist"],
+                            combined_artist="Test Artist",
+                            album_title=title,
+                        )
+                    ]
+                )
+                for sub_id, title, flair in batch_tuples
+            }
+
+        mock_worker = MagicMock()
+        mock_worker.extract_batch = AsyncMock(side_effect=fake_extract_batch)
+
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=mock_worker,
+            llm_batch_size=3,
+        )
+
+        stats = service.poll_and_extract_cycle()
+        assert stats.new_stats.inserted == 7
+        assert stats.extracted_count == 7
+        # 7 items with batch size 3 should yield batches of sizes 3, 3, 1
+        assert batch_calls == [3, 3, 1]
+
+        with session_factory() as session:
+            db_subs = session.execute(
+                select(Submission).order_by(Submission.id.asc())
+            ).scalars().all()
+            assert len(db_subs) == 7
+            for sub in db_subs:
+                assert sub.is_extracted is True
+
+        service.stop()
+
+    def test_process_unextracted_submissions_batch_timing_logged(self, session_factory, caplog):
+        import logging
+
+        caplog.set_level(logging.INFO)
+
+        created_now = datetime.now(timezone.utc)
+        sub = RawSubmission(
+            id="timing_sub_1",
+            title="Timing Artist - Timing Album",
+            url="https://reddit.com/r/vinylreleases/timing1",
+            permalink="/r/vinylreleases/comments/timing1",
+            created_utc=created_now,
+            fullname="t3_timing_sub_1",
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_new.return_value = [sub]
+        mock_adapter.fetch_hot.return_value = []
+
+        async def fake_extract_batch(batch_tuples):
+            return {
+                sub_id: ExtractionResult(
+                    releases=[
+                        ExtractedRelease(
+                            artists=["Timing Artist"],
+                            combined_artist="Timing Artist",
+                            album_title="Timing Album",
+                        )
+                    ]
+                )
+                for sub_id, title, flair in batch_tuples
+            }
+
+        mock_worker = MagicMock()
+        mock_worker.extract_batch = AsyncMock(side_effect=fake_extract_batch)
+
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=mock_worker,
+            llm_batch_size=5,
+        )
+
+        service.poll_and_extract_cycle()
+        assert any(
+            "Batch extraction completed for 1 submissions in" in record.message
+            for record in caplog.records
+        )
+        service.stop()
+
+    def test_poll_new_logs_discovered_submissions(self, caplog):
+        import logging
+
+        caplog.set_level(logging.INFO)
+
+        created_now = datetime.now(timezone.utc)
+        sub1 = RawSubmission(
+            id="disc_1",
+            title="Artist One - Album One",
+            url="https://reddit.com/r/vinylreleases/disc1",
+            permalink="/r/vinylreleases/comments/disc1",
+            created_utc=created_now,
+            fullname="t3_disc_1",
+        )
+        sub2 = RawSubmission(
+            id="disc_2",
+            title="Artist Two - Album Two",
+            url="https://reddit.com/r/vinylreleases/disc2",
+            permalink="/r/vinylreleases/comments/disc2",
+            created_utc=created_now,
+            fullname="t3_disc_2",
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_new.return_value = [sub1, sub2]
+
+        service = PollerService(
+            session_factory=MagicMock(),
+            reddit_adapter=mock_adapter,
+            ingester=MagicMock(),
+        )
+
+        service.poll_new()
+        messages = [r.message for r in caplog.records]
+        assert any("Discovered 2 new submission(s)" in m for m in messages)
+        assert any("  - [disc_1] Artist One - Album One" in m for m in messages)
+        assert any("  - [disc_2] Artist Two - Album Two" in m for m in messages)
+        service.stop()
+
+    def test_poll_hot_logs_tracked_submissions(self, caplog):
+        import logging
+
+        caplog.set_level(logging.DEBUG)
+
+        created_now = datetime.now(timezone.utc)
+        sub1 = RawSubmission(
+            id="hot_1",
+            title="Hot Artist One - Hot Album One",
+            url="https://reddit.com/r/vinylreleases/hot1",
+            permalink="/r/vinylreleases/comments/hot1",
+            created_utc=created_now,
+            fullname="t3_hot_1",
+            score=42,
+            num_comments=15,
+        )
+        sub2 = RawSubmission(
+            id="hot_2",
+            title="Hot Artist Two - Hot Album Two",
+            url="https://reddit.com/r/vinylreleases/hot2",
+            permalink="/r/vinylreleases/comments/hot2",
+            created_utc=created_now,
+            fullname="t3_hot_2",
+            score=100,
+            num_comments=50,
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_hot.return_value = [sub1, sub2]
+
+        service = PollerService(
+            session_factory=MagicMock(),
+            reddit_adapter=mock_adapter,
+            ingester=MagicMock(),
+        )
+
+        service.poll_hot()
+        messages = [r.message for r in caplog.records]
+        assert any("Polled /hot: tracked 2 active submission(s)" in m for m in messages)
+        assert any("  - [hot_1] (score=42, comments=15) Hot Artist One - Hot Album One" in m for m in messages)
+        assert any("  - [hot_2] (score=100, comments=50) Hot Artist Two - Hot Album Two" in m for m in messages)
+        service.stop()
+
+    def test_process_unextracted_submissions_shutdown_stops_between_batches(self, session_factory):
+        created_now = datetime.now(timezone.utc)
+        subs = [
+            RawSubmission(
+                id=f"shutdown_sub_{i}",
+                title=f"Artist {i} - Album {i}",
+                url=f"https://reddit.com/r/vinylreleases/shut{i}",
+                permalink="/r/vinylreleases/comments/shut{i}",
+                created_utc=created_now,
+                fullname=f"t3_shutdown_sub_{i}",
+            )
+            for i in range(4)
+        ]
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_new.return_value = subs
+        mock_adapter.fetch_hot.return_value = []
+
+        batch_calls = 0
+
+        async def fake_extract_batch(batch_tuples):
+            nonlocal batch_calls
+            batch_calls += 1
+            if batch_calls == 1:
+                service.stop()
+            return {
+                sub_id: ExtractionResult(
+                    releases=[
+                        ExtractedRelease(
+                            artists=["Shutdown Artist"],
+                            combined_artist="Shutdown Artist",
+                            album_title=title,
+                        )
+                    ]
+                )
+                for sub_id, title, flair in batch_tuples
+            }
+
+        mock_worker = MagicMock()
+        mock_worker.extract_batch = AsyncMock(side_effect=fake_extract_batch)
+
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=mock_worker,
+            llm_batch_size=2,
+        )
+
+        service.poll_new()
+        extracted = service.process_unextracted_submissions()
+        assert batch_calls == 1
+        assert extracted == 2
+
+        with session_factory() as session:
+            extracted_subs = session.execute(
+                select(Submission).where(Submission.is_extracted.is_(True))
+            ).scalars().all()
+            assert len(extracted_subs) == 2
+
+        service.stop()
+
+    def test_process_unextracted_submissions_error_in_submission_persists_others(
+        self, session_factory
+    ):
+        created_now = datetime.now(timezone.utc)
+        subs = [
+            RawSubmission(
+                id=f"resilience_sub_{i}",
+                title=f"Resilience Artist {i} - Album {i}",
+                url=f"https://reddit.com/r/vinylreleases/res{i}",
+                permalink=f"/r/vinylreleases/comments/res{i}",
+                created_utc=created_now,
+                fullname=f"t3_resilience_sub_{i}",
+            )
+            for i in range(3)
+        ]
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_new.return_value = subs
+        mock_adapter.fetch_hot.return_value = []
+
+        # Return result for sub 0 and 2, but omit or fail sub 1
+        async def fake_extract_batch(batch_tuples):
+            results = {}
+            for sub_id, title, flair in batch_tuples:
+                if "resilience_sub_1" not in sub_id:
+                    results[sub_id] = ExtractionResult(
+                        releases=[
+                            ExtractedRelease(
+                                artists=["Resilience Artist"],
+                                combined_artist="Resilience Artist",
+                                album_title=title,
+                            )
+                        ]
+                    )
+            return results
+
+        mock_worker = MagicMock()
+        mock_worker.extract_batch = AsyncMock(side_effect=fake_extract_batch)
+
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=mock_worker,
+            llm_batch_size=5,
+        )
+
+        service.poll_new()
+        extracted = service.process_unextracted_submissions()
+        # 2 succeeded, 1 failed/missing from results
+        assert extracted == 2
+
+        with session_factory() as session:
+            s0 = session.get(Submission, "t3_resilience_sub_0")
+            s1 = session.get(Submission, "t3_resilience_sub_1")
+            s2 = session.get(Submission, "t3_resilience_sub_2")
+            assert s0.is_extracted is True
+            assert s1.is_extracted is False
+            assert s2.is_extracted is True
+
+        service.stop()
+
+
 class TestCliRunner:
     """Test CLI subcommand `run` invocation and flags."""
 
@@ -591,4 +1016,23 @@ class TestCliRunner:
             hot_poll_interval_seconds=180,
             new_limit=50,
             hot_limit=50,
+            thinking_level="none",
+            llm_batch_size=5,
         )
+
+    def test_extract_batch_forwards_llm_batch_size(self, session_factory):
+        """Verify _extract_batch passes configured llm_batch_size to extraction worker."""
+        mock_worker = MagicMock()
+        mock_worker.extract_batch = MagicMock(return_value={})
+
+        service = PollerService(
+            session_factory=session_factory,
+            extraction_worker=mock_worker,
+            llm_batch_size=8,
+        )
+
+        sample_batch = [("sub_1", "Title 1", None)]
+        service._extract_batch(sample_batch)
+
+        mock_worker.extract_batch.assert_called_once_with(sample_batch, batch_size=8)
+        service.stop()

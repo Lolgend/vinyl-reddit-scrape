@@ -355,3 +355,27 @@ class TestReleasePersistence:
             assert len(all_releases) == 1
             all_sub_rels = session.execute(select(SubmissionRelease)).scalars().all()
             assert len(all_sub_rels) == 1
+
+    def test_persist_with_reddit_id_or_fullname_fallback(self, session_factory):
+        """Verify persistence resolves submission whether fullname or base36 reddit_id is passed."""
+        with session_factory() as session:
+            with session.begin():
+                create_test_submission(session, "t3_fallback_1", "fallback_1", "Artist 1 - Album 1")
+                create_test_submission(session, "fallback_2", "fallback_2", "Artist 2 - Album 2")
+
+        service = ReleasePersistenceService(session_factory)
+        ext = ExtractedRelease(artists=["Artist"], album_title="Album")
+
+        # Pass short ID for submission keyed by fullname
+        res1 = service.persist("fallback_1", [ext])
+        assert len(res1) == 1
+
+        # Pass fullname for submission keyed by short ID
+        res2 = service.persist("t3_fallback_2", [ext])
+        assert len(res2) == 1
+
+        with session_factory() as session:
+            s1 = session.get(Submission, "t3_fallback_1")
+            s2 = session.get(Submission, "fallback_2")
+            assert s1.is_extracted is True
+            assert s2.is_extracted is True
