@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+
 import pytest
 from dotenv import load_dotenv
 from sqlalchemy import select, text
@@ -7,13 +8,13 @@ from sqlalchemy.orm import sessionmaker
 load_dotenv()
 
 from reddit_scrape.db import get_engine, init_db
-from reddit_scrape.models import Submission, SubmissionSnapshot
 from reddit_scrape.ingestion import (
     RawSubmission,
     RedditSourceAdapter,
     SubmissionIngester,
     should_ingest_submission,
 )
+from reddit_scrape.models import Submission, SubmissionSnapshot
 
 
 @pytest.fixture(scope="session")

@@ -1,5 +1,5 @@
-import os
 from datetime import datetime, timezone
+
 import pytest
 from dotenv import load_dotenv
 from sqlalchemy import select, text
@@ -8,6 +8,7 @@ from sqlalchemy.orm import sessionmaker
 load_dotenv()
 
 from reddit_scrape.db import get_engine, init_db
+from reddit_scrape.extraction import ExtractedRelease, ExtractionResult
 from reddit_scrape.models import (
     Artist,
     Release,
@@ -15,13 +16,10 @@ from reddit_scrape.models import (
     Submission,
     SubmissionRelease,
 )
-from reddit_scrape.extraction import ExtractedRelease, ExtractionResult
 from reddit_scrape.persistence import (
-    STANDARD_TOKEN,
     ReleasePersistenceService,
     compute_release_fingerprint,
     normalize_attribute,
-    persist_extracted_releases,
 )
 
 
@@ -310,9 +308,8 @@ class TestReleasePersistence:
 
     def test_atomicity_and_rollback_on_failure(self, session_factory):
         """Failure mid-transaction rolls back all changes, leaving is_extracted=False."""
-        with session_factory() as session:
-            with session.begin():
-                create_test_submission(session, "sub_err", "red_err", "Artist - Album")
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "sub_err", "red_err", "Artist - Album")
 
         service = ReleasePersistenceService(session_factory)
 
@@ -332,9 +329,8 @@ class TestReleasePersistence:
 
     def test_idempotent_reprocessing(self, session_factory):
         """Calling persist multiple times on the same submission succeeds without duplicate rows."""
-        with session_factory() as session:
-            with session.begin():
-                create_test_submission(session, "sub_idem", "red_idem", "Radiohead - Kid A")
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "sub_idem", "red_idem", "Radiohead - Kid A")
 
         service = ReleasePersistenceService(session_factory)
         ext = ExtractedRelease(

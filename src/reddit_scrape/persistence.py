@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Optional, Sequence, Union
+from collections.abc import Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -22,7 +22,7 @@ from reddit_scrape.models import (
 STANDARD_TOKEN = "[standard]"
 
 
-def normalize_attribute(val: Optional[str], default_token: Optional[str] = None) -> str:
+def normalize_attribute(val: str | None, default_token: str | None = None) -> str:
     """Normalize release metadata attribute for deterministic fingerprinting.
 
     Lowercases, collapses whitespace, normalizes unicode dashes to standard hyphens,
@@ -54,8 +54,8 @@ def normalize_attribute(val: Optional[str], default_token: Optional[str] = None)
 def compute_release_fingerprint(
     combined_artist: str,
     album_title: str,
-    variant: Optional[str] = None,
-    retailer: Optional[str] = None,
+    variant: str | None = None,
+    retailer: str | None = None,
 ) -> str:
     """Compute a deterministic SHA-256 fingerprint over normalized release metadata.
 
@@ -74,7 +74,7 @@ def compute_release_fingerprint(
 def persist_extracted_releases(
     session: Session,
     submission_id: str,
-    releases: Union[ExtractionResult, Sequence[ExtractedRelease]],
+    releases: ExtractionResult | Sequence[ExtractedRelease],
 ) -> list[Release]:
     """Persist extracted releases within the caller's active database session.
 
@@ -196,20 +196,19 @@ class ReleasePersistenceService:
     def persist(
         self,
         submission_id: str,
-        releases: Union[ExtractionResult, Sequence[ExtractedRelease]],
+        releases: ExtractionResult | Sequence[ExtractedRelease],
     ) -> list[Release]:
         """Atomically persist extracted releases for a submission in a managed transaction."""
-        with self.session_factory() as session:
-            with session.begin():
-                result = persist_extracted_releases(
-                    session=session,
-                    submission_id=submission_id,
-                    releases=releases,
-                )
-                for r in result:
-                    session.refresh(r)
-                session.expunge_all()
-                return result
+        with self.session_factory() as session, session.begin():
+            result = persist_extracted_releases(
+                session=session,
+                submission_id=submission_id,
+                releases=releases,
+            )
+            for r in result:
+                session.refresh(r)
+            session.expunge_all()
+            return result
 
 
 __all__ = [

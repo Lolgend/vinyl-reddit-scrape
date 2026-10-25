@@ -1,12 +1,14 @@
 """Administrative snapshot retention and batched purging module."""
 
-from datetime import datetime
 import logging
 import os
-from typing import Any, Callable, Optional, Union
+from collections.abc import Callable
+from datetime import datetime
+from typing import Any
+
 from dotenv import load_dotenv
 from sqlalchemy import text
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 from reddit_scrape.db import get_session_factory
 
@@ -29,7 +31,7 @@ def _execute_purge_loop(
     session: Session,
     retention_days: int,
     batch_size: int,
-    cutoff: Optional[datetime] = None,
+    cutoff: datetime | None = None,
 ) -> int:
     """Execute batched deletion loop using PostgreSQL transaction per batch until 0 rows remain."""
     time_filter = ":cutoff" if cutoff is not None else "NOW() - (INTERVAL '1 day' * :retention_days)"
@@ -68,11 +70,11 @@ def _execute_purge_loop(
 
 
 def purge_snapshots(
-    session_factory_or_session: Union[Callable[[], Session], Session, None] = None,
+    session_factory_or_session: Callable[[], Session] | Session | None = None,
     retention_days: int = 30,
     batch_size: int = 5000,
     *,
-    cutoff: Optional[datetime] = None,
+    cutoff: datetime | None = None,
 ) -> int:
     """Batched, chunked deletion of submission_snapshots older than retention_days.
 

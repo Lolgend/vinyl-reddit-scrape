@@ -2,10 +2,12 @@ import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.orm import sessionmaker
 
+from reddit_scrape.cli import main as cli_main
 from reddit_scrape.db import get_engine, init_db
 from reddit_scrape.models import (
     Artist,
@@ -18,7 +20,6 @@ from reddit_scrape.models import (
 
 # Seams under test - will fail to import until implemented
 from reddit_scrape.retention import purge_snapshots
-from reddit_scrape.cli import main as cli_main
 
 
 @pytest.fixture(scope="session")

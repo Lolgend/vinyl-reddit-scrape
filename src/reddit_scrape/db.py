@@ -1,14 +1,14 @@
 import os
 from pathlib import Path
-from typing import Optional
+
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, Engine
+from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 Base = declarative_base()
 
 
-def get_database_url(url: Optional[str] = None) -> str:
+def get_database_url(url: str | None = None) -> str:
     """Retrieve and normalize database URL with psycopg dialect."""
     if not url:
         # Check current and parent directories for .env
@@ -32,20 +32,20 @@ def get_database_url(url: Optional[str] = None) -> str:
     return url
 
 
-def get_engine(database_url: Optional[str] = None, **kwargs) -> Engine:
+def get_engine(database_url: str | None = None, **kwargs) -> Engine:
     """Create a SQLAlchemy engine configured with psycopg."""
     url = get_database_url(database_url)
     return create_engine(url, **kwargs)
 
 
-def get_session_factory(engine: Optional[Engine] = None) -> sessionmaker:
+def get_session_factory(engine: Engine | None = None) -> sessionmaker:
     """Create a configured sessionmaker bound to engine."""
     if engine is None:
         engine = get_engine()
     return sessionmaker(bind=engine)
 
 
-def init_db(engine: Optional[Engine] = None) -> None:
+def init_db(engine: Engine | None = None) -> None:
     """Create all tables and indexes defined in Base metadata."""
     if engine is None:
         engine = get_engine()

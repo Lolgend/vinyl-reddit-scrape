@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import os
 import re
-from typing import Any, Iterable, List, Optional, Set
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import func, literal_column
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -12,7 +13,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from reddit_scrape.models import Submission, SubmissionSnapshot
 
-NON_RELEASE_FLAIRS: Set[str] = {
+NON_RELEASE_FLAIRS: set[str] = {
     "discussion",
     "question",
     "collection",
@@ -26,7 +27,7 @@ NON_RELEASE_TITLE_PATTERN = re.compile(
 )
 
 
-def should_ingest_submission(title: str, flair: Optional[str]) -> bool:
+def should_ingest_submission(title: str, flair: str | None) -> bool:
     """Check whether a submission should be ingested based on non-release flairs."""
     if flair and flair.strip().lower() in NON_RELEASE_FLAIRS:
         return False
@@ -57,8 +58,8 @@ class RawSubmission:
     score: int = 0
     upvote_ratio: float = 1.0
     num_comments: int = 0
-    flair: Optional[str] = None
-    fullname: Optional[str] = None  # Reddit fullname (e.g. 't3_123abc')
+    flair: str | None = None
+    fullname: str | None = None  # Reddit fullname (e.g. 't3_123abc')
 
     def get_created_utc_datetime(self) -> datetime:
         """Convert created_utc to a timezone-aware UTC datetime."""
@@ -80,7 +81,7 @@ class SubmissionIngester:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self.session_factory = session_factory
 
-    def ingest_submission(self, item: RawSubmission, session: Session) -> Optional[str]:
+    def ingest_submission(self, item: RawSubmission, session: Session) -> str | None:
         """Ingest a single submission item within an active database session.
 
         Returns 'inserted' if newly added, 'updated' if existing on conflict, or None if skipped.
@@ -138,17 +139,16 @@ class SubmissionIngester:
         stats = IngestionStats()
         adapter = RedditSourceAdapter(client=None)
 
-        with self.session_factory() as session:
-            with session.begin():
-                for item in items:
-                    raw = adapter.normalize_submission(item)
-                    status = self.ingest_submission(raw, session)
-                    if status == "inserted":
-                        stats.inserted += 1
-                    elif status == "updated":
-                        stats.updated += 1
-                    else:
-                        stats.skipped += 1
+        with self.session_factory() as session, session.begin():
+            for item in items:
+                raw = adapter.normalize_submission(item)
+                status = self.ingest_submission(raw, session)
+                if status == "inserted":
+                    stats.inserted += 1
+                elif status == "updated":
+                    stats.updated += 1
+                else:
+                    stats.skipped += 1
 
         return stats
 
@@ -156,7 +156,7 @@ class SubmissionIngester:
 class RedditSourceAdapter:
     """Adapter connecting to Reddit API via PRAW to ingest raw submissions."""
 
-    def __init__(self, client: Optional[Any] = None) -> None:
+    def __init__(self, client: Any | None = None) -> None:
         self.client = client
 
     def get_client(self) -> Any:
@@ -209,7 +209,7 @@ class RedditSourceAdapter:
 
     def fetch_new(
         self, limit: int = 50, subreddit_name: str = "vinylreleases"
-    ) -> List[RawSubmission]:
+    ) -> list[RawSubmission]:
         """Fetch newest submissions from subreddit."""
         client = self.get_client()
         submissions = client.subreddit(subreddit_name).new(limit=limit)
@@ -217,7 +217,7 @@ class RedditSourceAdapter:
 
     def fetch_hot(
         self, limit: int = 50, subreddit_name: str = "vinylreleases"
-    ) -> List[RawSubmission]:
+    ) -> list[RawSubmission]:
         """Fetch active/hot submissions from subreddit."""
         client = self.get_client()
         submissions = client.subreddit(subreddit_name).hot(limit=limit)
