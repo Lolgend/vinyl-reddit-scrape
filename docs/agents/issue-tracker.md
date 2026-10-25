@@ -2,8 +2,6 @@
 
 Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all operations.
 
-Note: The `gh` CLI communicates with `api.github.com` over the internet and requires network access (`BypassSandbox: true`).
-
 ## Conventions
 
 - **Create an issue**: `gh issue create --title "..." --body "..."`. On Windows/PowerShell, pass multi-line bodies via `--body-file <file>` or `-F <file>` to avoid shell escaping and subexpression parsing errors.
