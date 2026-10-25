@@ -236,39 +236,33 @@ class TestPollerServiceEndToEnd:
             id="rel101",
             title="Radiohead - OK Computer (Blue Vinyl)",
             url="https://reddit.com/r/vinylreleases/rel101",
-            permalink="/r/vinylreleases/comments/rel101",
             created_utc=created_now,
             score=10,
             upvote_ratio=0.95,
             num_comments=5,
             flair="New Release",
-            author="collector_one",
             fullname="t3_rel101",
         )
         sub_discussion = RawSubmission(
             id="disc102",
             title="[Discussion] What is your favorite pressing ever?",
             url="https://reddit.com/r/vinylreleases/disc102",
-            permalink="/r/vinylreleases/comments/disc102",
             created_utc=created_now,
             score=50,
             upvote_ratio=0.80,
             num_comments=100,
             flair="Discussion",
-            author="curious_collector",
             fullname="t3_disc102",
         )
         sub_multi = RawSubmission(
             id="rel103",
             title="Converge / Dropdead - Split (7\" /500)",
             url="https://reddit.com/r/vinylreleases/rel103",
-            permalink="/r/vinylreleases/comments/rel103",
             created_utc=created_now,
             score=35,
             upvote_ratio=0.99,
             num_comments=8,
             flair="Pre-Order",
-            author="hardcore_fan",
             fullname="t3_rel103",
         )
 
@@ -277,13 +271,11 @@ class TestPollerServiceEndToEnd:
             id="rel101",
             title="Radiohead - OK Computer (Blue Vinyl)",
             url="https://reddit.com/r/vinylreleases/rel101",
-            permalink="/r/vinylreleases/comments/rel101",
             created_utc=created_now,
             score=150,
             upvote_ratio=0.98,
             num_comments=42,
             flair="SOLD OUT",
-            author="collector_one",
             fullname="t3_rel101",
         )
 
@@ -418,7 +410,6 @@ class TestPollerServiceEndToEnd:
             id="fail1",
             title="Failing Release - Crash LP",
             url="https://reddit.com/r/vinylreleases/fail1",
-            permalink="/r/vinylreleases/comments/fail1",
             created_utc=created_now,
             fullname="t3_fail1",
         )
@@ -426,7 +417,6 @@ class TestPollerServiceEndToEnd:
             id="ok2",
             title="Good Artist - Success EP",
             url="https://reddit.com/r/vinylreleases/ok2",
-            permalink="/r/vinylreleases/comments/ok2",
             created_utc=created_now,
             fullname="t3_ok2",
         )
@@ -482,7 +472,6 @@ class TestPollerServiceEndToEnd:
                 id=f"item{i}",
                 title=f"Artist {i} - Album {i}",
                 url=f"https://reddit.com/r/vinylreleases/item{i}",
-                permalink=f"/r/vinylreleases/comments/item{i}",
                 created_utc=created_now,
                 fullname=f"t3_item{i}",
             )
@@ -577,7 +566,6 @@ class TestGracefulShutdown:
             id="async_rel_1",
             title="Slow Artist - Async LP",
             url="https://reddit.com/r/vinylreleases/async1",
-            permalink="/r/vinylreleases/comments/async1",
             created_utc=created_now,
             fullname="t3_async_rel_1",
         )
@@ -650,7 +638,6 @@ class TestBatchQueueProcessing:
                 id=f"batch_sub_{i}",
                 title=f"Artist {i} - Album {i}",
                 url=f"https://reddit.com/r/vinylreleases/batch{i}",
-                permalink=f"/r/vinylreleases/comments/batch{i}",
                 created_utc=created_now,
                 fullname=f"t3_batch_sub_{i}",
             )
@@ -714,7 +701,6 @@ class TestBatchQueueProcessing:
             id="timing_sub_1",
             title="Timing Artist - Timing Album",
             url="https://reddit.com/r/vinylreleases/timing1",
-            permalink="/r/vinylreleases/comments/timing1",
             created_utc=created_now,
             fullname="t3_timing_sub_1",
         )
@@ -764,7 +750,6 @@ class TestBatchQueueProcessing:
             id="disc_1",
             title="Artist One - Album One",
             url="https://reddit.com/r/vinylreleases/disc1",
-            permalink="/r/vinylreleases/comments/disc1",
             created_utc=created_now,
             fullname="t3_disc_1",
         )
@@ -772,7 +757,6 @@ class TestBatchQueueProcessing:
             id="disc_2",
             title="Artist Two - Album Two",
             url="https://reddit.com/r/vinylreleases/disc2",
-            permalink="/r/vinylreleases/comments/disc2",
             created_utc=created_now,
             fullname="t3_disc_2",
         )
@@ -803,7 +787,6 @@ class TestBatchQueueProcessing:
             id="hot_1",
             title="Hot Artist One - Hot Album One",
             url="https://reddit.com/r/vinylreleases/hot1",
-            permalink="/r/vinylreleases/comments/hot1",
             created_utc=created_now,
             fullname="t3_hot_1",
             score=42,
@@ -813,7 +796,6 @@ class TestBatchQueueProcessing:
             id="hot_2",
             title="Hot Artist Two - Hot Album Two",
             url="https://reddit.com/r/vinylreleases/hot2",
-            permalink="/r/vinylreleases/comments/hot2",
             created_utc=created_now,
             fullname="t3_hot_2",
             score=100,
@@ -843,7 +825,6 @@ class TestBatchQueueProcessing:
                 id=f"shutdown_sub_{i}",
                 title=f"Artist {i} - Album {i}",
                 url=f"https://reddit.com/r/vinylreleases/shut{i}",
-                permalink="/r/vinylreleases/comments/shut{i}",
                 created_utc=created_now,
                 fullname=f"t3_shutdown_sub_{i}",
             )
@@ -906,7 +887,6 @@ class TestBatchQueueProcessing:
                 id=f"resilience_sub_{i}",
                 title=f"Resilience Artist {i} - Album {i}",
                 url=f"https://reddit.com/r/vinylreleases/res{i}",
-                permalink=f"/r/vinylreleases/comments/res{i}",
                 created_utc=created_now,
                 fullname=f"t3_resilience_sub_{i}",
             )

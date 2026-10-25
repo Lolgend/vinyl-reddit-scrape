@@ -63,7 +63,6 @@ def create_test_submission(session, sub_id: str, reddit_id: str, title: str) -> 
         reddit_id=reddit_id,
         title=title,
         url=f"https://reddit.com/{reddit_id}",
-        permalink=f"/r/vinylreleases/comments/{reddit_id}",
         flair="New Release",
         created_utc=datetime.now(timezone.utc),
         is_extracted=False,

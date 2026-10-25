@@ -1,16 +1,14 @@
-import os
 from datetime import datetime, timezone
 import pytest
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import select, text
 from sqlalchemy.orm import sessionmaker
 
 load_dotenv()
 
-from reddit_scrape.db import Base, get_database_url, get_engine, init_db
+from reddit_scrape.db import get_engine, init_db
 from reddit_scrape.models import Submission, SubmissionSnapshot
 from reddit_scrape.ingestion import (
-    NON_RELEASE_FLAIRS,
     RawSubmission,
     RedditSourceAdapter,
     SubmissionIngester,
@@ -24,7 +22,7 @@ def engine():
         eng = get_engine()
         init_db(eng)
         return eng
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         pytest.skip(f"Database unavailable: {exc}")
 
 
@@ -64,15 +62,11 @@ def test_ingest_new_submission_persists_submission_and_snapshot(session_factory)
         id="sub101",
         title="Daft Punk - Discovery (2LP Gatefold)",
         url="https://example.com/daft-punk",
-        permalink="/r/vinylreleases/comments/sub101/daft_punk_discovery",
         created_utc=created_dt,
         score=42,
         upvote_ratio=0.95,
         num_comments=8,
         flair="Pre-Order",
-        author="vinyl_fan",
-        is_self=False,
-        selftext=None,
     )
 
     result = ingester.ingest_submissions([raw])
@@ -115,13 +109,11 @@ def test_ingest_duplicate_submission_upserts_and_appends_snapshot(session_factor
         id="sub202",
         title="The Mars Volta - Frances the Mute (3LP)",
         url="https://example.com/tmv",
-        permalink="/r/vinylreleases/comments/sub202/tmv",
         created_utc=created_dt,
         score=10,
         upvote_ratio=0.88,
         num_comments=3,
         flair="New Release",
-        author="prog_head",
     )
 
     res1 = ingester.ingest_submissions([raw1])
@@ -133,13 +125,11 @@ def test_ingest_duplicate_submission_upserts_and_appends_snapshot(session_factor
         id="sub202",
         title="The Mars Volta - Frances the Mute (3LP)",
         url="https://example.com/tmv",
-        permalink="/r/vinylreleases/comments/sub202/tmv",
         created_utc=created_dt,
         score=180,
         upvote_ratio=0.97,
         num_comments=45,
         flair="SOLD OUT",
-        author="prog_head",
     )
 
     res2 = ingester.ingest_submissions([raw2])
@@ -179,13 +169,11 @@ def test_ingest_conflict_preserves_is_extracted_status(session_factory):
         id="sub303",
         title="Radiohead - Kid A Mnesia (3LP Red)",
         url="https://example.com/kid-a",
-        permalink="/r/vinylreleases/comments/sub303/kid_a",
         created_utc=created_dt,
         score=50,
         upvote_ratio=0.92,
         num_comments=12,
         flair="Pre-Order",
-        author="thom",
     )
 
     ingester.ingest_submissions([raw1])
@@ -202,13 +190,11 @@ def test_ingest_conflict_preserves_is_extracted_status(session_factory):
         id="sub303",
         title="Radiohead - Kid A Mnesia (3LP Red)",
         url="https://example.com/kid-a",
-        permalink="/r/vinylreleases/comments/sub303/kid_a",
         created_utc=created_dt,
         score=120,
         upvote_ratio=0.94,
         num_comments=25,
         flair="Pre-Order",
-        author="thom",
     )
 
     ingester.ingest_submissions([raw2])
@@ -231,7 +217,6 @@ def test_ingest_stream_skips_non_release_submissions(session_factory):
             id="sub_valid_1",
             title="Artist A - Album 1",
             url="https://example.com/1",
-            permalink="/r/vinylreleases/comments/1",
             created_utc=created_dt,
             score=15,
             flair="New Release",
@@ -240,7 +225,6 @@ def test_ingest_stream_skips_non_release_submissions(session_factory):
             id="sub_disc",
             title="[Discussion] What is your favorite album?",
             url="https://example.com/disc",
-            permalink="/r/vinylreleases/comments/disc",
             created_utc=created_dt,
             score=50,
             flair="Discussion",
@@ -249,7 +233,6 @@ def test_ingest_stream_skips_non_release_submissions(session_factory):
             id="sub_iso",
             title="[ISO] Looking for Frank Ocean Blonde",
             url="https://example.com/iso",
-            permalink="/r/vinylreleases/comments/iso",
             created_utc=created_dt,
             score=5,
             flair="ISO",
@@ -258,7 +241,6 @@ def test_ingest_stream_skips_non_release_submissions(session_factory):
             id="sub_valid_2",
             title="Artist B - Album 2",
             url="https://example.com/2",
-            permalink="/r/vinylreleases/comments/2",
             created_utc=created_dt,
             score=30,
             flair=None,
@@ -282,11 +264,7 @@ def test_reddit_source_adapter_converts_item():
         name = "t3_mock123"
         title = "Khruangbin - A La Sala"
         url = "https://example.com/khru"
-        permalink = "/r/vinylreleases/comments/mock123"
         link_flair_text = "Pre-Order"
-        author = type("Author", (), {"name": "music_lover"})()
-        is_self = False
-        selftext = ""
         score = 88
         upvote_ratio = 0.99
         num_comments = 14
@@ -299,7 +277,6 @@ def test_reddit_source_adapter_converts_item():
     assert raw.fullname == "t3_mock123"
     assert raw.title == "Khruangbin - A La Sala"
     assert raw.flair == "Pre-Order"
-    assert raw.author == "music_lover"
     assert raw.score == 88
     assert raw.created_utc == datetime.fromtimestamp(1714000000.0, tz=timezone.utc)
 
@@ -318,7 +295,6 @@ def test_reddit_source_adapter_fetch_methods():
                     "id": "item_new",
                     "title": "Artist - New Album",
                     "url": "https://url.com/new",
-                    "permalink": "/r/vr/new",
                     "created_utc": 1714000000,
                 }
             ]
@@ -330,7 +306,6 @@ def test_reddit_source_adapter_fetch_methods():
                     "id": "item_hot",
                     "title": "Artist - Hot Album",
                     "url": "https://url.com/hot",
-                    "permalink": "/r/vr/hot",
                     "created_utc": 1714000000,
                 }
             ]
@@ -357,34 +332,14 @@ def test_reddit_source_adapter_fetch_methods():
     assert hot_items[0].id == "item_hot"
 
 
-def test_ingest_submission_with_none_author_and_selftext(session_factory):
-    """Verify submissions with None author (e.g. deleted account) and selftext are handled."""
-    ingester = SubmissionIngester(session_factory)
-    created_dt = datetime.now(timezone.utc)
+def test_submission_schema_and_raw_submission_exclude_unused_metadata():
+    """Verify that Submission model columns and RawSubmission fields omit permalink, author, is_self, selftext."""
+    import dataclasses
 
-    raw = RawSubmission(
-        id="sub_anon",
-        title="Unknown Artist - White Label (100 copies)",
-        url="https://example.com/anon",
-        permalink="/r/vinylreleases/comments/anon",
-        created_utc=created_dt,
-        score=5,
-        upvote_ratio=1.0,
-        num_comments=0,
-        flair="Restock",
-        author=None,
-        is_self=True,
-        selftext="Details inside",
-    )
+    col_names = {c.name for c in Submission.__table__.columns}
+    for obsolete_col in ("permalink", "author", "is_self", "selftext"):
+        assert obsolete_col not in col_names, f"Column {obsolete_col} should not be in Submission schema"
 
-    result = ingester.ingest_submissions([raw])
-    assert result.inserted == 1
-
-    with session_factory() as session:
-        sub = session.execute(
-            select(Submission).where(Submission.reddit_id == "sub_anon")
-        ).scalar_one()
-        assert sub.author is None
-        assert sub.is_self is True
-        assert sub.selftext == "Details inside"
-
+    raw_fields = {f.name for f in dataclasses.fields(RawSubmission)}
+    for obsolete_field in ("permalink", "author", "is_self", "selftext"):
+        assert obsolete_field not in raw_fields, f"Field {obsolete_field} should not be in RawSubmission"
