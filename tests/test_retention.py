@@ -99,7 +99,6 @@ def test_purge_old_snapshots_keeps_recent(session_factory):
             score=10,
             upvote_ratio=1.0,
             num_comments=2,
-            flair="New Release",
             captured_at=now - timedelta(days=45),
         )
         snap_old2 = SubmissionSnapshot(
@@ -107,7 +106,6 @@ def test_purge_old_snapshots_keeps_recent(session_factory):
             score=50,
             upvote_ratio=0.95,
             num_comments=12,
-            flair="New Release",
             captured_at=now - timedelta(days=35),
         )
         snap_recent1 = SubmissionSnapshot(
@@ -115,7 +113,6 @@ def test_purge_old_snapshots_keeps_recent(session_factory):
             score=180,
             upvote_ratio=0.97,
             num_comments=30,
-            flair="Pre-Order",
             captured_at=now - timedelta(days=15),
         )
         snap_recent2 = SubmissionSnapshot(
@@ -123,7 +120,6 @@ def test_purge_old_snapshots_keeps_recent(session_factory):
             score=250,
             upvote_ratio=0.98,
             num_comments=45,
-            flair="Sold Out",
             captured_at=now - timedelta(days=2),
         )
         session.add_all([snap_old1, snap_old2, snap_recent1, snap_recent2])

@@ -113,8 +113,8 @@ flowchart TD
   ```
 - **Unconditional Snapshot Logging**: Appends metric observations on each observation cycle:
   ```sql
-  INSERT INTO submission_snapshots (submission_id, score, upvote_ratio, num_comments, flair, captured_at)
-  VALUES (:submission_id, :score, :upvote_ratio, :num_comments, :flair, CURRENT_TIMESTAMP);
+  INSERT INTO submission_snapshots (submission_id, score, upvote_ratio, num_comments, captured_at)
+  VALUES (:submission_id, :score, :upvote_ratio, :num_comments, CURRENT_TIMESTAMP);
   ```
 
 ### 2. PostgreSQL Relational Storage & DDL
@@ -147,7 +147,6 @@ CREATE TABLE IF NOT EXISTS submission_snapshots (
     score INT NOT NULL,
     upvote_ratio FLOAT NOT NULL,
     num_comments INT NOT NULL,
-    flair TEXT,
     captured_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 

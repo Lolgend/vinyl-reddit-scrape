@@ -358,10 +358,10 @@ class TestPollerServiceEndToEnd:
                 .order_by(SubmissionSnapshot.id.asc())
             ).scalars().all()
             assert len(snaps_101) == 2
-            assert snaps_101[0].flair == "New Release"
             assert snaps_101[0].score == 10
-            assert snaps_101[1].flair == "SOLD OUT"
+            assert not hasattr(snaps_101[0], "flair")
             assert snaps_101[1].score == 150
+            assert not hasattr(snaps_101[1], "flair")
 
             # Verify releases table
             releases = session.execute(

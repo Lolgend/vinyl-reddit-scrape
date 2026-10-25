@@ -96,7 +96,7 @@ def test_ingest_new_submission_persists_submission_and_snapshot(session_factory)
         assert snapshots[0].score == 42
         assert snapshots[0].upvote_ratio == 0.95
         assert snapshots[0].num_comments == 8
-        assert snapshots[0].flair == "Pre-Order"
+        assert not hasattr(snapshots[0], "flair")
         assert snapshots[0].captured_at is not None
 
 
@@ -155,9 +155,9 @@ def test_ingest_duplicate_submission_upserts_and_appends_snapshot(session_factor
 
         assert len(snapshots) == 2
         assert snapshots[0].score == 10
-        assert snapshots[0].flair == "New Release"
+        assert not hasattr(snapshots[0], "flair")
         assert snapshots[1].score == 180
-        assert snapshots[1].flair == "SOLD OUT"
+        assert not hasattr(snapshots[1], "flair")
 
 
 def test_ingest_conflict_preserves_is_extracted_status(session_factory):
@@ -343,3 +343,10 @@ def test_submission_schema_and_raw_submission_exclude_unused_metadata():
     raw_fields = {f.name for f in dataclasses.fields(RawSubmission)}
     for obsolete_field in ("permalink", "author", "is_self", "selftext"):
         assert obsolete_field not in raw_fields, f"Field {obsolete_field} should not be in RawSubmission"
+
+
+def test_submission_snapshot_schema_excludes_flair():
+    """Verify that SubmissionSnapshot model columns omit flair and only define quantitative metrics."""
+    col_names = {c.name for c in SubmissionSnapshot.__table__.columns}
+    assert "flair" not in col_names, "Column flair should not be in SubmissionSnapshot schema"
+    assert col_names == {"id", "submission_id", "score", "upvote_ratio", "num_comments", "captured_at"}

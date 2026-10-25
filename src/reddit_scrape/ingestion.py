@@ -128,7 +128,6 @@ class SubmissionIngester:
             score=item.score,
             upvote_ratio=item.upvote_ratio,
             num_comments=item.num_comments,
-            flair=item.flair,
         )
         session.add(snapshot)
 

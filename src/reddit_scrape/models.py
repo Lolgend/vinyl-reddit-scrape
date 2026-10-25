@@ -62,7 +62,6 @@ class SubmissionSnapshot(Base):
     score = Column(Integer, nullable=False)
     upvote_ratio = Column(Float, nullable=False)
     num_comments = Column(Integer, nullable=False)
-    flair = Column(Text, nullable=True)
     captured_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
