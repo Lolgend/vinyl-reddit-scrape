@@ -6,7 +6,7 @@ import hashlib
 import re
 from typing import Optional, Sequence, Union
 
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -86,6 +86,17 @@ def persist_extracted_releases(
     """
     sub = session.get(Submission, submission_id)
     if sub is None:
+        alt_id = submission_id[3:] if submission_id.startswith("t3_") else f"t3_{submission_id}"
+        sub = session.get(Submission, alt_id)
+        if sub is None:
+            sub = session.execute(
+                select(Submission).where(
+                    (Submission.reddit_id == submission_id)
+                    | (Submission.reddit_id == alt_id)
+                )
+            ).scalars().first()
+
+    if sub is None:
         raise ValueError(f"Submission with ID '{submission_id}' does not exist.")
 
     if isinstance(releases, ExtractionResult):
@@ -160,7 +171,7 @@ def persist_extracted_releases(
         # Link submission to release
         sr_stmt = (
             pg_insert(SubmissionRelease)
-            .values(submission_id=submission_id, release_id=rel_id)
+            .values(submission_id=sub.id, release_id=rel_id)
             .on_conflict_do_nothing()
         )
         session.execute(sr_stmt)

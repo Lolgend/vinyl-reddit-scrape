@@ -1019,3 +1019,20 @@ class TestCliRunner:
             thinking_level="none",
             llm_batch_size=5,
         )
+
+    def test_extract_batch_forwards_llm_batch_size(self, session_factory):
+        """Verify _extract_batch passes configured llm_batch_size to extraction worker."""
+        mock_worker = MagicMock()
+        mock_worker.extract_batch = MagicMock(return_value={})
+
+        service = PollerService(
+            session_factory=session_factory,
+            extraction_worker=mock_worker,
+            llm_batch_size=8,
+        )
+
+        sample_batch = [("sub_1", "Title 1", None)]
+        service._extract_batch(sample_batch)
+
+        mock_worker.extract_batch.assert_called_once_with(sample_batch, batch_size=8)
+        service.stop()

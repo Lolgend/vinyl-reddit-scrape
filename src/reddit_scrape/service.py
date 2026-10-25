@@ -293,9 +293,19 @@ class PollerService:
     ) -> dict[str, ExtractionResult]:
         """Invoke extraction worker batch extraction, handling both sync and async return values."""
         if hasattr(self.extraction_worker, "extract_batch"):
-            res = self.extraction_worker.extract_batch(batch_tuples)
-            if inspect.iscoroutine(res):
-                res = self._run_coroutine(res)
+            try:
+                res = self.extraction_worker.extract_batch(
+                    batch_tuples, batch_size=self.llm_batch_size
+                )
+                if inspect.iscoroutine(res):
+                    res = self._run_coroutine(res)
+            except TypeError as exc:
+                if "batch_size" in str(exc):
+                    res = self.extraction_worker.extract_batch(batch_tuples)
+                    if inspect.iscoroutine(res):
+                        res = self._run_coroutine(res)
+                else:
+                    raise
             if isinstance(res, dict):
                 return res
 
@@ -485,6 +495,11 @@ class PollerService:
             self.poll_new()
             self.poll_hot()
             self.trigger_extraction()
+            logger.info(
+                "Initial poll cycle completed. Poller active (next discovery poll in %ds, tracking poll in %ds).",
+                self.poll_interval_seconds,
+                self.hot_poll_interval_seconds,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("Error during initial poll cycle: %s", exc)
 
