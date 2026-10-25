@@ -179,7 +179,6 @@ class TestCliBatchSizeAndVerbosity:
             hot_poll_interval_seconds=900,
             new_limit=50,
             hot_limit=50,
-            thinking_level="low",
+            thinking_level="none",
             llm_batch_size=8,
         )
-

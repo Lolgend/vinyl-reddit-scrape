@@ -18,6 +18,23 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# --- Thinking Level Logic ---
+
+
+def get_default_thinking_level(model_name: str | None = None) -> str:
+    """Return default thinking level based on model capabilities.
+
+    If model_name is reasoning-capable (e.g. contains 'reasoner', 'r1', 'o1', 'o3'),
+    returns 'low'. For standard chat models (e.g. 'deepseek-chat', 'gpt-4o'), returns 'none'.
+    """
+    model = model_name or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    model_lower = model.lower()
+    reasoning_identifiers = ("reasoner", "r1", "o1", "o3")
+    if any(ident in model_lower for ident in reasoning_identifiers):
+        return "low"
+    return "none"
+
+
 # --- Schema Definitions ---
 
 
@@ -57,7 +74,7 @@ class BatchExtractedItem(BaseModel):
     """Structured entity representing releases extracted for a single submission in a batch."""
 
     submission_id: str = Field(
-        description="Reddit submission ID corresponding to the post."
+        description="Reddit submission ID corresponding to the submission."
     )
     releases: list[ExtractedRelease] = Field(
         default_factory=list,
@@ -94,7 +111,7 @@ def pre_clean_title(raw_title: str) -> str:
 EXTRACTION_SYSTEM_PROMPT = """You are an expert vinyl record discography classifier specialized in extracting structured data from r/vinylreleases submission titles.
 
 Rules:
-1. Non-Release / Generic Posts -> Return empty `releases: []`:
+1. Non-Release / Generic Submissions -> Return empty `releases: []`:
    - Community discussions, questions, or polls (e.g. "[Discussion] ...")
    - In-Search-Of requests (e.g. "[ISO] ...")
    - Store sales or generic restock announcements that do NOT name specific album titles (e.g. "VMP Restocks: Artist A, Artist B", "Target Buy 2 Get 1 Free Sale")
@@ -102,12 +119,12 @@ Rules:
 2. Specific Release Announcements -> Extract each release:
    - `artists`: List of individual artist/band names. For splits ('A / B') or collaborations ('A & B', 'A feat. B'), extract each artist as a separate list item. Keep multi-word/comma artist names intact (e.g. ["Tyler, The Creator"]).
    - `combined_artist`: For multi-artist releases, provide the collaborative billing string (e.g. "Converge / Dropdead", "Kanye West & Ty Dolla $ign"). For single artist releases, provide the single artist name.
-   - `album_title`: Clean title of the album/single. Never hallucinate an album title if none is specified in the post.
+   - `album_title`: Clean title of the album/single. Never hallucinate an album title if none is specified in the submission.
    - `variant`: The physical pressing variant details (e.g. "Opaque Emerald LP", "180g 45RPM 2LP Box", "Pink /500", "Clear Zoetrope").
    - `retailer`: Exclusive seller or store if mentioned (e.g. "Blood Records", "Target", "Rough Trade", "VMP").
 
 3. Strict Anti-Hallucination:
-   - Only extract information explicitly stated in the post title. Do NOT guess or hallucinate missing album titles or artists.
+   - Only extract information explicitly stated in the submission title. Do NOT guess or hallucinate missing album titles or artists.
 """
 
 BATCH_EXTRACTION_SYSTEM_PROMPT = """You are an expert vinyl record discography classifier specialized in extracting structured data from batches of r/vinylreleases submission titles.
@@ -118,7 +135,7 @@ Batch Processing Instructions:
 - You MUST return exactly one `BatchExtractedItem` per provided `submission_id`, preserving the exact `submission_id`.
 
 Rules for Each Submission:
-1. Non-Release / Generic Posts -> Return empty `releases: []`:
+1. Non-Release / Generic Submissions -> Return empty `releases: []`:
    - Community discussions, questions, or polls (e.g. "[Discussion] ...")
    - In-Search-Of requests (e.g. "[ISO] ...")
    - Store sales or generic restock announcements that do NOT name specific album titles (e.g. "VMP Restocks: Artist A, Artist B", "Target Buy 2 Get 1 Free Sale")
@@ -126,12 +143,12 @@ Rules for Each Submission:
 2. Specific Release Announcements -> Extract each release:
    - `artists`: List of individual artist/band names. For splits ('A / B') or collaborations ('A & B', 'A feat. B'), extract each artist as a separate list item. Keep multi-word/comma artist names intact (e.g. ["Tyler, The Creator"]).
    - `combined_artist`: For multi-artist releases, provide the collaborative billing string (e.g. "Converge / Dropdead", "Kanye West & Ty Dolla $ign"). For single artist releases, provide the single artist name.
-   - `album_title`: Clean title of the album/single. Never hallucinate an album title if none is specified in the post.
+   - `album_title`: Clean title of the album/single. Never hallucinate an album title if none is specified in the submission.
    - `variant`: The physical pressing variant details (e.g. "Opaque Emerald LP", "180g 45RPM 2LP Box", "Pink /500", "Clear Zoetrope").
    - `retailer`: Exclusive seller or store if mentioned (e.g. "Blood Records", "Target", "Rough Trade", "VMP").
 
 3. Strict Anti-Hallucination:
-   - Only extract information explicitly stated in the post title. Do NOT guess or hallucinate missing album titles or artists.
+   - Only extract information explicitly stated in the submission title. Do NOT guess or hallucinate missing album titles or artists.
 """
 
 
@@ -143,11 +160,11 @@ def build_extraction_prompt(title: str, flair: str | None = None) -> str:
     cleaned_title = pre_clean_title(title)
     if flair and flair.strip():
         return (
-            f"Extract release entities from Reddit post:\n\n"
+            f"Extract release entities from Reddit submission:\n\n"
             f"Flair: {flair.strip()}\n"
             f"Title: {cleaned_title}"
         )
-    return f"Extract release entities from Reddit post title:\n\n{cleaned_title}"
+    return f"Extract release entities from Reddit submission title:\n\n{cleaned_title}"
 
 
 def build_batch_extraction_prompt(
@@ -193,7 +210,10 @@ def create_extraction_agent(
     url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     model = model_name or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
-    level = thinking_level or os.getenv("LLM_THINKING_LEVEL", "low")
+    level = thinking_level or os.getenv("LLM_THINKING_LEVEL")
+    if not level:
+        level = get_default_thinking_level(model)
+
     model_settings: ModelSettings
     if level.lower() == "none":
         model_settings = {"thinking": False}
@@ -229,7 +249,10 @@ def create_batch_extraction_agent(
     url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     model = model_name or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
-    level = thinking_level or os.getenv("LLM_THINKING_LEVEL", "low")
+    level = thinking_level or os.getenv("LLM_THINKING_LEVEL")
+    if not level:
+        level = get_default_thinking_level(model)
+
     model_settings: ModelSettings
     if level.lower() == "none":
         model_settings = {"thinking": False}
@@ -258,7 +281,7 @@ async def extract_releases(
     flair: str | None = None,
     agent: Agent | None = None,
 ) -> ExtractionResult:
-    """Extract structured releases from a post title and optional flair asynchronously."""
+    """Extract structured releases from a submission title and optional flair asynchronously."""
     if agent is None:
         agent = create_extraction_agent()
 
@@ -312,10 +335,22 @@ class ExtractionWorker:
     async def extract_batch(
         self,
         submissions: Sequence[tuple[str, str, str | None]],
+        batch_size: int = 5,
     ) -> dict[str, ExtractionResult]:
         """Extract releases for a batch of submissions with automatic single-submission fallback."""
         if not submissions:
             return {}
+
+        effective_batch_size = max(1, batch_size)
+        if len(submissions) > effective_batch_size:
+            combined_results: dict[str, ExtractionResult] = {}
+            for i in range(0, len(submissions), effective_batch_size):
+                sub_batch = submissions[i : i + effective_batch_size]
+                sub_results = await self.extract_batch(
+                    sub_batch, batch_size=effective_batch_size
+                )
+                combined_results.update(sub_results)
+            return combined_results
 
         prompt = build_batch_extraction_prompt(submissions)
         agent = self._get_batch_agent()
@@ -347,7 +382,16 @@ class ExtractionWorker:
             )
             fallback_results: dict[str, ExtractionResult] = {}
             for sub_id, title, flair in submissions:
-                fallback_results[sub_id] = await self.extract(title, flair=flair)
+                try:
+                    fallback_results[sub_id] = await self.extract(title, flair=flair)
+                except Exception as single_exc:  # noqa: BLE001
+                    logger.warning(
+                        "Fallback extraction failed for submission %s (%s: %s)",
+                        sub_id,
+                        type(single_exc).__name__,
+                        single_exc,
+                    )
+                    fallback_results[sub_id] = ExtractionResult(releases=[])
             return fallback_results
 
         missing_ids = [sub_id for sub_id in sub_map if sub_id not in results]
@@ -358,7 +402,16 @@ class ExtractionWorker:
             )
             for sub_id in missing_ids:
                 title, flair = sub_map[sub_id]
-                results[sub_id] = await self.extract(title, flair=flair)
+                try:
+                    results[sub_id] = await self.extract(title, flair=flair)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Fallback extraction failed for omitted submission %s (%s: %s)",
+                        sub_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    results[sub_id] = ExtractionResult(releases=[])
 
         return results
 
@@ -376,5 +429,6 @@ __all__ = [
     "create_batch_extraction_agent",
     "create_extraction_agent",
     "extract_releases",
+    "get_default_thinking_level",
     "pre_clean_title",
 ]

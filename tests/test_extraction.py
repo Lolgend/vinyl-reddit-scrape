@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from reddit_scrape.extraction import (
     create_batch_extraction_agent,
     create_extraction_agent,
     extract_releases,
+    get_default_thinking_level,
     pre_clean_title,
 )
 
@@ -215,6 +217,28 @@ class TestBatchPromptBuilder:
         assert "Flair:" not in lines
 
 
+class TestThinkingLevelDefaults:
+    def test_get_default_thinking_level_reasoning_models(self):
+        assert get_default_thinking_level("deepseek-reasoner") == "low"
+        assert get_default_thinking_level("deepseek-r1") == "low"
+        assert get_default_thinking_level("DeepSeek-R1-Distill-Qwen-32B") == "low"
+        assert get_default_thinking_level("o1-preview") == "low"
+        assert get_default_thinking_level("o3-mini") == "low"
+
+    def test_get_default_thinking_level_chat_models(self):
+        assert get_default_thinking_level("deepseek-chat") == "none"
+        assert get_default_thinking_level("gpt-4o") == "none"
+        assert get_default_thinking_level("claude-3-5-sonnet") == "none"
+
+    def test_get_default_thinking_level_env_fallback(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-reasoner")
+        assert get_default_thinking_level() == "low"
+        monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-chat")
+        assert get_default_thinking_level() == "none"
+        monkeypatch.delenv("DEEPSEEK_MODEL", raising=False)
+        assert get_default_thinking_level() == "none"
+
+
 class TestAgentConfiguration:
     def test_create_extraction_agent_requires_api_key(self, monkeypatch):
         monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
@@ -261,8 +285,13 @@ class TestAgentConfiguration:
         assert agent_none.model_settings == {"thinking": False}
 
         monkeypatch.delenv("LLM_THINKING_LEVEL", raising=False)
+        # Default for chat model is none -> thinking: False
         agent_default = create_extraction_agent()
-        assert agent_default.model_settings == {"thinking": "low"}
+        assert agent_default.model_settings == {"thinking": False}
+
+        # Default for reasoning model is low -> thinking: "low"
+        agent_reasoner = create_extraction_agent(model_name="deepseek-reasoner")
+        assert agent_reasoner.model_settings == {"thinking": "low"}
 
 
 class TestBatchAgentConfiguration:
@@ -311,8 +340,13 @@ class TestBatchAgentConfiguration:
         assert agent_none.model_settings == {"thinking": False}
 
         monkeypatch.delenv("LLM_THINKING_LEVEL", raising=False)
+        # Default for chat model is none -> thinking: False
         agent_default = create_batch_extraction_agent()
-        assert agent_default.model_settings == {"thinking": "low"}
+        assert agent_default.model_settings == {"thinking": False}
+
+        # Default for reasoning model is low -> thinking: "low"
+        agent_reasoner = create_batch_extraction_agent(model_name="deepseek-reasoner")
+        assert agent_reasoner.model_settings == {"thinking": "low"}
 
 
 class TestExtractionAsyncLogic:
@@ -687,6 +721,113 @@ class TestBatchExtractionWorker:
         agent = worker._get_batch_agent()
         assert agent is not None
         assert captured_kwargs.get("thinking_level") == "high"
+
+    @pytest.mark.asyncio
+    async def test_extract_batch_bounded_batch_size_partitioning(self):
+        batch_calls = []
+
+        async def fake_run(prompt):
+            sub_count = prompt.count("--- Submission ")
+            batch_calls.append(sub_count)
+            items = []
+            for i in range(1, sub_count + 1):
+                pattern = rf"--- Submission {i} ---\s+Submission ID:\s+(\S+)"
+                m = re.search(pattern, prompt)
+                sub_id = m.group(1) if m else f"sub_{i}"
+                items.append(
+                    BatchExtractedItem(
+                        submission_id=sub_id,
+                        releases=[
+                            ExtractedRelease(
+                                artists=[f"Artist {sub_id}"],
+                                album_title=f"Album {sub_id}",
+                            )
+                        ],
+                    )
+                )
+            return type("RunResult", (), {"output": BatchExtractionResult(items=items)})()
+
+        fake_batch_agent = Agent(
+            TestModel(),
+            output_type=BatchExtractionResult,
+            system_prompt=BATCH_EXTRACTION_SYSTEM_PROMPT,
+        )
+        fake_batch_agent.run = fake_run
+
+        worker = ExtractionWorker(batch_agent=fake_batch_agent)
+        submissions = [
+            (f"sub_{i}", f"Artist {i} - Album {i}", None)
+            for i in range(7)
+        ]
+
+        results = await worker.extract_batch(submissions, batch_size=3)
+        assert len(results) == 7
+        assert batch_calls == [3, 3, 1]
+        for i in range(7):
+            assert f"sub_{i}" in results
+            assert results[f"sub_{i}"].releases[0].album_title == f"Album sub_{i}"
+
+    @pytest.mark.asyncio
+    async def test_extract_batch_omission_fallback_exception_handling(self, caplog):
+        import logging
+
+        caplog.set_level(logging.WARNING)
+
+        # Batch agent returns item for sub_1 only, omitting sub_2 and sub_3
+        mock_output = {
+            "items": [
+                {
+                    "submission_id": "sub_1",
+                    "releases": [
+                        {
+                            "artists": ["Artist 1"],
+                            "album_title": "Album 1",
+                        }
+                    ],
+                }
+            ]
+        }
+        batch_agent = Agent(
+            TestModel(custom_output_args=mock_output),
+            output_type=BatchExtractionResult,
+            system_prompt=BATCH_EXTRACTION_SYSTEM_PROMPT,
+        )
+
+        worker = ExtractionWorker(batch_agent=batch_agent)
+
+        # Single extract will succeed for sub_2, but raise Exception for sub_3
+        async def mock_extract(title, flair=None):
+            if "Album 3" in title:
+                raise RuntimeError("LLM rate limit error on single item")
+            return ExtractionResult(
+                releases=[
+                    ExtractedRelease(
+                        artists=["Artist 2"],
+                        album_title="Album 2",
+                    )
+                ]
+            )
+
+        worker.extract = mock_extract
+
+        submissions = [
+            ("sub_1", "Artist 1 - Album 1", None),
+            ("sub_2", "Artist 2 - Album 2", None),
+            ("sub_3", "Artist 3 - Album 3", None),
+        ]
+
+        results = await worker.extract_batch(submissions)
+        assert len(results) == 3
+        assert len(results["sub_1"].releases) == 1
+        assert results["sub_1"].releases[0].album_title == "Album 1"
+        assert len(results["sub_2"].releases) == 1
+        assert results["sub_2"].releases[0].album_title == "Album 2"
+        # sub_3 failed during fallback extraction, should have empty releases without raising
+        assert len(results["sub_3"].releases) == 0
+        assert any(
+            "Fallback extraction failed for omitted submission sub_3" in record.message
+            for record in caplog.records
+        )
 
 
 class TestBenchmarkFixtures:

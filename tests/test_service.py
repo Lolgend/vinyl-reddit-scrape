@@ -36,7 +36,7 @@ def engine():
         eng = get_engine()
         init_db(eng)
         return eng
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         pytest.skip(f"Database unavailable: {exc}")
 
 
@@ -115,6 +115,19 @@ class TestEnvironmentValidation:
             "DEEPSEEK_API_KEY": "mock_key",
         }
         config = validate_environment(env)
+        # Default for deepseek-chat is none
+        assert config.llm_thinking_level == "none"
+
+    def test_validate_environment_thinking_level_default_reasoning(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_key",
+            "DEEPSEEK_MODEL": "deepseek-reasoner",
+        }
+        config = validate_environment(env)
+        # Default for reasoning model is low
         assert config.llm_thinking_level == "low"
 
     @pytest.mark.parametrize(
@@ -630,16 +643,16 @@ class TestBatchQueueProcessing:
         assert service_custom.llm_batch_size == 8
         service_custom.stop()
 
-    def test_process_unextracted_submissions_chunked_batching(self, session_factory):
+    def test_process_unextracted_submissions_batches(self, session_factory):
         created_now = datetime.now(timezone.utc)
         subs = [
             RawSubmission(
-                id=f"chunk_sub_{i}",
+                id=f"batch_sub_{i}",
                 title=f"Artist {i} - Album {i}",
-                url=f"https://reddit.com/r/vinylreleases/chunk{i}",
-                permalink=f"/r/vinylreleases/comments/chunk{i}",
+                url=f"https://reddit.com/r/vinylreleases/batch{i}",
+                permalink=f"/r/vinylreleases/comments/batch{i}",
                 created_utc=created_now,
-                fullname=f"t3_chunk_sub_{i}",
+                fullname=f"t3_batch_sub_{i}",
             )
             for i in range(7)
         ]
@@ -650,8 +663,8 @@ class TestBatchQueueProcessing:
 
         batch_calls = []
 
-        async def fake_extract_batch(chunk_tuples):
-            batch_calls.append(len(chunk_tuples))
+        async def fake_extract_batch(batch_tuples):
+            batch_calls.append(len(batch_tuples))
             return {
                 sub_id: ExtractionResult(
                     releases=[
@@ -662,7 +675,7 @@ class TestBatchQueueProcessing:
                         )
                     ]
                 )
-                for sub_id, title, flair in chunk_tuples
+                for sub_id, title, flair in batch_tuples
             }
 
         mock_worker = MagicMock()
@@ -678,7 +691,7 @@ class TestBatchQueueProcessing:
         stats = service.poll_and_extract_cycle()
         assert stats.new_stats.inserted == 7
         assert stats.extracted_count == 7
-        # 7 items with batch size 3 should yield chunks of sizes 3, 3, 1
+        # 7 items with batch size 3 should yield batches of sizes 3, 3, 1
         assert batch_calls == [3, 3, 1]
 
         with session_factory() as session:
@@ -710,7 +723,7 @@ class TestBatchQueueProcessing:
         mock_adapter.fetch_new.return_value = [sub]
         mock_adapter.fetch_hot.return_value = []
 
-        async def fake_extract_batch(chunk_tuples):
+        async def fake_extract_batch(batch_tuples):
             return {
                 sub_id: ExtractionResult(
                     releases=[
@@ -721,7 +734,7 @@ class TestBatchQueueProcessing:
                         )
                     ]
                 )
-                for sub_id, title, flair in chunk_tuples
+                for sub_id, title, flair in batch_tuples
             }
 
         mock_worker = MagicMock()
@@ -780,7 +793,50 @@ class TestBatchQueueProcessing:
         assert any("  - [disc_2] Artist Two - Album Two" in m for m in messages)
         service.stop()
 
-    def test_process_unextracted_submissions_shutdown_stops_between_chunks(self, session_factory):
+    def test_poll_hot_logs_tracked_submissions(self, caplog):
+        import logging
+
+        caplog.set_level(logging.DEBUG)
+
+        created_now = datetime.now(timezone.utc)
+        sub1 = RawSubmission(
+            id="hot_1",
+            title="Hot Artist One - Hot Album One",
+            url="https://reddit.com/r/vinylreleases/hot1",
+            permalink="/r/vinylreleases/comments/hot1",
+            created_utc=created_now,
+            fullname="t3_hot_1",
+            score=42,
+            num_comments=15,
+        )
+        sub2 = RawSubmission(
+            id="hot_2",
+            title="Hot Artist Two - Hot Album Two",
+            url="https://reddit.com/r/vinylreleases/hot2",
+            permalink="/r/vinylreleases/comments/hot2",
+            created_utc=created_now,
+            fullname="t3_hot_2",
+            score=100,
+            num_comments=50,
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_hot.return_value = [sub1, sub2]
+
+        service = PollerService(
+            session_factory=MagicMock(),
+            reddit_adapter=mock_adapter,
+            ingester=MagicMock(),
+        )
+
+        service.poll_hot()
+        messages = [r.message for r in caplog.records]
+        assert any("Polled /hot: tracked 2 active submission(s)" in m for m in messages)
+        assert any("  - [hot_1] (score=42, comments=15) Hot Artist One - Hot Album One" in m for m in messages)
+        assert any("  - [hot_2] (score=100, comments=50) Hot Artist Two - Hot Album Two" in m for m in messages)
+        service.stop()
+
+    def test_process_unextracted_submissions_shutdown_stops_between_batches(self, session_factory):
         created_now = datetime.now(timezone.utc)
         subs = [
             RawSubmission(
@@ -800,7 +856,7 @@ class TestBatchQueueProcessing:
 
         batch_calls = 0
 
-        async def fake_extract_batch(chunk_tuples):
+        async def fake_extract_batch(batch_tuples):
             nonlocal batch_calls
             batch_calls += 1
             if batch_calls == 1:
@@ -815,7 +871,7 @@ class TestBatchQueueProcessing:
                         )
                     ]
                 )
-                for sub_id, title, flair in chunk_tuples
+                for sub_id, title, flair in batch_tuples
             }
 
         mock_worker = MagicMock()
@@ -862,9 +918,9 @@ class TestBatchQueueProcessing:
         mock_adapter.fetch_hot.return_value = []
 
         # Return result for sub 0 and 2, but omit or fail sub 1
-        async def fake_extract_batch(chunk_tuples):
+        async def fake_extract_batch(batch_tuples):
             results = {}
-            for sub_id, title, flair in chunk_tuples:
+            for sub_id, title, flair in batch_tuples:
                 if "resilience_sub_1" not in sub_id:
                     results[sub_id] = ExtractionResult(
                         releases=[
@@ -960,6 +1016,6 @@ class TestCliRunner:
             hot_poll_interval_seconds=180,
             new_limit=50,
             hot_limit=50,
-            thinking_level="low",
+            thinking_level="none",
             llm_batch_size=5,
         )
