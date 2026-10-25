@@ -27,6 +27,7 @@ from reddit_scrape.service import (
     CycleStats,
     PollerService,
     ServiceConfig,
+    _AsyncRunner,
     validate_environment,
 )
 
@@ -318,6 +319,7 @@ class TestPollerServiceEndToEnd:
         mock_adapter.fetch_hot.return_value = []
         stats2 = service.poll_and_extract_cycle(new_limit=50, hot_limit=50)
         assert stats2.extracted_count == 0
+        service.stop()
 
     def test_extraction_failure_does_not_corrupt_transactions(self, session_factory):
         created_now = datetime.now(timezone.utc)
@@ -379,6 +381,63 @@ class TestPollerServiceEndToEnd:
             releases = session.execute(select(Release)).scalars().all()
             assert len(releases) == 1
             assert releases[0].album_title == "Success EP"
+
+        service.stop()
+
+    def test_process_unextracted_submissions_consecutive_async_extractions(self, session_factory):
+        created_now = datetime.now(timezone.utc)
+        subs = [
+            RawSubmission(
+                id=f"item{i}",
+                title=f"Artist {i} - Album {i}",
+                url=f"https://reddit.com/r/vinylreleases/item{i}",
+                permalink=f"/r/vinylreleases/comments/item{i}",
+                created_utc=created_now,
+                fullname=f"t3_item{i}",
+            )
+            for i in range(3)
+        ]
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_new.return_value = subs
+        mock_adapter.fetch_hot.return_value = []
+
+        mock_worker = MagicMock()
+
+        async def fake_extract(title, flair=None):
+            return ExtractionResult(
+                releases=[
+                    ExtractedRelease(
+                        artists=["Artist"],
+                        combined_artist="Artist",
+                        album_title="Album",
+                    )
+                ]
+            )
+
+        mock_worker.extract = AsyncMock(side_effect=fake_extract)
+
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=mock_worker,
+        )
+
+        stats = service.poll_and_extract_cycle()
+        assert stats.extracted_count == 3
+        service.stop()
+
+    def test_async_runner_lifecycle(self):
+        runner = _AsyncRunner()
+
+        async def hello():
+            return 42
+
+        assert runner.run(hello()) == 42
+        assert runner._thread is not None and runner._thread.is_alive()
+        runner.stop()
+        assert runner._thread is None
+        assert runner._loop is None
 
 
 class TestGracefulShutdown:

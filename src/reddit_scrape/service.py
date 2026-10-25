@@ -117,6 +117,48 @@ class CycleStats:
     extracted_count: int
 
 
+class _AsyncRunner:
+    """Manages a persistent background event loop to execute coroutines safely across threads."""
+
+    def __init__(self) -> None:
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    def _ensure_started(self) -> None:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._loop = asyncio.new_event_loop()
+                self._thread = threading.Thread(
+                    target=self._run_loop,
+                    name="PollerAsyncRunner",
+                    daemon=True,
+                )
+                self._thread.start()
+
+    def _run_loop(self) -> None:
+        assert self._loop is not None
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def run(self, coro: Coroutine[Any, Any, Any]) -> Any:
+        self._ensure_started()
+        assert self._loop is not None
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
+    def stop(self) -> None:
+        with self._lock:
+            if self._loop is not None and self._loop.is_running():
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            if self._thread is not None and self._thread.is_alive():
+                self._thread.join(timeout=5.0)
+            if self._loop is not None and not self._loop.is_closed():
+                self._loop.close()
+            self._loop = None
+            self._thread = None
+
+
 class PollerService:
     """Continuous dual-loop Reddit scraper and entity extraction pipeline service."""
 
@@ -149,11 +191,21 @@ class PollerService:
         self._extraction_trigger = threading.Event()
         self._extraction_lock = threading.Lock()
         self._extraction_thread: Optional[threading.Thread] = None
+        self._async_runner = _AsyncRunner()
+
+    def __del__(self) -> None:
+        try:
+            if hasattr(self, "_async_runner"):
+                self._async_runner.stop()
+        except Exception:
+            pass
 
     def stop(self) -> None:
         """Signal the poller service to initiate graceful termination."""
         self._shutdown_event.set()
         self._extraction_trigger.set()
+        if hasattr(self, "_async_runner"):
+            self._async_runner.stop()
 
     def is_shutdown_requested(self) -> bool:
         """Return True if termination signal has been received."""
@@ -180,17 +232,8 @@ class PollerService:
             pass
 
     def _run_coroutine(self, coro: Coroutine[Any, Any, Any]) -> Any:
-        """Safely execute an asynchronous coroutine from synchronous context."""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                return executor.submit(lambda: asyncio.run(coro)).result()
-        else:
-            return asyncio.run(coro)
+        """Safely execute an asynchronous coroutine using the persistent event loop runner."""
+        return self._async_runner.run(coro)
 
     def _extract(self, title: str, flair: Optional[str]) -> ExtractionResult:
         """Invoke extraction worker, handling both sync and async return values."""

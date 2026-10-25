@@ -148,6 +148,7 @@ class ExtractionWorker:
 
     def __init__(self, agent: Optional[Agent] = None) -> None:
         self.agent = agent
+        self._owns_agent = agent is None
 
     def _get_agent(self) -> Agent:
         if self.agent is None:
@@ -161,7 +162,13 @@ class ExtractionWorker:
     ) -> ExtractionResult:
         """Extract structured releases from a submission title and optional flair."""
         agent = self._get_agent()
-        return await extract_releases(title, flair=flair, agent=agent)
+        try:
+            return await extract_releases(title, flair=flair, agent=agent)
+        except RuntimeError as exc:
+            if "Event loop is closed" in str(exc) and self._owns_agent:
+                self.agent = create_extraction_agent()
+                return await extract_releases(title, flair=flair, agent=self.agent)
+            raise
 
 
 __all__ = [

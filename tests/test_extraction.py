@@ -204,6 +204,33 @@ class TestExtractionAsyncLogic:
         assert release.combined_artist == "Kanye West & Ty Dolla $ign"
         assert release.album_title == "Vultures 1"
 
+    @pytest.mark.asyncio
+    async def test_extraction_worker_recovers_from_closed_event_loop(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-mock-key")
+        worker = ExtractionWorker()
+
+        call_count = 0
+
+        async def fake_extract_releases(title, flair=None, agent=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("Event loop is closed")
+            return ExtractionResult(
+                releases=[
+                    ExtractedRelease(
+                        artists=["Recovered Artist"],
+                        album_title="Recovered Album",
+                    )
+                ]
+            )
+
+        monkeypatch.setattr("reddit_scrape.extraction.extract_releases", fake_extract_releases)
+        res = await worker.extract("Test Title")
+        assert len(res.releases) == 1
+        assert res.releases[0].artists == ["Recovered Artist"]
+        assert call_count == 2
+
 
 class TestBenchmarkFixtures:
     def test_prototype_results_schema_conformance(self):
@@ -235,4 +262,3 @@ class TestBenchmarkFixtures:
                 for r in parsed.releases:
                     assert len(r.artists) >= 1
                     assert r.album_title
-
