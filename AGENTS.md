@@ -5,7 +5,14 @@
 Package manager & runner is `uv`.
 - Run commands: `uv run <cmd>` (e.g. `uv run python script.py`)
 - Manage packages: `uv add <pkg>` or `uv pip list`
-- Windows UTF-8: Set `PYTHONUTF8=1` in environment or commands to prevent `cp1252` encoding errors.
+
+### Toolchain & Commands
+- Run tests: `uv run pytest` (Always use `BypassSandbox: true`)
+- Type check: `uv run mypy src tests` (Always use `BypassSandbox: true`)
+- Lint / format: `uv run ruff check .`
+- GitHub CLI: `gh` (Always use `BypassSandbox: true`)
+- Git write ops (`git branch`, `git worktree`): Always use `BypassSandbox: true`
+- PowerShell: Chain commands with `;`, not `&&`
 
 ### Asynchronous Tasks
 
