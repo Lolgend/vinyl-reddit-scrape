@@ -3,9 +3,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from sqlalchemy import Engine, create_engine, text
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
-Base = declarative_base()
+
+class Base(DeclarativeBase):
+    pass
 
 
 def get_database_url(url: str | None = None) -> str:

@@ -343,6 +343,7 @@ class TestReleasePersistence:
             all_releases = session.execute(select(Release)).scalars().all()
             assert len(all_releases) == 1
             assert all_releases[0].embedding is not None
+            assert len(all_releases[0].embedding) == 384
 
             all_sub_rels = session.execute(select(SubmissionRelease)).scalars().all()
             assert len(all_sub_rels) == 1
@@ -390,3 +391,103 @@ class TestReleasePersistence:
             s2 = session.get(Submission, "fallback_2")
             assert s1 is not None and s1.is_extracted is True
             assert s2 is not None and s2.is_extracted is True
+
+
+class TestCatalogCandidateRetrievalIntegration:
+    @pytest.fixture(autouse=True)
+    def seed_catalog(self, session_factory):
+        service = ReleasePersistenceService(session_factory)
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "sub_seed_1", "red_seed_1", "Converge / Dropdead - Split")
+            create_test_submission(session, "sub_seed_2", "red_seed_2", "Daft Punk - Discovery")
+            create_test_submission(session, "sub_seed_3", "red_seed_3", "Radiohead - OK Computer")
+
+        # Persist canonical releases
+        service.persist("sub_seed_1", [
+            ExtractedRelease(
+                artists=["Converge", "Dropdead"],
+                combined_artist="Converge / Dropdead",
+                album_title="Split",
+                variant="Clear 7\"",
+                retailer="Deathwish",
+            )
+        ])
+        service.persist("sub_seed_2", [
+            ExtractedRelease(
+                artists=["Daft Punk"],
+                combined_artist="Daft Punk",
+                album_title="Discovery",
+                variant="2LP Gatefold",
+                retailer="Virgin",
+            )
+        ])
+        service.persist("sub_seed_3", [
+            ExtractedRelease(
+                artists=["Radiohead"],
+                combined_artist="Radiohead",
+                album_title="OK Computer",
+                variant="180g Vinyl",
+                retailer=None,
+            )
+        ])
+
+    def test_query_with_reversed_billing_order(self, session_factory):
+        service = ReleasePersistenceService(session_factory)
+        # Reversed billing order: "Dropdead / Converge - Split 7\""
+        candidates = service.find_candidates("Dropdead / Converge - Split 7\"", top_k=5, min_similarity=0.50)
+        assert len(candidates.releases) >= 1
+        top_rel = candidates.releases[0]
+        assert top_rel.combined_artist == "Converge / Dropdead"
+        assert top_rel.album_title == "Split"
+        assert "Converge" in top_rel.artists and "Dropdead" in top_rel.artists
+        assert top_rel.similarity >= 0.50
+        # Contributing artists also retrieved in artists
+        assert "Converge" in candidates.artists or "Dropdead" in candidates.artists
+
+    def test_query_with_swapped_artist_album_order(self, session_factory):
+        service = ReleasePersistenceService(session_factory)
+        # Swapped artist/album: "Discovery - Daft Punk"
+        candidates = service.find_candidates("Discovery - Daft Punk", top_k=5, min_similarity=0.50)
+        assert len(candidates.releases) >= 1
+        top_rel = candidates.releases[0]
+        assert top_rel.combined_artist == "Daft Punk"
+        assert top_rel.album_title == "Discovery"
+        assert top_rel.artists == ["Daft Punk"]
+        assert top_rel.similarity >= 0.50
+        assert "Daft Punk" in candidates.artists
+
+    def test_query_with_reordered_variant_tokens(self, session_factory):
+        service = ReleasePersistenceService(session_factory)
+        # Reordered variant tokens
+        candidates = service.find_candidates("Daft Punk - Discovery (Gatefold 2LP)", top_k=5, min_similarity=0.50)
+        assert len(candidates.releases) >= 1
+        top_rel = candidates.releases[0]
+        assert top_rel.combined_artist == "Daft Punk"
+        assert top_rel.album_title == "Discovery"
+        assert top_rel.variant == "2LP Gatefold"
+
+    def test_unrelated_query_below_threshold_excluded(self, session_factory):
+        service = ReleasePersistenceService(session_factory)
+        # High threshold for unrelated query
+        candidates = service.find_candidates(
+            "Beethoven - Symphony No. 9 in D minor",
+            top_k=5,
+            min_similarity=0.85,
+        )
+        assert candidates.is_empty
+        assert len(candidates.releases) == 0
+
+    def test_batch_query_deduplicates_across_titles(self, session_factory):
+        service = ReleasePersistenceService(session_factory)
+        # Two queries matching the same canonical release
+        candidates = service.find_candidates([
+            "Daft Punk - Discovery (Gatefold)",
+            "Discovery by Daft Punk",
+        ], top_k=5, min_similarity=0.50)
+
+        # Release ID must be unique in candidates.releases
+        rel_ids = [r.id for r in candidates.releases]
+        assert len(rel_ids) == len(set(rel_ids))
+        # Artist names must be unique
+        assert len(candidates.artists) == len(set(candidates.artists))
+        assert any(r.combined_artist == "Daft Punk" for r in candidates.releases)

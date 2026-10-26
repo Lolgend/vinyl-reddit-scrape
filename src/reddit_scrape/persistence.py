@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -15,7 +17,11 @@ from reddit_scrape.embeddings import (
     compute_release_text,
     embed_texts,
 )
-from reddit_scrape.extraction import ExtractedRelease, ExtractionResult
+from reddit_scrape.extraction import (
+    ExtractedRelease,
+    ExtractionResult,
+    pre_clean_title,
+)
 from reddit_scrape.models import (
     Artist,
     Release,
@@ -25,6 +31,34 @@ from reddit_scrape.models import (
 )
 
 STANDARD_TOKEN = "[standard]"
+
+
+@dataclass(frozen=True)
+class CatalogReleaseCandidate:
+    """Canonical release candidate retrieved from vector similarity search."""
+
+    id: str
+    combined_artist: str
+    album_title: str
+    artists: list[str]
+    variant: str | None = None
+    retailer: str | None = None
+    similarity: float = 0.0
+
+
+@dataclass(frozen=True)
+class CatalogCandidates:
+    """Catalog similarity match candidates containing releases and artists."""
+
+    releases: list[CatalogReleaseCandidate] = field(default_factory=list)
+    artists: list[str] = field(default_factory=list)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.releases and not self.artists
+
+    def __bool__(self) -> bool:
+        return bool(self.releases or self.artists)
 
 
 def normalize_attribute(val: str | None, default_token: str | None = None) -> str:
@@ -235,6 +269,121 @@ def persist_extracted_releases(
     return persisted_releases
 
 
+def find_catalog_candidates(
+    session: Session,
+    query_titles: str | Sequence[str],
+    top_k: int = 5,
+    min_similarity: float = 0.50,
+) -> CatalogCandidates:
+    """Find semantically similar catalog releases and artists using pgvector cosine distance.
+
+    1. Normalizes input query strings and pre-cleans them with `pre_clean_title`.
+    2. Embeds all unique query titles in a single vectorized batch call using `embed_texts`.
+    3. Queries PostgreSQL for up to `top_k` Releases and `top_k` Artists per query vector
+       having cosine distance <= (1.0 - min_similarity).
+    4. Deduplicates releases and artists across the query batch, keeping the highest similarity.
+    5. Hydrates matched releases with their contributing artists from `ReleaseArtist` / `Artist`.
+    6. Returns clean `CatalogCandidates` sorted by similarity descending.
+    """
+    if isinstance(query_titles, str):
+        raw_titles = [query_titles]
+    else:
+        raw_titles = list(query_titles)
+
+    cleaned_titles = [pre_clean_title(t) for t in raw_titles]
+    valid_titles = [t for t in cleaned_titles if t]
+    if not valid_titles:
+        return CatalogCandidates()
+
+    # Deduplicate titles for single batch embedding pass
+    unique_titles = list(dict.fromkeys(valid_titles))
+    vectors = embed_texts(unique_titles)
+    vector_map = dict(zip(unique_titles, vectors))
+
+    # Map release ID to (Release, best_similarity)
+    best_releases: dict[Any, tuple[Release, float]] = {}
+    # Map artist name to best_similarity
+    best_artists: dict[str, float] = {}
+
+    max_distance = 1.0 - min_similarity
+
+    for title in valid_titles:
+        vec = vector_map[title]
+
+        # 1. Query top_k Releases using pgvector cosine distance
+        rel_dist = Release.embedding.cosine_distance(vec)
+        rel_stmt = (
+            select(Release, rel_dist.label("dist"))
+            .where(Release.embedding.is_not(None))
+            .where(rel_dist <= (max_distance + 1e-6))
+            .order_by(rel_dist.asc())
+            .limit(top_k)
+        )
+        rel_rows = session.execute(rel_stmt).all()
+        for rel_obj, dist in rel_rows:
+            sim = 1.0 - float(dist)
+            if sim >= min_similarity and (
+                rel_obj.id not in best_releases or sim > best_releases[rel_obj.id][1]
+            ):
+                best_releases[rel_obj.id] = (rel_obj, sim)
+
+        # 2. Query top_k Artists using pgvector cosine distance
+        art_dist = Artist.embedding.cosine_distance(vec)
+        art_stmt = (
+            select(Artist, art_dist.label("dist"))
+            .where(Artist.embedding.is_not(None))
+            .where(art_dist <= (max_distance + 1e-6))
+            .order_by(art_dist.asc())
+            .limit(top_k)
+        )
+        art_rows = session.execute(art_stmt).all()
+        for art_obj, dist in art_rows:
+            sim = 1.0 - float(dist)
+            if sim >= min_similarity and (
+                art_obj.name not in best_artists or sim > best_artists[art_obj.name]
+            ):
+                best_artists[art_obj.name] = sim
+
+    # 3. Hydrate contributing artists for all matched releases
+    matched_rel_ids = list(best_releases.keys())
+    rel_artists_map: dict[Any, list[str]] = {rid: [] for rid in matched_rel_ids}
+    if matched_rel_ids:
+        ra_stmt = (
+            select(ReleaseArtist.release_id, Artist.name)
+            .join(Artist, ReleaseArtist.artist_id == Artist.id)
+            .where(ReleaseArtist.release_id.in_(matched_rel_ids))
+        )
+        ra_rows = session.execute(ra_stmt).all()
+        for r_id, a_name in ra_rows:
+            if a_name not in rel_artists_map[r_id]:
+                rel_artists_map[r_id].append(str(a_name))
+
+    # 4. Assemble deduplicated CatalogReleaseCandidate list sorted by similarity descending
+    sorted_releases = sorted(best_releases.values(), key=lambda pair: pair[1], reverse=True)
+    candidate_releases: list[CatalogReleaseCandidate] = []
+    for rel_obj, sim in sorted_releases:
+        artists = rel_artists_map.get(rel_obj.id, [])
+        if not artists and rel_obj.combined_artist:
+            artists = [str(rel_obj.combined_artist)]
+        candidate_releases.append(
+            CatalogReleaseCandidate(
+                id=str(rel_obj.id),
+                combined_artist=str(rel_obj.combined_artist),
+                album_title=str(rel_obj.album_title),
+                artists=artists,
+                variant=str(rel_obj.variant) if rel_obj.variant is not None else None,
+                retailer=str(rel_obj.retailer_name) if rel_obj.retailer_name is not None else None,
+                similarity=round(sim, 4),
+            )
+        )
+
+    # 5. Assemble deduplicated artist names sorted by similarity descending
+    sorted_artists = sorted(best_artists.items(), key=lambda pair: pair[1], reverse=True)
+    candidate_artists = [str(name) for name, _ in sorted_artists]
+
+    return CatalogCandidates(releases=candidate_releases, artists=candidate_artists)
+
+
 class ReleasePersistenceService:
     """Service managing database transactions for release persistence and deduplication."""
 
@@ -258,12 +407,32 @@ class ReleasePersistenceService:
             session.expunge_all()
             return result
 
+    def find_candidates(
+        self,
+        query_titles: str | Sequence[str],
+        top_k: int = 5,
+        min_similarity: float = 0.50,
+    ) -> CatalogCandidates:
+        """Find semantically similar catalog releases and artists for query titles."""
+        with self.session_factory() as session:
+            return find_catalog_candidates(
+                session=session,
+                query_titles=query_titles,
+                top_k=top_k,
+                min_similarity=min_similarity,
+            )
+
+    get_catalog_candidates = find_candidates
+
 
 __all__ = [
     "STANDARD_TOKEN",
+    "CatalogCandidates",
+    "CatalogReleaseCandidate",
     "ReleasePersistenceService",
     "compute_release_fingerprint",
     "embed_texts",
+    "find_catalog_candidates",
     "normalize_attribute",
     "persist_extracted_releases",
 ]
