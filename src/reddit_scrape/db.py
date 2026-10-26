@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 Base = declarative_base()
@@ -51,5 +51,9 @@ def init_db(engine: Engine | None = None) -> None:
         engine = get_engine()
     # Import models to ensure they are registered on Base.metadata
     from reddit_scrape import models  # noqa: F401
+
+    with engine.begin() as conn:
+        if engine.dialect.name == "postgresql":
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
 
     Base.metadata.create_all(engine)

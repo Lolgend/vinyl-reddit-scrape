@@ -57,7 +57,7 @@ from reddit_scrape.service import (
     validate_environment,
 )
 
-__all__ = [
+__all__ = [  # noqa: RUF022
     # Database
     "Base",
     "get_database_url",
