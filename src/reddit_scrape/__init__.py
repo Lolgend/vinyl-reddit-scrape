@@ -40,8 +40,11 @@ from reddit_scrape.models import (
 )
 from reddit_scrape.persistence import (
     STANDARD_TOKEN,
+    CatalogCandidates,
+    CatalogReleaseCandidate,
     ReleasePersistenceService,
     compute_release_fingerprint,
+    find_catalog_candidates,
     normalize_attribute,
     persist_extracted_releases,
 )
@@ -93,9 +96,12 @@ __all__ = [  # noqa: RUF022
     "extract_releases",
     "pre_clean_title",
     # Persistence
+    "CatalogCandidates",
+    "CatalogReleaseCandidate",
     "STANDARD_TOKEN",
     "ReleasePersistenceService",
     "compute_release_fingerprint",
+    "find_catalog_candidates",
     "normalize_attribute",
     "persist_extracted_releases",
     # Retention
