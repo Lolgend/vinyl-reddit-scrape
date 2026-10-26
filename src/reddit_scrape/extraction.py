@@ -175,6 +175,12 @@ Rules for Each Submission:
    - Exact & Reordered Match Alignment: If the submission announces an artist or release that semantically matches an existing canonical record (even if artist/album order is reversed, multi-artist billing order is rearranged, or intra-field tokens differ in formatting/word order), you MUST align to the exact canonical strings from the reference for `combined_artist`, `artists`, `album_title`, `variant`, and `retailer`.
    - Partial Match Support: If the submission announces a new variant or retailer for an album already present in the catalog reference, reuse the exact canonical `artists`, `combined_artist`, and `album_title` from the reference while extracting the new `variant` and/or `retailer` from the submission.
    - Anti-Hallucination Preservation: Never force a match to an unrelated catalog candidate if the submission announces a genuinely different artist, album, or entity. Only align when the entity is semantically the same.
+
+5. Intra-Batch Canonical Alignment:
+   When multiple submissions within the same batch refer to the same Artist, Combined Artist, album, or Variant in different orders, arrangements, or word orders (e.g. "Converge / Dropdead" in one submission and "Dropdead / Converge" in another, or "Album - Artist" vs "Artist - Album"):
+   - Output a single consistent canonical ordering for all of them across the entire batch.
+   - If matching records exist in the "Existing Catalog Reference", all submissions in the batch MUST align to the reference canonical strings.
+   - If no matching catalog reference exists, establish a consistent canonical order and billing string and reuse that exact same representation for all occurrences of that entity across the entire batch.
 """
 
 
@@ -242,6 +248,7 @@ def build_extraction_prompt(
 
 def build_batch_extraction_prompt(
     submissions: Sequence[tuple[str, str, str | None]],
+    candidates: CatalogCandidates | None = None,
 ) -> str:
     """Build the LLM user prompt for a batch of Reddit submissions."""
     if not submissions:
@@ -259,10 +266,15 @@ def build_batch_extraction_prompt(
         entry_lines.append(f"Title: {cleaned_title}")
         entries.append("\n".join(entry_lines))
 
-    return (
+    base_prompt = (
         "Extract release entities from the following Reddit submissions:\n\n"
         + "\n\n".join(entries)
     )
+
+    reference_block = format_catalog_reference(candidates)
+    if reference_block:
+        return f"{base_prompt}\n\n{reference_block}"
+    return base_prompt
 
 
 # --- Agent Factories ---
@@ -473,6 +485,8 @@ class ExtractionWorker:
         self,
         submissions: Sequence[tuple[str, str, str | None]],
         batch_size: int = 5,
+        candidates: CatalogCandidates | None = None,
+        candidate_retriever: CandidateRetriever | None = None,
     ) -> dict[str, ExtractionResult]:
         """Extract releases for a batch of submissions with automatic single-submission fallback."""
         if not submissions:
@@ -484,12 +498,25 @@ class ExtractionWorker:
             for i in range(0, len(submissions), effective_batch_size):
                 sub_batch = submissions[i : i + effective_batch_size]
                 sub_results = await self.extract_batch(
-                    sub_batch, batch_size=effective_batch_size
+                    sub_batch,
+                    batch_size=effective_batch_size,
+                    candidates=candidates,
+                    candidate_retriever=candidate_retriever,
                 )
                 combined_results.update(sub_results)
             return combined_results
 
-        prompt = build_batch_extraction_prompt(submissions)
+        retriever = (
+            candidate_retriever
+            if candidate_retriever is not None
+            else self.candidate_retriever
+        )
+        resolved_candidates = candidates
+        if resolved_candidates is None and retriever is not None:
+            chunk_titles = [title for _, title, _ in submissions]
+            resolved_candidates = await _resolve_candidates(retriever, chunk_titles)
+
+        prompt = build_batch_extraction_prompt(submissions, candidates=resolved_candidates)
         agent = self._get_batch_agent()
         sub_map = {sub_id: (title, flair) for sub_id, title, flair in submissions}
 
@@ -518,9 +545,18 @@ class ExtractionWorker:
                 len(submissions),
             )
             fallback_results: dict[str, ExtractionResult] = {}
+            fallback_candidates = candidates if candidates is not None else resolved_candidates
             for sub_id, title, flair in submissions:
                 try:
-                    fallback_results[sub_id] = await self.extract(title, flair=flair)
+                    try:
+                        fallback_results[sub_id] = await self.extract(
+                            title,
+                            flair=flair,
+                            candidates=fallback_candidates,
+                            candidate_retriever=retriever,
+                        )
+                    except TypeError:
+                        fallback_results[sub_id] = await self.extract(title, flair=flair)
                 except Exception as single_exc:  # noqa: BLE001
                     logger.warning(
                         "Fallback extraction failed for submission %s (%s: %s)",
@@ -537,10 +573,19 @@ class ExtractionWorker:
                 "Batch extraction omitted %d submission IDs; falling back to single-submission extraction for omitted items",
                 len(missing_ids),
             )
+            fallback_candidates = candidates if candidates is not None else resolved_candidates
             for sub_id in missing_ids:
                 title, flair = sub_map[sub_id]
                 try:
-                    results[sub_id] = await self.extract(title, flair=flair)
+                    try:
+                        results[sub_id] = await self.extract(
+                            title,
+                            flair=flair,
+                            candidates=fallback_candidates,
+                            candidate_retriever=retriever,
+                        )
+                    except TypeError:
+                        results[sub_id] = await self.extract(title, flair=flair)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "Fallback extraction failed for omitted submission %s (%s: %s)",

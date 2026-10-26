@@ -220,6 +220,57 @@ class TestBatchPromptBuilder:
         lines = [line.strip() for line in prompt.split("\n")]
         assert "Flair:" not in lines
 
+    def test_build_batch_extraction_prompt_omits_reference_when_none_or_empty(self):
+        submissions = [("sub_1", "Fontaines D.C. - Romance", None)]
+        assert "Existing Catalog Reference" not in build_batch_extraction_prompt(submissions, candidates=None)
+        assert "Existing Catalog Reference" not in build_batch_extraction_prompt(
+            submissions, candidates=CatalogCandidates()
+        )
+        assert "Existing Catalog Reference" not in build_batch_extraction_prompt(
+            submissions, candidates=CatalogCandidates(releases=[], artists=[])
+        )
+
+    def test_build_batch_extraction_prompt_includes_reference_when_candidates_present(self):
+        submissions = [
+            ("sub_1", "Romance - Fontaines D.C.", "Vinyl"),
+            ("sub_2", "Dropdead / Converge - Split", None),
+        ]
+        candidates = CatalogCandidates(
+            artists=["Fontaines D.C.", "Converge", "Dropdead"],
+            releases=[
+                CatalogReleaseCandidate(
+                    id="rel_1",
+                    combined_artist="Fontaines D.C.",
+                    album_title="Romance",
+                    artists=["Fontaines D.C."],
+                    variant="Opaque Emerald LP",
+                    retailer="XL Recordings",
+                ),
+                CatalogReleaseCandidate(
+                    id="rel_2",
+                    combined_artist="Converge / Dropdead",
+                    album_title="Split",
+                    artists=["Converge", "Dropdead"],
+                    variant=None,
+                    retailer=None,
+                ),
+            ],
+        )
+        prompt = build_batch_extraction_prompt(submissions, candidates=candidates)
+        assert "Submission ID: sub_1" in prompt
+        assert "Submission ID: sub_2" in prompt
+        assert "Existing Catalog Reference:" in prompt
+        assert "Canonical Artists:" in prompt
+        assert "- Fontaines D.C." in prompt
+        assert "- Converge" in prompt
+        assert "Canonical Releases:" in prompt
+        assert "- Combined Artist: Fontaines D.C. | Artists: Fontaines D.C. | Album Title: Romance | Variant: Opaque Emerald LP | Retailer: XL Recordings" in prompt
+        assert "- Combined Artist: Converge / Dropdead | Artists: Converge, Dropdead | Album Title: Split | Variant: None | Retailer: None" in prompt
+
+    def test_build_batch_extraction_prompt_empty_submissions_returns_empty_even_with_candidates(self):
+        candidates = CatalogCandidates(artists=["Artist A"])
+        assert build_batch_extraction_prompt([], candidates=candidates) == ""
+
 
 class TestThinkingLevelDefaults:
     def test_get_default_thinking_level_reasoning_models(self):
@@ -833,6 +884,365 @@ class TestBatchExtractionWorker:
             for record in caplog.records
         )
 
+    @pytest.mark.asyncio
+    async def test_extract_batch_candidate_injection_and_single_retriever_call_per_chunk(self):
+        retriever_calls: list[Sequence[str]] = []
+        captured_prompts: list[str] = []
+
+        canonical_candidates = CatalogCandidates(
+            artists=["Converge", "Dropdead"],
+            releases=[
+                CatalogReleaseCandidate(
+                    id="rel_split",
+                    combined_artist="Converge / Dropdead",
+                    album_title="Split",
+                    artists=["Converge", "Dropdead"],
+                    variant='7" /500',
+                    retailer="Deathwish",
+                )
+            ],
+        )
+
+        def mock_retriever(titles: Sequence[str]) -> CatalogCandidates:
+            retriever_calls.append(list(titles))
+            return canonical_candidates
+
+        batch_agent = Agent(
+            TestModel(
+                custom_output_args={
+                    "items": [
+                        {
+                            "submission_id": "sub_1",
+                            "releases": [
+                                {
+                                    "artists": ["Converge", "Dropdead"],
+                                    "combined_artist": "Converge / Dropdead",
+                                    "album_title": "Split",
+                                    "variant": '7" /500',
+                                    "retailer": "Deathwish",
+                                }
+                            ],
+                        },
+                        {
+                            "submission_id": "sub_2",
+                            "releases": [
+                                {
+                                    "artists": ["Converge", "Dropdead"],
+                                    "combined_artist": "Converge / Dropdead",
+                                    "album_title": "Split",
+                                    "variant": '7" /500',
+                                    "retailer": "Deathwish",
+                                }
+                            ],
+                        },
+                    ]
+                }
+            ),
+            output_type=BatchExtractionResult,
+            system_prompt=BATCH_EXTRACTION_SYSTEM_PROMPT,
+        )
+
+        original_run = batch_agent.run
+
+        async def spy_run(prompt, *args, **kwargs):
+            captured_prompts.append(prompt)
+            return await original_run(prompt, *args, **kwargs)
+
+        batch_agent.run = spy_run
+
+        worker = ExtractionWorker(batch_agent=batch_agent, candidate_retriever=mock_retriever)
+        submissions = [
+            ("sub_1", "Dropdead / Converge - Split 7\" /500", "Official"),
+            ("sub_2", "Converge / Dropdead - Split (Deathwish)", None),
+        ]
+
+        results = await worker.extract_batch(submissions)
+
+        assert len(results) == 2
+        # Retriever called exactly once with all titles in the chunk
+        assert len(retriever_calls) == 1
+        assert retriever_calls[0] == [
+            "Dropdead / Converge - Split 7\" /500",
+            "Converge / Dropdead - Split (Deathwish)",
+        ]
+
+        # Prompt received by batch agent includes Existing Catalog Reference
+        assert len(captured_prompts) == 1
+        assert "Existing Catalog Reference:" in captured_prompts[0]
+        assert "Canonical Artists:" in captured_prompts[0]
+        assert "- Converge" in captured_prompts[0]
+        assert "Canonical Releases:" in captured_prompts[0]
+        assert "Converge / Dropdead" in captured_prompts[0]
+        assert "Split" in captured_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_extract_batch_chunking_retrieves_candidates_per_chunk(self):
+        retriever_calls: list[Sequence[str]] = []
+        captured_prompts: list[str] = []
+
+        def mock_retriever(titles: Sequence[str]) -> CatalogCandidates:
+            retriever_calls.append(list(titles))
+            return CatalogCandidates(artists=[f"Artist for {len(titles)} titles"])
+
+        async def fake_run(prompt):
+            captured_prompts.append(prompt)
+            sub_count = prompt.count("--- Submission ")
+            items = []
+            for i in range(1, sub_count + 1):
+                pattern = rf"--- Submission {i} ---\s+Submission ID:\s+(\S+)"
+                m = re.search(pattern, prompt)
+                sub_id = m.group(1) if m else f"sub_{i}"
+                items.append(
+                    BatchExtractedItem(
+                        submission_id=sub_id,
+                        releases=[
+                            ExtractedRelease(
+                                artists=[f"Artist {sub_id}"],
+                                album_title=f"Album {sub_id}",
+                            )
+                        ],
+                    )
+                )
+            return type("RunResult", (), {"output": BatchExtractionResult(items=items)})()
+
+        fake_batch_agent = Agent(
+            TestModel(),
+            output_type=BatchExtractionResult,
+            system_prompt=BATCH_EXTRACTION_SYSTEM_PROMPT,
+        )
+        fake_batch_agent.run = fake_run
+
+        worker = ExtractionWorker(batch_agent=fake_batch_agent, candidate_retriever=mock_retriever)
+        submissions = [
+            ("sub_1", "Artist 1 - Album 1", None),
+            ("sub_2", "Artist 2 - Album 2", None),
+            ("sub_3", "Artist 3 - Album 3", None),
+            ("sub_4", "Artist 4 - Album 4", None),
+        ]
+
+        results = await worker.extract_batch(submissions, batch_size=2)
+        assert len(results) == 4
+        # Retriever called once per chunk of 2
+        assert len(retriever_calls) == 2
+        assert retriever_calls[0] == ["Artist 1 - Album 1", "Artist 2 - Album 2"]
+        assert retriever_calls[1] == ["Artist 3 - Album 3", "Artist 4 - Album 4"]
+        assert len(captured_prompts) == 2
+        assert "Existing Catalog Reference:" in captured_prompts[0]
+        assert "Existing Catalog Reference:" in captured_prompts[1]
+
+    @pytest.mark.asyncio
+    async def test_extract_batch_preserves_candidates_during_batch_failure_fallback(self):
+        failing_batch_agent = Agent(
+            TestModel(),
+            output_type=BatchExtractionResult,
+            system_prompt=BATCH_EXTRACTION_SYSTEM_PROMPT,
+        )
+
+        async def fail_run(*args, **kwargs):
+            raise RuntimeError("Batch LLM call crashed")
+
+        failing_batch_agent.run = fail_run
+
+        single_prompts: list[str] = []
+        single_agent = Agent(
+            TestModel(
+                custom_output_args={
+                    "releases": [
+                        {
+                            "artists": ["Fallback Artist"],
+                            "combined_artist": "Fallback Artist",
+                            "album_title": "Fallback Album",
+                        }
+                    ]
+                }
+            ),
+            output_type=ExtractionResult,
+            system_prompt=EXTRACTION_SYSTEM_PROMPT,
+        )
+        original_single_run = single_agent.run
+
+        async def spy_single_run(prompt, *args, **kwargs):
+            single_prompts.append(prompt)
+            return await original_single_run(prompt, *args, **kwargs)
+
+        single_agent.run = spy_single_run
+
+        canonical_candidates = CatalogCandidates(
+            artists=["Fallback Artist"],
+            releases=[
+                CatalogReleaseCandidate(
+                    id="rel_fb",
+                    combined_artist="Fallback Artist",
+                    album_title="Fallback Album",
+                    artists=["Fallback Artist"],
+                )
+            ],
+        )
+
+        worker = ExtractionWorker(
+            agent=single_agent,
+            batch_agent=failing_batch_agent,
+            candidate_retriever=lambda _: canonical_candidates,
+        )
+
+        submissions = [
+            ("sub_101", "Fallback Album - Fallback Artist", None),
+            ("sub_102", "Fallback Artist - Fallback Album", "News"),
+        ]
+
+        results = await worker.extract_batch(submissions)
+        assert len(results) == 2
+        assert "sub_101" in results and "sub_102" in results
+        # Fallback single agent prompts must include Existing Catalog Reference
+        assert len(single_prompts) == 2
+        for prompt in single_prompts:
+            assert "Existing Catalog Reference:" in prompt
+            assert "Fallback Artist" in prompt
+            assert "Fallback Album" in prompt
+
+    @pytest.mark.asyncio
+    async def test_extract_batch_preserves_candidates_during_omitted_id_fallback(self):
+        # Batch agent returns only sub_1, omitting sub_2
+        mock_output = {
+            "items": [
+                {
+                    "submission_id": "sub_1",
+                    "releases": [
+                        {
+                            "artists": ["Fontaines D.C."],
+                            "combined_artist": "Fontaines D.C.",
+                            "album_title": "Romance",
+                        }
+                    ],
+                }
+            ]
+        }
+        batch_agent = Agent(
+            TestModel(custom_output_args=mock_output),
+            output_type=BatchExtractionResult,
+            system_prompt=BATCH_EXTRACTION_SYSTEM_PROMPT,
+        )
+
+        single_prompts: list[str] = []
+        single_agent = Agent(
+            TestModel(
+                custom_output_args={
+                    "releases": [
+                        {
+                            "artists": ["Idles"],
+                            "combined_artist": "Idles",
+                            "album_title": "TANGK",
+                        }
+                    ]
+                }
+            ),
+            output_type=ExtractionResult,
+            system_prompt=EXTRACTION_SYSTEM_PROMPT,
+        )
+        original_single_run = single_agent.run
+
+        async def spy_single_run(prompt, *args, **kwargs):
+            single_prompts.append(prompt)
+            return await original_single_run(prompt, *args, **kwargs)
+
+        single_agent.run = spy_single_run
+
+        canonical_candidates = CatalogCandidates(
+            artists=["Idles"],
+            releases=[
+                CatalogReleaseCandidate(
+                    id="rel_idles",
+                    combined_artist="Idles",
+                    album_title="TANGK",
+                    artists=["Idles"],
+                )
+            ],
+        )
+
+        worker = ExtractionWorker(
+            agent=single_agent,
+            batch_agent=batch_agent,
+            candidate_retriever=lambda _: canonical_candidates,
+        )
+
+        submissions = [
+            ("sub_1", "Fontaines D.C. - Romance", None),
+            ("sub_2", "TANGK - Idles", None),
+        ]
+
+        results = await worker.extract_batch(submissions)
+        assert len(results) == 2
+        assert "sub_1" in results and "sub_2" in results
+        # Single prompt for sub_2 must contain Existing Catalog Reference
+        assert len(single_prompts) == 1
+        assert "Existing Catalog Reference:" in single_prompts[0]
+        assert "TANGK" in single_prompts[0]
+        assert "Idles" in single_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_extract_batch_explicit_candidates_and_retriever_override(self):
+        worker_retriever_called = False
+
+        def worker_retriever(titles):
+            nonlocal worker_retriever_called
+            worker_retriever_called = True
+            return CatalogCandidates(artists=["Worker Artist"])
+
+        explicit_candidates = CatalogCandidates(
+            artists=["Explicit Artist"],
+            releases=[
+                CatalogReleaseCandidate(
+                    id="rel_exp",
+                    combined_artist="Explicit Artist",
+                    album_title="Explicit Album",
+                    artists=["Explicit Artist"],
+                )
+            ],
+        )
+
+        captured_prompts: list[str] = []
+        batch_agent = Agent(
+            TestModel(
+                custom_output_args={
+                    "items": [
+                        {
+                            "submission_id": "sub_exp",
+                            "releases": [
+                                {
+                                    "artists": ["Explicit Artist"],
+                                    "album_title": "Explicit Album",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ),
+            output_type=BatchExtractionResult,
+            system_prompt=BATCH_EXTRACTION_SYSTEM_PROMPT,
+        )
+        original_run = batch_agent.run
+
+        async def spy_run(prompt, *args, **kwargs):
+            captured_prompts.append(prompt)
+            return await original_run(prompt, *args, **kwargs)
+
+        batch_agent.run = spy_run
+
+        worker = ExtractionWorker(batch_agent=batch_agent, candidate_retriever=worker_retriever)
+
+        results = await worker.extract_batch(
+            [("sub_exp", "Explicit Album - Explicit Artist", None)],
+            candidates=explicit_candidates,
+        )
+
+        assert len(results) == 1
+        # Worker retriever should NOT be called when explicit candidates are passed
+        assert not worker_retriever_called
+        assert len(captured_prompts) == 1
+        assert "Existing Catalog Reference:" in captured_prompts[0]
+        assert "Explicit Artist" in captured_prompts[0]
+        assert "Explicit Album" in captured_prompts[0]
+
 
 class TestBenchmarkFixtures:
     def test_prototype_results_schema_conformance(self):
@@ -975,6 +1385,22 @@ class TestSystemPromptCanonicalAlignment:
         assert "Anti-Hallucination" in EXTRACTION_SYSTEM_PROMPT
         prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
         assert "different" in prompt_lower or "unrelated" in prompt_lower
+
+
+class TestBatchSystemPromptCanonicalAlignment:
+    def test_batch_system_prompt_includes_catalog_canonical_alignment(self):
+        assert "Canonical Alignment" in BATCH_EXTRACTION_SYSTEM_PROMPT
+        assert "Existing Catalog Reference" in BATCH_EXTRACTION_SYSTEM_PROMPT
+        assert "Exact & Reordered Match Alignment" in BATCH_EXTRACTION_SYSTEM_PROMPT
+        assert "Partial Match Support" in BATCH_EXTRACTION_SYSTEM_PROMPT
+        assert "Anti-Hallucination" in BATCH_EXTRACTION_SYSTEM_PROMPT
+
+    def test_batch_system_prompt_includes_intra_batch_canonical_alignment(self):
+        prompt_lower = BATCH_EXTRACTION_SYSTEM_PROMPT.lower()
+        assert "intra-batch" in prompt_lower or "intra batch" in prompt_lower
+        assert "canonical" in prompt_lower
+        assert "order" in prompt_lower or "consistent" in prompt_lower
+        assert "batch" in prompt_lower
 
 
 class TestCandidateRetrieverWiring:
@@ -1297,3 +1723,154 @@ class TestCanonicalAlignmentBehavior:
         assert rel.album_title == "Romance"
         assert rel.variant == "Clear Zoetrope LP"
         assert rel.retailer == "Blood Records"
+
+    @pytest.mark.asyncio
+    async def test_batch_extraction_intra_batch_canonical_alignment_with_catalog_reference(self):
+        canonical_candidates = CatalogCandidates(
+            artists=["Converge", "Dropdead"],
+            releases=[
+                CatalogReleaseCandidate(
+                    id="rel_split",
+                    combined_artist="Converge / Dropdead",
+                    album_title="Split",
+                    artists=["Converge", "Dropdead"],
+                    variant='7"',
+                    retailer=None,
+                )
+            ],
+        )
+
+        captured_prompts: list[str] = []
+        batch_agent = Agent(
+            TestModel(
+                custom_output_args={
+                    "items": [
+                        {
+                            "submission_id": "sub_1",
+                            "releases": [
+                                {
+                                    "artists": ["Converge", "Dropdead"],
+                                    "combined_artist": "Converge / Dropdead",
+                                    "album_title": "Split",
+                                    "variant": '7"',
+                                    "retailer": None,
+                                }
+                            ],
+                        },
+                        {
+                            "submission_id": "sub_2",
+                            "releases": [
+                                {
+                                    "artists": ["Converge", "Dropdead"],
+                                    "combined_artist": "Converge / Dropdead",
+                                    "album_title": "Split",
+                                    "variant": '7"',
+                                    "retailer": None,
+                                }
+                            ],
+                        },
+                    ]
+                }
+            ),
+            output_type=BatchExtractionResult,
+            system_prompt=BATCH_EXTRACTION_SYSTEM_PROMPT,
+        )
+        original_run = batch_agent.run
+
+        async def spy_run(prompt, *args, **kwargs):
+            captured_prompts.append(prompt)
+            return await original_run(prompt, *args, **kwargs)
+
+        batch_agent.run = spy_run
+
+        worker = ExtractionWorker(
+            batch_agent=batch_agent,
+            candidate_retriever=lambda _: canonical_candidates,
+        )
+
+        submissions = [
+            ("sub_1", "Dropdead / Converge - Split 7\"", None),
+            ("sub_2", "Split 7\" - Converge / Dropdead", None),
+        ]
+
+        results = await worker.extract_batch(submissions)
+
+        assert len(captured_prompts) == 1
+        assert "Existing Catalog Reference:" in captured_prompts[0]
+        assert "Converge / Dropdead" in captured_prompts[0]
+
+        assert len(results) == 2
+        rel1 = results["sub_1"].releases[0]
+        rel2 = results["sub_2"].releases[0]
+        assert rel1.combined_artist == "Converge / Dropdead"
+        assert rel2.combined_artist == "Converge / Dropdead"
+        assert rel1.album_title == "Split"
+        assert rel2.album_title == "Split"
+        assert rel1.artists == rel2.artists == ["Converge", "Dropdead"]
+
+    @pytest.mark.asyncio
+    async def test_batch_extraction_intra_batch_canonical_alignment_without_catalog_reference(self):
+        captured_prompts: list[str] = []
+        batch_agent = Agent(
+            TestModel(
+                custom_output_args={
+                    "items": [
+                        {
+                            "submission_id": "sub_1",
+                            "releases": [
+                                {
+                                    "artists": ["Converge", "Dropdead"],
+                                    "combined_artist": "Converge / Dropdead",
+                                    "album_title": "Unreleased",
+                                    "variant": '12"',
+                                    "retailer": None,
+                                }
+                            ],
+                        },
+                        {
+                            "submission_id": "sub_2",
+                            "releases": [
+                                {
+                                    "artists": ["Converge", "Dropdead"],
+                                    "combined_artist": "Converge / Dropdead",
+                                    "album_title": "Unreleased",
+                                    "variant": '12"',
+                                    "retailer": None,
+                                }
+                            ],
+                        },
+                    ]
+                }
+            ),
+            output_type=BatchExtractionResult,
+            system_prompt=BATCH_EXTRACTION_SYSTEM_PROMPT,
+        )
+        original_run = batch_agent.run
+
+        async def spy_run(prompt, *args, **kwargs):
+            captured_prompts.append(prompt)
+            return await original_run(prompt, *args, **kwargs)
+
+        batch_agent.run = spy_run
+
+        worker = ExtractionWorker(
+            batch_agent=batch_agent,
+            candidate_retriever=lambda _: CatalogCandidates(),
+        )
+
+        submissions = [
+            ("sub_1", "Dropdead / Converge - Unreleased 12\"", None),
+            ("sub_2", "Unreleased 12\" - Converge / Dropdead", None),
+        ]
+
+        results = await worker.extract_batch(submissions)
+
+        assert len(captured_prompts) == 1
+        assert "Existing Catalog Reference:" not in captured_prompts[0]
+
+        assert len(results) == 2
+        rel1 = results["sub_1"].releases[0]
+        rel2 = results["sub_2"].releases[0]
+        assert rel1.combined_artist == rel2.combined_artist == "Converge / Dropdead"
+        assert rel1.album_title == rel2.album_title == "Unreleased"
+        assert rel1.artists == rel2.artists == ["Converge", "Dropdead"]
