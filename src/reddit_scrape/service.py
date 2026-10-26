@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from dotenv import load_dotenv
 from sqlalchemy import select
@@ -230,10 +230,6 @@ class PollerService:
             )
         else:
             self.extraction_worker = extraction_worker
-            if getattr(self.extraction_worker, 'candidate_retriever', None) is None:
-                self.extraction_worker.candidate_retriever = (
-                    self.persistence_service.find_candidates
-                )
         self.ingester = ingester or SubmissionIngester(self.session_factory)
 
         self.poll_interval_seconds = poll_interval_seconds
@@ -293,8 +289,8 @@ class PollerService:
         """Invoke extraction worker, handling both sync and async return values."""
         res = self.extraction_worker.extract(title, flair=flair)
         if inspect.iscoroutine(res):
-            return self._run_coroutine(res)
-        return res
+            return cast(ExtractionResult, self._run_coroutine(res))
+        return cast(ExtractionResult, res)
 
     def _extract_batch(
         self, batch_tuples: list[tuple[str, str, str | None]]

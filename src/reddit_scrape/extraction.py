@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, Union, cast
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -41,7 +41,7 @@ def get_default_thinking_level(model_name: str | None = None) -> str:
     If model_name is reasoning-capable (e.g. contains 'reasoner', 'r1', 'o1', 'o3'),
     returns 'low'. For standard chat models (e.g. 'deepseek-chat', 'gpt-4o'), returns 'none'.
     """
-    model = model_name or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    model = model_name or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
     model_lower = model.lower()
     reasoning_identifiers = ("reasoner", "r1", "o1", "o3")
     if any(ident in model_lower for ident in reasoning_identifiers):
@@ -293,7 +293,7 @@ def create_extraction_agent(
             "DEEPSEEK_API_KEY or DEEPSEEK_KEY environment variable is required"
         )
     url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    model = model_name or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    model = model_name or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
 
     level = thinking_level or os.getenv("LLM_THINKING_LEVEL")
     if not level:
@@ -303,7 +303,7 @@ def create_extraction_agent(
     if level.lower() == "none":
         model_settings = {"thinking": False}
     else:
-        model_settings = {"thinking": level.lower()}
+        model_settings = {"thinking": cast(Any, level.lower())}
 
     provider = OpenAIProvider(
         base_url=url,
@@ -332,7 +332,7 @@ def create_batch_extraction_agent(
             "DEEPSEEK_API_KEY or DEEPSEEK_KEY environment variable is required"
         )
     url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    model = model_name or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    model = model_name or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
 
     level = thinking_level or os.getenv("LLM_THINKING_LEVEL")
     if not level:
@@ -342,7 +342,7 @@ def create_batch_extraction_agent(
     if level.lower() == "none":
         model_settings = {"thinking": False}
     else:
-        model_settings = {"thinking": level.lower()}
+        model_settings = {"thinking": cast(Any, level.lower())}
 
     provider = OpenAIProvider(
         base_url=url,
@@ -365,23 +365,22 @@ async def _resolve_candidates(
     retriever: CandidateRetriever | None,
     titles: Sequence[str],
 ) -> CatalogCandidates | None:
-    """Safely execute a synchronous or asynchronous candidate retriever callable."""
+    """Safely execute a candidate retriever callable."""
     if retriever is None:
         return None
     try:
-        try:
-            result = retriever(titles)
-        except TypeError:
-            if len(titles) == 1:
-                result = retriever(titles[0])
-            else:
-                raise
+        result = retriever(titles)
+        resolved: Any
         if inspect.isawaitable(result):
             resolved = await result
         else:
             resolved = result
-        if resolved is not None and hasattr(resolved, "releases") and hasattr(resolved, "artists"):
-            return resolved  # type: ignore[return-value]
+        if (
+            resolved is not None
+            and hasattr(resolved, "releases")
+            and hasattr(resolved, "artists")
+        ):
+            return cast("CatalogCandidates", resolved)
         return None
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -395,20 +394,19 @@ async def _resolve_candidates(
 async def extract_releases(
     title: str,
     flair: str | None = None,
-    agent: Agent | None = None,
+    agent: Agent[None, ExtractionResult] | None = None,
     candidates: CatalogCandidates | None = None,
     candidate_retriever: CandidateRetriever | None = None,
 ) -> ExtractionResult:
     """Extract structured releases from a submission title and optional flair asynchronously."""
-    if agent is None:
-        agent = create_extraction_agent()
+    target_agent = agent if agent is not None else create_extraction_agent()
 
     resolved_candidates = candidates
     if resolved_candidates is None and candidate_retriever is not None:
         resolved_candidates = await _resolve_candidates(candidate_retriever, [title])
 
     prompt = build_extraction_prompt(title, flair=flair, candidates=resolved_candidates)
-    run_result = await agent.run(prompt)
+    run_result = await target_agent.run(prompt)
     return run_result.output
 
 
@@ -417,29 +415,64 @@ class ExtractionWorker:
 
     def __init__(
         self,
-        agent: Agent | None = None,
+        agent: Agent[None, ExtractionResult] | None = None,
         thinking_level: str | None = None,
-        batch_agent: Agent | None = None,
+        batch_agent: Agent[None, BatchExtractionResult] | None = None,
         candidate_retriever: CandidateRetriever | None = None,
     ) -> None:
-        self.agent = agent
-        self.batch_agent = batch_agent
+        self.agent: Agent[None, ExtractionResult] | None = agent
+        self.batch_agent: Agent[None, BatchExtractionResult] | None = batch_agent
         self.thinking_level = thinking_level
         self.candidate_retriever = candidate_retriever
         self._owns_agent = agent is None
         self._owns_batch_agent = batch_agent is None
 
-    def _get_agent(self) -> Agent:
+    def _get_agent(self) -> Agent[None, ExtractionResult]:
         if self.agent is None:
             self.agent = create_extraction_agent(thinking_level=self.thinking_level)
         return self.agent
 
-    def _get_batch_agent(self) -> Agent:
+    def _get_batch_agent(self) -> Agent[None, BatchExtractionResult]:
         if self.batch_agent is None:
             self.batch_agent = create_batch_extraction_agent(
                 thinking_level=self.thinking_level
             )
         return self.batch_agent
+
+    async def _fallback_extract_single(
+        self,
+        sub_id: str,
+        title: str,
+        flair: str | None,
+        retriever: CandidateRetriever | None,
+        is_omitted: bool = False,
+    ) -> ExtractionResult:
+        """Safely extract releases for an individual submission during batch fallback."""
+        kwargs: dict[str, Any] = {}
+        if retriever is not None:
+            kwargs["candidate_retriever"] = retriever
+
+        try:
+            try:
+                return await self.extract(
+                    title,
+                    flair=flair,
+                    **kwargs,
+                )
+            except TypeError as te:
+                if "candidate_retriever" in str(te):
+                    return await self.extract(title, flair=flair)
+                raise
+        except Exception as exc:  # noqa: BLE001
+            target_label = "omitted submission" if is_omitted else "submission"
+            logger.warning(
+                "Fallback extraction failed for %s %s (%s: %s)",
+                target_label,
+                sub_id,
+                type(exc).__name__,
+                exc,
+            )
+            return ExtractionResult(releases=[])
 
     async def extract(
         self,
@@ -545,26 +578,10 @@ class ExtractionWorker:
                 len(submissions),
             )
             fallback_results: dict[str, ExtractionResult] = {}
-            fallback_candidates = candidates if candidates is not None else resolved_candidates
             for sub_id, title, flair in submissions:
-                try:
-                    try:
-                        fallback_results[sub_id] = await self.extract(
-                            title,
-                            flair=flair,
-                            candidates=fallback_candidates,
-                            candidate_retriever=retriever,
-                        )
-                    except TypeError:
-                        fallback_results[sub_id] = await self.extract(title, flair=flair)
-                except Exception as single_exc:  # noqa: BLE001
-                    logger.warning(
-                        "Fallback extraction failed for submission %s (%s: %s)",
-                        sub_id,
-                        type(single_exc).__name__,
-                        single_exc,
-                    )
-                    fallback_results[sub_id] = ExtractionResult(releases=[])
+                fallback_results[sub_id] = await self._fallback_extract_single(
+                    sub_id, title, flair, retriever
+                )
             return fallback_results
 
         missing_ids = [sub_id for sub_id in sub_map if sub_id not in results]
@@ -573,27 +590,11 @@ class ExtractionWorker:
                 "Batch extraction omitted %d submission IDs; falling back to single-submission extraction for omitted items",
                 len(missing_ids),
             )
-            fallback_candidates = candidates if candidates is not None else resolved_candidates
             for sub_id in missing_ids:
                 title, flair = sub_map[sub_id]
-                try:
-                    try:
-                        results[sub_id] = await self.extract(
-                            title,
-                            flair=flair,
-                            candidates=fallback_candidates,
-                            candidate_retriever=retriever,
-                        )
-                    except TypeError:
-                        results[sub_id] = await self.extract(title, flair=flair)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "Fallback extraction failed for omitted submission %s (%s: %s)",
-                        sub_id,
-                        type(exc).__name__,
-                        exc,
-                    )
-                    results[sub_id] = ExtractionResult(releases=[])
+                results[sub_id] = await self._fallback_extract_single(
+                    sub_id, title, flair, retriever, is_omitted=True
+                )
 
         return results
 

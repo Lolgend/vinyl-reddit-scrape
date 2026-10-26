@@ -6,6 +6,7 @@ from reddit_scrape.db import (
     get_engine,
     get_session_factory,
     init_db,
+    reset_db,
 )
 from reddit_scrape.extraction import (
     BATCH_EXTRACTION_SYSTEM_PROMPT,
@@ -69,6 +70,7 @@ __all__ = [  # noqa: RUF022
     "get_engine",
     "get_session_factory",
     "init_db",
+    "reset_db",
     # Models
     "Artist",
     "Release",

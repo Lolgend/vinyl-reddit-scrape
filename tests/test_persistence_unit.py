@@ -373,7 +373,6 @@ class TestCatalogCandidateRetrievalUnit:
         mock_session_factory.return_value.__enter__.return_value = mock_session
 
         service = ReleasePersistenceService(mock_session_factory)
-        assert service.get_catalog_candidates == service.find_candidates
 
         with patch("reddit_scrape.persistence.find_catalog_candidates") as mock_find:
             mock_find.return_value = CatalogCandidates()

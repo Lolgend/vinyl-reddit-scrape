@@ -56,7 +56,7 @@ def _execute_purge_loop(
     while True:
         result = session.execute(stmt, params)
         session.commit()
-        batch_deleted = result.rowcount
+        batch_deleted = int(getattr(result, "rowcount", 0))
         total_deleted += batch_deleted
         logger.info(
             "Purged %d snapshots in batch (total deleted so far: %d)",

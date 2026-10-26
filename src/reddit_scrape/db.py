@@ -47,15 +47,36 @@ def get_session_factory(engine: Engine | None = None) -> sessionmaker:
     return sessionmaker(bind=engine)
 
 
-def init_db(engine: Engine | None = None) -> None:
-    """Create all tables and indexes defined in Base metadata."""
+def init_db(engine: Engine | None = None, drop_existing: bool = False) -> None:
+    """Create all tables and indexes defined in Base metadata.
+
+    If drop_existing is True, drops all existing tables before re-creating them.
+    """
     if engine is None:
         engine = get_engine()
     # Import models to ensure they are registered on Base.metadata
     from reddit_scrape import models  # noqa: F401
+
+    if drop_existing:
+        Base.metadata.drop_all(engine)
 
     with engine.begin() as conn:
         if engine.dialect.name == "postgresql":
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
 
     Base.metadata.create_all(engine)
+
+
+def reset_db(engine: Engine | None = None) -> None:
+    """Drop all existing tables, ensure vector extension, and re-create all tables cleanly."""
+    init_db(engine=engine, drop_existing=True)
+
+
+__all__ = [
+    "Base",
+    "get_database_url",
+    "get_engine",
+    "get_session_factory",
+    "init_db",
+    "reset_db",
+]
