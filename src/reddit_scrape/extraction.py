@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Union
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -13,6 +15,18 @@ from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
+
+if TYPE_CHECKING:
+    from reddit_scrape.persistence import CatalogCandidates
+
+CandidateRetriever = Callable[
+    ...,
+    Union[
+        "CatalogCandidates",
+        Awaitable["CatalogCandidates"],
+        None,
+    ],
+]
 
 load_dotenv()
 
@@ -125,6 +139,12 @@ Rules:
 
 3. Strict Anti-Hallucination:
    - Only extract information explicitly stated in the submission title. Do NOT guess or hallucinate missing album titles or artists.
+
+4. Canonical Alignment (Existing Catalog Reference):
+   When an "Existing Catalog Reference" section is present in the prompt:
+   - Exact & Reordered Match Alignment: If the submission announces an artist or release that semantically matches an existing canonical record (even if artist/album order is reversed, multi-artist billing order is rearranged, or intra-field tokens differ in formatting/word order), you MUST align to the exact canonical strings from the reference for `combined_artist`, `artists`, `album_title`, `variant`, and `retailer`.
+   - Partial Match Support: If the submission announces a new variant or retailer for an album already present in the catalog reference, reuse the exact canonical `artists`, `combined_artist`, and `album_title` from the reference while extracting the new `variant` and/or `retailer` from the submission.
+   - Anti-Hallucination Preservation: Never force a match to an unrelated catalog candidate if the submission announces a genuinely different artist, album, or entity. Only align when the entity is semantically the same.
 """
 
 BATCH_EXTRACTION_SYSTEM_PROMPT = """You are an expert vinyl record discography classifier specialized in extracting structured data from batches of r/vinylreleases submission titles.
@@ -149,22 +169,75 @@ Rules for Each Submission:
 
 3. Strict Anti-Hallucination:
    - Only extract information explicitly stated in the submission title. Do NOT guess or hallucinate missing album titles or artists.
+
+4. Canonical Alignment (Existing Catalog Reference):
+   When an "Existing Catalog Reference" section is present in the prompt:
+   - Exact & Reordered Match Alignment: If the submission announces an artist or release that semantically matches an existing canonical record (even if artist/album order is reversed, multi-artist billing order is rearranged, or intra-field tokens differ in formatting/word order), you MUST align to the exact canonical strings from the reference for `combined_artist`, `artists`, `album_title`, `variant`, and `retailer`.
+   - Partial Match Support: If the submission announces a new variant or retailer for an album already present in the catalog reference, reuse the exact canonical `artists`, `combined_artist`, and `album_title` from the reference while extracting the new `variant` and/or `retailer` from the submission.
+   - Anti-Hallucination Preservation: Never force a match to an unrelated catalog candidate if the submission announces a genuinely different artist, album, or entity. Only align when the entity is semantically the same.
 """
 
 
 # --- Prompt Builders ---
 
 
-def build_extraction_prompt(title: str, flair: str | None = None) -> str:
-    """Build the LLM user prompt from the submission title and optional flair."""
+def format_catalog_reference(candidates: CatalogCandidates | None) -> str:
+    """Format catalog candidates into an 'Existing Catalog Reference' block.
+
+    Returns an empty string if candidates is None or has no artists or releases.
+    """
+    if not candidates:
+        return ""
+    if getattr(candidates, "is_empty", False):
+        return ""
+
+    has_artists = bool(getattr(candidates, "artists", None))
+    has_releases = bool(getattr(candidates, "releases", None))
+
+    if not has_artists and not has_releases:
+        return ""
+
+    lines = ["Existing Catalog Reference:"]
+    if has_artists:
+        lines.append("Canonical Artists:")
+        for artist in candidates.artists:
+            lines.append(f"- {artist}")
+
+    if has_releases:
+        if has_artists:
+            lines.append("")
+        lines.append("Canonical Releases:")
+        for r in candidates.releases:
+            artists_str = ", ".join(r.artists) if r.artists else r.combined_artist
+            variant_str = r.variant if r.variant is not None else "None"
+            retailer_str = r.retailer if r.retailer is not None else "None"
+            lines.append(
+                f"- Combined Artist: {r.combined_artist} | Artists: {artists_str} | Album Title: {r.album_title} | Variant: {variant_str} | Retailer: {retailer_str}"
+            )
+
+    return "\n".join(lines)
+
+
+def build_extraction_prompt(
+    title: str,
+    flair: str | None = None,
+    candidates: CatalogCandidates | None = None,
+) -> str:
+    """Build the LLM user prompt from the submission title, optional flair, and catalog candidates."""
     cleaned_title = pre_clean_title(title)
     if flair and flair.strip():
-        return (
+        base_prompt = (
             f"Extract release entities from Reddit submission:\n\n"
             f"Flair: {flair.strip()}\n"
             f"Title: {cleaned_title}"
         )
-    return f"Extract release entities from Reddit submission title:\n\n{cleaned_title}"
+    else:
+        base_prompt = f"Extract release entities from Reddit submission title:\n\n{cleaned_title}"
+
+    reference_block = format_catalog_reference(candidates)
+    if reference_block:
+        return f"{base_prompt}\n\n{reference_block}"
+    return base_prompt
 
 
 def build_batch_extraction_prompt(
@@ -276,16 +349,53 @@ def create_batch_extraction_agent(
 # --- Asynchronous Extraction Functions ---
 
 
+async def _resolve_candidates(
+    retriever: CandidateRetriever | None,
+    titles: Sequence[str],
+) -> CatalogCandidates | None:
+    """Safely execute a synchronous or asynchronous candidate retriever callable."""
+    if retriever is None:
+        return None
+    try:
+        try:
+            result = retriever(titles)
+        except TypeError:
+            if len(titles) == 1:
+                result = retriever(titles[0])
+            else:
+                raise
+        if inspect.isawaitable(result):
+            resolved = await result
+        else:
+            resolved = result
+        if resolved is not None and hasattr(resolved, "releases") and hasattr(resolved, "artists"):
+            return resolved  # type: ignore[return-value]
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Candidate retrieval failed (%s: %s); proceeding without catalog reference",
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
 async def extract_releases(
     title: str,
     flair: str | None = None,
     agent: Agent | None = None,
+    candidates: CatalogCandidates | None = None,
+    candidate_retriever: CandidateRetriever | None = None,
 ) -> ExtractionResult:
     """Extract structured releases from a submission title and optional flair asynchronously."""
     if agent is None:
         agent = create_extraction_agent()
 
-    prompt = build_extraction_prompt(title, flair)
+    resolved_candidates = candidates
+    if resolved_candidates is None and candidate_retriever is not None:
+        resolved_candidates = await _resolve_candidates(candidate_retriever, [title])
+
+    prompt = build_extraction_prompt(title, flair=flair, candidates=resolved_candidates)
     run_result = await agent.run(prompt)
     return run_result.output
 
@@ -298,10 +408,12 @@ class ExtractionWorker:
         agent: Agent | None = None,
         thinking_level: str | None = None,
         batch_agent: Agent | None = None,
+        candidate_retriever: CandidateRetriever | None = None,
     ) -> None:
         self.agent = agent
         self.batch_agent = batch_agent
         self.thinking_level = thinking_level
+        self.candidate_retriever = candidate_retriever
         self._owns_agent = agent is None
         self._owns_batch_agent = batch_agent is None
 
@@ -321,15 +433,40 @@ class ExtractionWorker:
         self,
         title: str,
         flair: str | None = None,
+        candidates: CatalogCandidates | None = None,
+        candidate_retriever: CandidateRetriever | None = None,
     ) -> ExtractionResult:
         """Extract structured releases from a submission title and optional flair."""
         agent = self._get_agent()
+        retriever = (
+            candidate_retriever
+            if candidate_retriever is not None
+            else self.candidate_retriever
+        )
+        resolved_candidates = candidates
+        if resolved_candidates is None and retriever is not None:
+            resolved_candidates = await _resolve_candidates(retriever, [title])
+
+        kwargs: dict[str, Any] = {}
+        if resolved_candidates is not None:
+            kwargs["candidates"] = resolved_candidates
+
         try:
-            return await extract_releases(title, flair=flair, agent=agent)
+            return await extract_releases(
+                title,
+                flair=flair,
+                agent=agent,
+                **kwargs,
+            )
         except RuntimeError as exc:
             if "Event loop is closed" in str(exc) and self._owns_agent:
                 self.agent = create_extraction_agent(thinking_level=self.thinking_level)
-                return await extract_releases(title, flair=flair, agent=self.agent)
+                return await extract_releases(
+                    title,
+                    flair=flair,
+                    agent=self.agent,
+                    **kwargs,
+                )
             raise
 
     async def extract_batch(
@@ -421,6 +558,7 @@ __all__ = [
     "EXTRACTION_SYSTEM_PROMPT",
     "BatchExtractedItem",
     "BatchExtractionResult",
+    "CandidateRetriever",
     "ExtractedRelease",
     "ExtractionResult",
     "ExtractionWorker",
@@ -429,6 +567,7 @@ __all__ = [
     "create_batch_extraction_agent",
     "create_extraction_agent",
     "extract_releases",
+    "format_catalog_reference",
     "get_default_thinking_level",
     "pre_clean_title",
 ]
