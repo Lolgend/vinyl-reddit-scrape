@@ -220,12 +220,20 @@ class PollerService:
         self.reddit_adapter = reddit_adapter or RedditSourceAdapter()
         self.thinking_level = thinking_level
         self.llm_batch_size = llm_batch_size
-        self.extraction_worker = extraction_worker or ExtractionWorker(
-            thinking_level=thinking_level
-        )
         self.persistence_service = persistence_service or ReleasePersistenceService(
             self.session_factory
         )
+        if extraction_worker is None:
+            self.extraction_worker = ExtractionWorker(
+                thinking_level=thinking_level,
+                candidate_retriever=self.persistence_service.find_candidates,
+            )
+        else:
+            self.extraction_worker = extraction_worker
+            if getattr(self.extraction_worker, 'candidate_retriever', None) is None:
+                self.extraction_worker.candidate_retriever = (
+                    self.persistence_service.find_candidates
+                )
         self.ingester = ingester or SubmissionIngester(self.session_factory)
 
         self.poll_interval_seconds = poll_interval_seconds

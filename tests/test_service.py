@@ -11,7 +11,13 @@ load_dotenv()
 
 from reddit_scrape.cli import main
 from reddit_scrape.db import get_engine, init_db
-from reddit_scrape.extraction import ExtractedRelease, ExtractionResult
+from reddit_scrape.extraction import (
+    BatchExtractedItem,
+    BatchExtractionResult,
+    ExtractedRelease,
+    ExtractionResult,
+    ExtractionWorker,
+)
 from reddit_scrape.ingestion import RawSubmission
 from reddit_scrape.models import (
     Artist,
@@ -933,6 +939,323 @@ class TestBatchQueueProcessing:
             assert s0.is_extracted is True
             assert s1.is_extracted is False
             assert s2.is_extracted is True
+
+        service.stop()
+
+
+
+
+class TestMultiCycleCanonicalAlignmentIntegration:
+    """End-to-end integration tests for multi-cycle Canonical Alignment with PostgreSQL."""
+
+    def test_poller_wires_candidate_retriever_on_worker_by_default(self, session_factory):
+        """Verify PollerService wires persistence_service.find_candidates on default ExtractionWorker."""
+        service = PollerService(session_factory=session_factory)
+        assert service.extraction_worker.candidate_retriever == service.persistence_service.find_candidates
+        service.stop()
+
+    def test_poller_wires_candidate_retriever_when_worker_supplied_without_retriever(
+        self, session_factory
+    ):
+        """Verify PollerService wires candidate_retriever when worker has none."""
+        worker = ExtractionWorker()
+        assert worker.candidate_retriever is None
+        service = PollerService(session_factory=session_factory, extraction_worker=worker)
+        assert worker.candidate_retriever == service.persistence_service.find_candidates
+        service.stop()
+
+    def test_multi_cycle_canonical_alignment_deduplicates_reversed_billing_and_title(
+        self, session_factory
+    ):
+        """End-to-end test verifying Cycle 1 persists release and artists, and Cycle 2 with reversed
+        title and artist order receives Cycle 1 reference candidates and links both submissions
+        to the exact same Release and Artist records without creating duplicates.
+        """
+        created_now = datetime.now(timezone.utc)
+        sub1 = RawSubmission(
+            id="c1_sub",
+            title='Converge / Dropdead - Split 7" (Opaque Emerald LP) [Deathwish]',
+            url="https://reddit.com/r/vinylreleases/c1_sub",
+            created_utc=created_now,
+            fullname="t3_c1_sub",
+        )
+        sub2 = RawSubmission(
+            id="c2_sub",
+            title='Split 7" - Dropdead / Converge (Opaque Emerald LP) [Deathwish]',
+            url="https://reddit.com/r/vinylreleases/c2_sub",
+            created_utc=created_now,
+            fullname="t3_c2_sub",
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_hot.return_value = []
+
+        captured_prompts: list[str] = []
+        mock_batch_agent = MagicMock()
+
+        async def fake_agent_run(prompt: str):
+            captured_prompts.append(prompt)
+            if "c1_sub" in prompt or "Converge / Dropdead - Split" in prompt:
+                return MagicMock(
+                    output=BatchExtractionResult(
+                        items=[
+                            BatchExtractedItem(
+                                submission_id="t3_c1_sub",
+                                releases=[
+                                    ExtractedRelease(
+                                        artists=["Converge", "Dropdead"],
+                                        combined_artist="Converge / Dropdead",
+                                        album_title='Split 7"',
+                                        variant="Opaque Emerald LP",
+                                        retailer="Deathwish",
+                                    )
+                                ],
+                            )
+                        ]
+                    )
+                )
+            else:
+                return MagicMock(
+                    output=BatchExtractionResult(
+                        items=[
+                            BatchExtractedItem(
+                                submission_id="t3_c2_sub",
+                                releases=[
+                                    ExtractedRelease(
+                                        artists=["Converge", "Dropdead"],
+                                        combined_artist="Converge / Dropdead",
+                                        album_title='Split 7"',
+                                        variant="Opaque Emerald LP",
+                                        retailer="Deathwish",
+                                    )
+                                ],
+                            )
+                        ]
+                    )
+                )
+
+        mock_batch_agent.run = AsyncMock(side_effect=fake_agent_run)
+        worker = ExtractionWorker(batch_agent=mock_batch_agent)
+
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=worker,
+        )
+
+        assert worker.candidate_retriever == service.persistence_service.find_candidates
+
+        # --- Cycle 1 ---
+        mock_adapter.fetch_new.return_value = [sub1]
+        stats1 = service.poll_and_extract_cycle()
+        assert stats1.new_stats.inserted == 1
+        assert stats1.extracted_count == 1
+        assert len(captured_prompts) == 1
+        assert "Existing Catalog Reference:" not in captured_prompts[0]
+
+        # Verify PostgreSQL state after Cycle 1
+        with session_factory() as session:
+            db_subs = session.execute(select(Submission)).scalars().all()
+            assert len(db_subs) == 1
+            assert db_subs[0].id == "t3_c1_sub"
+            assert db_subs[0].is_extracted is True
+
+            db_releases = session.execute(select(Release)).scalars().all()
+            assert len(db_releases) == 1
+            rel1 = db_releases[0]
+            assert rel1.combined_artist == "Converge / Dropdead"
+            assert rel1.album_title == 'Split 7"'
+            assert rel1.variant == "Opaque Emerald LP"
+            assert rel1.retailer_name == "Deathwish"
+            assert rel1.embedding is not None
+
+            db_artists = session.execute(select(Artist).order_by(Artist.name.asc())).scalars().all()
+            assert len(db_artists) == 2
+            assert [a.name for a in db_artists] == ["Converge", "Dropdead"]
+            for a in db_artists:
+                assert a.embedding is not None
+
+        # --- Cycle 2 ---
+        mock_adapter.fetch_new.return_value = [sub2]
+        stats2 = service.poll_and_extract_cycle()
+        assert stats2.new_stats.inserted == 1
+        assert stats2.extracted_count == 1
+        assert len(captured_prompts) == 2
+
+        # Verify prompt received Cycle 1 entities from PostgreSQL vector similarity search
+        c2_prompt = captured_prompts[1]
+        assert "Existing Catalog Reference:" in c2_prompt
+        assert "Canonical Releases:" in c2_prompt
+        assert "Combined Artist: Converge / Dropdead" in c2_prompt
+        assert 'Album Title: Split 7"' in c2_prompt
+        assert "Variant: Opaque Emerald LP" in c2_prompt
+        assert "Retailer: Deathwish" in c2_prompt
+        assert "Canonical Artists:" in c2_prompt
+        assert "- Converge" in c2_prompt
+        assert "- Dropdead" in c2_prompt
+
+        # Verify PostgreSQL state after Cycle 2:
+        # Both submissions linked to the EXACT same Release and Artist records without duplicates!
+        with session_factory() as session:
+            all_subs = session.execute(select(Submission).order_by(Submission.id.asc())).scalars().all()
+            assert len(all_subs) == 2
+            assert {s.id for s in all_subs} == {"t3_c1_sub", "t3_c2_sub"}
+            for s in all_subs:
+                assert s.is_extracted is True
+
+            all_releases = session.execute(select(Release)).scalars().all()
+            assert len(all_releases) == 1
+            canonical_release = all_releases[0]
+            assert canonical_release.id == rel1.id
+
+            all_artists = session.execute(select(Artist).order_by(Artist.name.asc())).scalars().all()
+            assert len(all_artists) == 2
+            assert [a.name for a in all_artists] == ["Converge", "Dropdead"]
+
+            sub_releases = session.execute(
+                select(SubmissionRelease).order_by(SubmissionRelease.submission_id.asc())
+            ).scalars().all()
+            assert len(sub_releases) == 2
+            assert sub_releases[0].submission_id == "t3_c1_sub"
+            assert sub_releases[0].release_id == canonical_release.id
+            assert sub_releases[1].submission_id == "t3_c2_sub"
+            assert sub_releases[1].release_id == canonical_release.id
+
+        service.stop()
+
+    def test_multi_cycle_canonical_alignment_reuses_artist_for_new_variant(
+        self, session_factory
+    ):
+        """End-to-end test verifying that when Cycle 2 announces a new Variant of a Cycle 1 album
+        with reversed title ordering, it reuses the canonical Artist and album title while
+        creating a distinct Release for the new Variant.
+        """
+        created_now = datetime.now(timezone.utc)
+        sub1 = RawSubmission(
+            id="c1_orig",
+            title='Converge / Dropdead - Split 7" (Opaque Emerald LP) [Deathwish]',
+            url="https://reddit.com/r/vinylreleases/c1_orig",
+            created_utc=created_now,
+            fullname="t3_c1_orig",
+        )
+        sub2 = RawSubmission(
+            id="c2_variant",
+            title='Split 7" - Dropdead / Converge (Pink /500) [Deathwish]',
+            url="https://reddit.com/r/vinylreleases/c2_variant",
+            created_utc=created_now,
+            fullname="t3_c2_variant",
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_hot.return_value = []
+
+        captured_prompts: list[str] = []
+        mock_batch_agent = MagicMock()
+
+        async def fake_agent_run(prompt: str):
+            captured_prompts.append(prompt)
+            if "c1_orig" in prompt or "Converge / Dropdead - Split" in prompt:
+                return MagicMock(
+                    output=BatchExtractionResult(
+                        items=[
+                            BatchExtractedItem(
+                                submission_id="t3_c1_orig",
+                                releases=[
+                                    ExtractedRelease(
+                                        artists=["Converge", "Dropdead"],
+                                        combined_artist="Converge / Dropdead",
+                                        album_title='Split 7"',
+                                        variant="Opaque Emerald LP",
+                                        retailer="Deathwish",
+                                    )
+                                ],
+                            )
+                        ]
+                    )
+                )
+            else:
+                return MagicMock(
+                    output=BatchExtractionResult(
+                        items=[
+                            BatchExtractedItem(
+                                submission_id="t3_c2_variant",
+                                releases=[
+                                    ExtractedRelease(
+                                        artists=["Converge", "Dropdead"],
+                                        combined_artist="Converge / Dropdead",
+                                        album_title='Split 7"',
+                                        variant="Pink /500",
+                                        retailer="Deathwish",
+                                    )
+                                ],
+                            )
+                        ]
+                    )
+                )
+
+        mock_batch_agent.run = AsyncMock(side_effect=fake_agent_run)
+        worker = ExtractionWorker(batch_agent=mock_batch_agent)
+
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=worker,
+        )
+
+        # --- Cycle 1 ---
+        mock_adapter.fetch_new.return_value = [sub1]
+        stats1 = service.poll_and_extract_cycle()
+        assert stats1.new_stats.inserted == 1
+        assert stats1.extracted_count == 1
+
+        # --- Cycle 2 (New Variant) ---
+        mock_adapter.fetch_new.return_value = [sub2]
+        stats2 = service.poll_and_extract_cycle()
+        assert stats2.new_stats.inserted == 1
+        assert stats2.extracted_count == 1
+        assert len(captured_prompts) == 2
+
+        # Verify prompt received Cycle 1 entities from PostgreSQL
+        c2_prompt = captured_prompts[1]
+        assert "Existing Catalog Reference:" in c2_prompt
+        assert "Combined Artist: Converge / Dropdead" in c2_prompt
+        assert 'Album Title: Split 7"' in c2_prompt
+        assert "- Converge" in c2_prompt
+        assert "- Dropdead" in c2_prompt
+
+        # Verify PostgreSQL state:
+        # Distinct Release for the new variant, but reuses canonical Artists!
+        with session_factory() as session:
+            all_releases = session.execute(
+                select(Release).order_by(Release.variant.asc())
+            ).scalars().all()
+            assert len(all_releases) == 2
+            for r in all_releases:
+                assert r.combined_artist == "Converge / Dropdead"
+                assert r.album_title == 'Split 7"'
+                assert r.retailer_name == "Deathwish"
+                assert r.embedding is not None
+
+            assert all_releases[0].variant == "Opaque Emerald LP"
+            assert all_releases[1].variant == "Pink /500"
+            assert all_releases[0].fingerprint != all_releases[1].fingerprint
+
+            all_artists = session.execute(select(Artist).order_by(Artist.name.asc())).scalars().all()
+            assert len(all_artists) == 2
+            assert [a.name for a in all_artists] == ["Converge", "Dropdead"]
+
+            all_subs = session.execute(select(Submission).order_by(Submission.id.asc())).scalars().all()
+            assert len(all_subs) == 2
+
+            sr1 = session.execute(
+                select(SubmissionRelease).where(SubmissionRelease.submission_id == "t3_c1_orig")
+            ).scalars().all()
+            sr2 = session.execute(
+                select(SubmissionRelease).where(SubmissionRelease.submission_id == "t3_c2_variant")
+            ).scalars().all()
+            assert len(sr1) == 1
+            assert len(sr2) == 1
+            assert sr1[0].release_id != sr2[0].release_id
 
         service.stop()
 
