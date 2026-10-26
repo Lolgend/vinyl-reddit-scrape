@@ -31,16 +31,13 @@ class TestPollerServiceWiringUnit:
         )
         service.stop()
 
-    def test_poller_service_wires_candidate_retriever_when_worker_has_none(self):
+    def test_poller_service_does_not_mutate_caller_supplied_worker(self):
         mock_factory = MagicMock()
         worker = ExtractionWorker()
         assert worker.candidate_retriever is None
 
         service = PollerService(session_factory=mock_factory, extraction_worker=worker)
-        assert (
-            worker.candidate_retriever
-            == service.persistence_service.find_candidates
-        )
+        assert worker.candidate_retriever is None
         service.stop()
 
     def test_poller_service_preserves_custom_candidate_retriever(self):
@@ -150,7 +147,7 @@ class TestPollerServiceMultiCycleUnit:
                 )
 
         batch_agent.run = AsyncMock(side_effect=fake_agent_run)
-        worker = ExtractionWorker(batch_agent=batch_agent)
+        worker = ExtractionWorker(batch_agent=batch_agent, candidate_retriever=mock_persistence.find_candidates)
 
         service = PollerService(
             session_factory=mock_factory,

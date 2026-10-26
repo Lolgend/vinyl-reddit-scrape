@@ -27,6 +27,7 @@ from reddit_scrape.models import (
     SubmissionRelease,
     SubmissionSnapshot,
 )
+from reddit_scrape.persistence import ReleasePersistenceService
 from reddit_scrape.service import (
     CycleStats,
     PollerService,
@@ -954,14 +955,14 @@ class TestMultiCycleCanonicalAlignmentIntegration:
         assert service.extraction_worker.candidate_retriever == service.persistence_service.find_candidates
         service.stop()
 
-    def test_poller_wires_candidate_retriever_when_worker_supplied_without_retriever(
+    def test_poller_does_not_mutate_caller_supplied_worker(
         self, session_factory
     ):
-        """Verify PollerService wires candidate_retriever when worker has none."""
+        """Verify PollerService does not mutate candidate_retriever when worker is supplied by caller."""
         worker = ExtractionWorker()
         assert worker.candidate_retriever is None
         service = PollerService(session_factory=session_factory, extraction_worker=worker)
-        assert worker.candidate_retriever == service.persistence_service.find_candidates
+        assert worker.candidate_retriever is None
         service.stop()
 
     def test_multi_cycle_canonical_alignment_deduplicates_reversed_billing_and_title(
@@ -1035,12 +1036,17 @@ class TestMultiCycleCanonicalAlignmentIntegration:
                 )
 
         mock_batch_agent.run = AsyncMock(side_effect=fake_agent_run)
-        worker = ExtractionWorker(batch_agent=mock_batch_agent)
+        persistence_svc = ReleasePersistenceService(session_factory)
+        worker = ExtractionWorker(
+            batch_agent=mock_batch_agent,
+            candidate_retriever=persistence_svc.find_candidates,
+        )
 
         service = PollerService(
             session_factory=session_factory,
             reddit_adapter=mock_adapter,
             extraction_worker=worker,
+            persistence_service=persistence_svc,
         )
 
         assert worker.candidate_retriever == service.persistence_service.find_candidates
@@ -1194,12 +1200,17 @@ class TestMultiCycleCanonicalAlignmentIntegration:
                 )
 
         mock_batch_agent.run = AsyncMock(side_effect=fake_agent_run)
-        worker = ExtractionWorker(batch_agent=mock_batch_agent)
+        persistence_svc = ReleasePersistenceService(session_factory)
+        worker = ExtractionWorker(
+            batch_agent=mock_batch_agent,
+            candidate_retriever=persistence_svc.find_candidates,
+        )
 
         service = PollerService(
             session_factory=session_factory,
             reddit_adapter=mock_adapter,
             extraction_worker=worker,
+            persistence_service=persistence_svc,
         )
 
         # --- Cycle 1 ---

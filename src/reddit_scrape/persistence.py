@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -145,9 +145,9 @@ def persist_extracted_releases(
         release_items = list(releases)
 
     if not release_items:
-        sub.is_release = False
-        sub.is_extracted = True
-        sub.updated_at = func.now()
+        sub.is_release = False  # type: ignore[assignment]
+        sub.is_extracted = True  # type: ignore[assignment]
+        sub.updated_at = func.now()  # type: ignore[assignment]
         session.flush()
         return []
 
@@ -262,11 +262,28 @@ def persist_extracted_releases(
         if rel_obj:
             persisted_releases.append(rel_obj)
 
-    sub.is_extracted = True
-    sub.updated_at = func.now()
+    sub.is_extracted = True  # type: ignore[assignment]
+    sub.updated_at = func.now()  # type: ignore[assignment]
     session.flush()
 
     return persisted_releases
+
+
+def _build_cosine_similarity_query(
+    model: type[Release | Artist],
+    vector: list[float],
+    max_distance: float,
+    top_k: int,
+) -> Select[Any]:
+    """Build a cosine similarity query filtering by maximum distance and ordering nearest first."""
+    dist_expr = model.embedding.cosine_distance(vector)
+    return (
+        select(model, dist_expr.label("dist"))
+        .where(model.embedding.is_not(None))
+        .where(dist_expr <= (max_distance + 1e-6))
+        .order_by(dist_expr.asc())
+        .limit(top_k)
+    )
 
 
 def find_catalog_candidates(
@@ -311,14 +328,7 @@ def find_catalog_candidates(
         vec = vector_map[title]
 
         # 1. Query top_k Releases using pgvector cosine distance
-        rel_dist = Release.embedding.cosine_distance(vec)
-        rel_stmt = (
-            select(Release, rel_dist.label("dist"))
-            .where(Release.embedding.is_not(None))
-            .where(rel_dist <= (max_distance + 1e-6))
-            .order_by(rel_dist.asc())
-            .limit(top_k)
-        )
+        rel_stmt = _build_cosine_similarity_query(Release, vec, max_distance, top_k)
         rel_rows = session.execute(rel_stmt).all()
         for rel_obj, dist in rel_rows:
             sim = 1.0 - float(dist)
@@ -328,14 +338,7 @@ def find_catalog_candidates(
                 best_releases[rel_obj.id] = (rel_obj, sim)
 
         # 2. Query top_k Artists using pgvector cosine distance
-        art_dist = Artist.embedding.cosine_distance(vec)
-        art_stmt = (
-            select(Artist, art_dist.label("dist"))
-            .where(Artist.embedding.is_not(None))
-            .where(art_dist <= (max_distance + 1e-6))
-            .order_by(art_dist.asc())
-            .limit(top_k)
-        )
+        art_stmt = _build_cosine_similarity_query(Artist, vec, max_distance, top_k)
         art_rows = session.execute(art_stmt).all()
         for art_obj, dist in art_rows:
             sim = 1.0 - float(dist)
@@ -421,8 +424,6 @@ class ReleasePersistenceService:
                 top_k=top_k,
                 min_similarity=min_similarity,
             )
-
-    get_catalog_candidates = find_candidates
 
 
 __all__ = [

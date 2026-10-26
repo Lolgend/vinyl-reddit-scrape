@@ -106,7 +106,7 @@ class SubmissionIngester:
             is_release=True,
         )
 
-        upsert_stmt = stmt.on_conflict_do_update(
+        upsert_stmt: Any = stmt.on_conflict_do_update(
             index_elements=[Submission.reddit_id],
             set_={
                 "flair": stmt.excluded.flair,
