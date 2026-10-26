@@ -12,6 +12,7 @@ from reddit_scrape.extraction import (
     EXTRACTION_SYSTEM_PROMPT,
     BatchExtractedItem,
     BatchExtractionResult,
+    CandidateRetriever,
     ExtractedRelease,
     ExtractionResult,
     ExtractionWorker,
@@ -20,6 +21,7 @@ from reddit_scrape.extraction import (
     create_batch_extraction_agent,
     create_extraction_agent,
     extract_releases,
+    format_catalog_reference,
     pre_clean_title,
 )
 from reddit_scrape.ingestion import (
@@ -85,6 +87,7 @@ __all__ = [  # noqa: RUF022
     "BATCH_EXTRACTION_SYSTEM_PROMPT",
     "BatchExtractedItem",
     "BatchExtractionResult",
+    "CandidateRetriever",
     "EXTRACTION_SYSTEM_PROMPT",
     "ExtractedRelease",
     "ExtractionResult",
@@ -94,6 +97,7 @@ __all__ = [  # noqa: RUF022
     "create_batch_extraction_agent",
     "create_extraction_agent",
     "extract_releases",
+    "format_catalog_reference",
     "pre_clean_title",
     # Persistence
     "CatalogCandidates",
