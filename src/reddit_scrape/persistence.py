@@ -10,6 +10,11 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
 
+from reddit_scrape.embeddings import (
+    compute_artist_text,
+    compute_release_text,
+    embed_texts,
+)
 from reddit_scrape.extraction import ExtractedRelease, ExtractionResult
 from reddit_scrape.models import (
     Artist,
@@ -79,10 +84,11 @@ def persist_extracted_releases(
     """Persist extracted releases within the caller's active database session.
 
     Atomically:
-    1. Idempotently upserts Release records based on fingerprint conflict.
-    2. Inserts unique Artist records and links them in release_artists.
-    3. Links parent submission to releases in submission_releases (ON CONFLICT DO NOTHING).
-    4. Marks submission.is_extracted = TRUE.
+    1. Generates 384-dimensional dense vector embeddings for releases and contributing artists.
+    2. Idempotently upserts Release records based on fingerprint conflict, preserving/populating embeddings.
+    3. Idempotently inserts/updates Artist records with embeddings and links them in release_artists.
+    4. Links parent submission to releases in submission_releases (ON CONFLICT DO NOTHING).
+    5. Marks submission.is_extracted = TRUE.
     """
     sub = session.get(Submission, submission_id)
     if sub is None:
@@ -111,7 +117,9 @@ def persist_extracted_releases(
         session.flush()
         return []
 
-    persisted_releases: list[Release] = []
+    # Prepare metadata and collect texts for batch vector embedding in deterministic order
+    items_to_persist = []
+    ordered_texts: list[str] = []
 
     for ext in release_items:
         combined_artist = (
@@ -130,36 +138,76 @@ def persist_extracted_releases(
             retailer=retailer,
         )
 
-        rel_stmt = (
-            pg_insert(Release)
-            .values(
-                combined_artist=combined_artist,
-                album_title=album_title,
-                variant=variant,
-                retailer_name=retailer,
-                fingerprint=fingerprint,
-            )
-            .on_conflict_do_update(
-                index_elements=[Release.fingerprint],
-                set_={"updated_at": func.now()},
-            )
-            .returning(Release.id)
+        rel_text = compute_release_text(
+            combined_artist=combined_artist,
+            album_title=album_title,
+            variant=variant,
+            retailer=retailer,
         )
-        rel_id = session.execute(rel_stmt).scalar_one()
+        ordered_texts.append(rel_text)
 
-        # Link contributing artists
         contributing_artists = ext.artists if ext.artists else ([combined_artist] if combined_artist else [])
         artist_names = list(
             dict.fromkeys(a.strip() for a in contributing_artists if a.strip())
         )
-
         for art_name in artist_names:
-            art_stmt = pg_insert(Artist).values(name=art_name)
-            art_stmt = art_stmt.on_conflict_do_update(
+            ordered_texts.append(compute_artist_text(art_name))
+
+        items_to_persist.append(
+            (combined_artist, album_title, variant, retailer, fingerprint, rel_text, artist_names)
+        )
+
+    unique_texts = list(dict.fromkeys(ordered_texts))
+    embeddings_list = embed_texts(unique_texts)
+    embedding_map = dict(zip(unique_texts, embeddings_list))
+
+    persisted_releases: list[Release] = []
+
+    for (
+        combined_artist,
+        album_title,
+        variant,
+        retailer,
+        fingerprint,
+        rel_text,
+        artist_names,
+    ) in items_to_persist:
+        rel_embedding = embedding_map[rel_text]
+
+        rel_stmt = pg_insert(Release).values(
+            combined_artist=combined_artist,
+            album_title=album_title,
+            variant=variant,
+            retailer_name=retailer,
+            fingerprint=fingerprint,
+            embedding=rel_embedding,
+        )
+        rel_returning = rel_stmt.on_conflict_do_update(
+            index_elements=[Release.fingerprint],
+            set_={
+                "updated_at": func.now(),
+                "embedding": func.coalesce(Release.embedding, rel_stmt.excluded.embedding),
+            },
+        ).returning(Release.id)
+        rel_id = session.execute(rel_returning).scalar_one()
+
+        # Link contributing artists
+        for art_name in artist_names:
+            art_text = compute_artist_text(art_name)
+            art_embedding = embedding_map[art_text]
+
+            art_stmt = pg_insert(Artist).values(
+                name=art_name,
+                embedding=art_embedding,
+            )
+            art_returning = art_stmt.on_conflict_do_update(
                 index_elements=[Artist.name],
-                set_={"name": art_stmt.excluded.name},
+                set_={
+                    "name": art_stmt.excluded.name,
+                    "embedding": func.coalesce(Artist.embedding, art_stmt.excluded.embedding),
+                },
             ).returning(Artist.id)
-            art_id = session.execute(art_stmt).scalar_one()
+            art_id = session.execute(art_returning).scalar_one()
 
             ra_stmt = (
                 pg_insert(ReleaseArtist)
@@ -215,6 +263,7 @@ __all__ = [
     "STANDARD_TOKEN",
     "ReleasePersistenceService",
     "compute_release_fingerprint",
+    "embed_texts",
     "normalize_attribute",
     "persist_extracted_releases",
 ]

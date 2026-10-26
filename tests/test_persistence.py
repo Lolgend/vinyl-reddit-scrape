@@ -29,7 +29,7 @@ def engine():
         eng = get_engine()
         init_db(eng)
         return eng
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         pytest.skip(f"Database unavailable: {exc}")
 
 
@@ -153,9 +153,8 @@ class TestReleaseFingerprint:
 class TestReleasePersistence:
     def test_persist_single_artist_release(self, session_factory):
         """Verify single-artist release persistence, artist row, and join records."""
-        with session_factory() as session:
-            with session.begin():
-                sub = create_test_submission(session, "sub1", "red1", "Daft Punk - Discovery")
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "sub1", "red1", "Daft Punk - Discovery")
 
         service = ReleasePersistenceService(session_factory)
         ext_release = ExtractedRelease(
@@ -174,6 +173,8 @@ class TestReleasePersistence:
         assert rel.variant == "2LP Gatefold"
         assert rel.retailer_name is None
         assert rel.fingerprint is not None
+        assert rel.embedding is not None
+        assert len(rel.embedding) == 384
 
         with session_factory() as session:
             # Check submission updated
@@ -184,6 +185,8 @@ class TestReleasePersistence:
             artists = session.execute(select(Artist)).scalars().all()
             assert len(artists) == 1
             assert artists[0].name == "Daft Punk"
+            assert artists[0].embedding is not None
+            assert len(artists[0].embedding) == 384
 
             # Check release_artists link
             rel_artists = session.execute(select(ReleaseArtist)).scalars().all()
@@ -199,9 +202,8 @@ class TestReleasePersistence:
 
     def test_persist_multi_artist_release(self, session_factory):
         """Verify multi-artist split/collaboration associates each artist individually."""
-        with session_factory() as session:
-            with session.begin():
-                sub = create_test_submission(session, "sub2", "red2", "Converge / Dropdead Split")
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "sub2", "red2", "Converge / Dropdead Split")
 
         service = ReleasePersistenceService(session_factory)
         ext_release = ExtractedRelease(
@@ -215,6 +217,8 @@ class TestReleasePersistence:
 
         assert len(result) == 1
         rel = result[0]
+        assert rel.embedding is not None
+        assert len(rel.embedding) == 384
 
         with session_factory() as session:
             artists = session.execute(select(Artist).order_by(Artist.name)).scalars().all()
@@ -222,6 +226,7 @@ class TestReleasePersistence:
             artist_names = [a.name for a in artists]
             assert "Converge" in artist_names
             assert "Dropdead" in artist_names
+            assert all(a.embedding is not None and len(a.embedding) == 384 for a in artists)
 
             # Check both artists linked to this release
             links = session.execute(
@@ -231,10 +236,9 @@ class TestReleasePersistence:
 
     def test_deduplication_two_submissions_same_release(self, session_factory):
         """Two different submissions for the exact same pressing resolve to the same Release row."""
-        with session_factory() as session:
-            with session.begin():
-                create_test_submission(session, "sub_a", "red_a", "Post 1: Charli XCX - Brat Pink Vinyl")
-                create_test_submission(session, "sub_b", "red_b", "Post 2: Charli XCX - Brat [Pink Vinyl]")
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "sub_a", "red_a", "Post 1: Charli XCX - Brat Pink Vinyl")
+            create_test_submission(session, "sub_b", "red_b", "Post 2: Charli XCX - Brat [Pink Vinyl]")
 
         service = ReleasePersistenceService(session_factory)
         ext1 = ExtractedRelease(
@@ -264,10 +268,14 @@ class TestReleasePersistence:
             # Only 1 canonical Release record
             all_releases = session.execute(select(Release)).scalars().all()
             assert len(all_releases) == 1
+            assert all_releases[0].embedding is not None
+            assert len(all_releases[0].embedding) == 384
 
             # Only 1 canonical Artist record
             all_artists = session.execute(select(Artist)).scalars().all()
             assert len(all_artists) == 1
+            assert all_artists[0].embedding is not None
+            assert len(all_artists[0].embedding) == 384
 
             # 2 rows in submission_releases (one per submission)
             sub_rels = session.execute(select(SubmissionRelease)).scalars().all()
@@ -283,12 +291,12 @@ class TestReleasePersistence:
 
     def test_empty_release_handling(self, session_factory):
         """When releases: [] (e.g. non-release or generic restock), mark is_extracted=True without creating releases."""
-        with session_factory() as session:
-            with session.begin():
-                create_test_submission(session, "sub_disc", "red_disc", "[Discussion] Favorite turntables?")
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "sub_disc", "red_disc", "[Discussion] Favorite turntables?")
 
         service = ReleasePersistenceService(session_factory)
-        result = service.persist("sub_disc", ExtractionResult(releases=[]))
+        ext_result = ExtractionResult(is_release=False, confidence="high", releases=[])
+        result = service.persist("sub_disc", ext_result)
 
         assert result == []
 
@@ -297,14 +305,47 @@ class TestReleasePersistence:
             assert sub.is_extracted is True
             assert sub.is_release is False
 
-            releases = session.execute(select(Release)).scalars().all()
-            assert len(releases) == 0
+            all_releases = session.execute(select(Release)).scalars().all()
+            assert len(all_releases) == 0
 
-            artists = session.execute(select(Artist)).scalars().all()
-            assert len(artists) == 0
+    def test_unknown_submission_raises_value_error(self, session_factory):
+        service = ReleasePersistenceService(session_factory)
+        ext_release = ExtractedRelease(
+            artists=["Daft Punk"],
+            combined_artist="Daft Punk",
+            album_title="Discovery",
+        )
+        with pytest.raises(ValueError, match="does not exist"):
+            service.persist("non_existent_id", [ext_release])
 
-            sub_rels = session.execute(select(SubmissionRelease)).scalars().all()
-            assert len(sub_rels) == 0
+    def test_idempotent_reingestion(self, session_factory):
+        """Re-ingesting the exact same submission multiple times is safe and maintains consistency."""
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "sub_dup", "red_dup", "Daft Punk - Homework")
+
+        service = ReleasePersistenceService(session_factory)
+        ext = ExtractedRelease(
+            artists=["Daft Punk"],
+            combined_artist="Daft Punk",
+            album_title="Homework",
+            variant="Standard Black",
+            retailer="Amazon",
+        )
+
+        res1 = service.persist("sub_dup", [ext])
+        res2 = service.persist("sub_dup", [ext])
+
+        assert len(res1) == 1
+        assert len(res2) == 1
+        assert res1[0].id == res2[0].id
+
+        with session_factory() as session:
+            all_releases = session.execute(select(Release)).scalars().all()
+            assert len(all_releases) == 1
+            assert all_releases[0].embedding is not None
+
+            all_sub_rels = session.execute(select(SubmissionRelease)).scalars().all()
+            assert len(all_sub_rels) == 1
 
     def test_atomicity_and_rollback_on_failure(self, session_factory):
         """Failure mid-transaction rolls back all changes, leaving is_extracted=False."""
@@ -314,7 +355,7 @@ class TestReleasePersistence:
         service = ReleasePersistenceService(session_factory)
 
         # Passing non-existent submission_id should raise ValueError
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="does not exist"):
             service.persist("non_existent_sub", [
                 ExtractedRelease(
                     artists=["Ghost Artist"],
@@ -327,36 +368,11 @@ class TestReleasePersistence:
             artists = session.execute(select(Artist).where(Artist.name == "Ghost Artist")).scalars().all()
             assert len(artists) == 0
 
-    def test_idempotent_reprocessing(self, session_factory):
-        """Calling persist multiple times on the same submission succeeds without duplicate rows."""
-        with session_factory() as session, session.begin():
-            create_test_submission(session, "sub_idem", "red_idem", "Radiohead - Kid A")
-
-        service = ReleasePersistenceService(session_factory)
-        ext = ExtractedRelease(
-            artists=["Radiohead"],
-            combined_artist="Radiohead",
-            album_title="Kid A",
-            variant="2LP 10-inch",
-        )
-
-        res1 = service.persist("sub_idem", [ext])
-        res2 = service.persist("sub_idem", [ext])
-
-        assert res1[0].id == res2[0].id
-
-        with session_factory() as session:
-            all_releases = session.execute(select(Release)).scalars().all()
-            assert len(all_releases) == 1
-            all_sub_rels = session.execute(select(SubmissionRelease)).scalars().all()
-            assert len(all_sub_rels) == 1
-
     def test_persist_with_reddit_id_or_fullname_fallback(self, session_factory):
         """Verify persistence resolves submission whether fullname or base36 reddit_id is passed."""
-        with session_factory() as session:
-            with session.begin():
-                create_test_submission(session, "t3_fallback_1", "fallback_1", "Artist 1 - Album 1")
-                create_test_submission(session, "fallback_2", "fallback_2", "Artist 2 - Album 2")
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "t3_fallback_1", "fallback_1", "Artist 1 - Album 1")
+            create_test_submission(session, "fallback_2", "fallback_2", "Artist 2 - Album 2")
 
         service = ReleasePersistenceService(session_factory)
         ext = ExtractedRelease(artists=["Artist"], album_title="Album")
@@ -372,5 +388,5 @@ class TestReleasePersistence:
         with session_factory() as session:
             s1 = session.get(Submission, "t3_fallback_1")
             s2 = session.get(Submission, "fallback_2")
-            assert s1.is_extracted is True
-            assert s2.is_extracted is True
+            assert s1 is not None and s1.is_extracted is True
+            assert s2 is not None and s2.is_extracted is True
