@@ -61,6 +61,19 @@ class CatalogCandidates:
         return bool(self.releases or self.artists)
 
 
+@dataclass(frozen=True)
+class _PreparedReleaseItem:
+    """Normalized release metadata and embedding text prepared for persistence."""
+
+    combined_artist: str
+    album_title: str
+    variant: str | None
+    retailer: str | None
+    fingerprint: str
+    rel_text: str
+    artist_names: list[str]
+
+
 def normalize_attribute(val: str | None, default_token: str | None = None) -> str:
     """Normalize release metadata attribute for deterministic fingerprinting.
 
@@ -152,7 +165,7 @@ def persist_extracted_releases(
         return []
 
     # Prepare metadata and collect texts for batch vector embedding in deterministic order
-    items_to_persist = []
+    items_to_persist: list[_PreparedReleaseItem] = []
     ordered_texts: list[str] = []
 
     for ext in release_items:
@@ -188,7 +201,15 @@ def persist_extracted_releases(
             ordered_texts.append(compute_artist_text(art_name))
 
         items_to_persist.append(
-            (combined_artist, album_title, variant, retailer, fingerprint, rel_text, artist_names)
+            _PreparedReleaseItem(
+                combined_artist=combined_artist,
+                album_title=album_title,
+                variant=variant,
+                retailer=retailer,
+                fingerprint=fingerprint,
+                rel_text=rel_text,
+                artist_names=artist_names,
+            )
         )
 
     unique_texts = list(dict.fromkeys(ordered_texts))
@@ -197,23 +218,15 @@ def persist_extracted_releases(
 
     persisted_releases: list[Release] = []
 
-    for (
-        combined_artist,
-        album_title,
-        variant,
-        retailer,
-        fingerprint,
-        rel_text,
-        artist_names,
-    ) in items_to_persist:
-        rel_embedding = embedding_map[rel_text]
+    for item in items_to_persist:
+        rel_embedding = embedding_map[item.rel_text]
 
         rel_stmt = pg_insert(Release).values(
-            combined_artist=combined_artist,
-            album_title=album_title,
-            variant=variant,
-            retailer_name=retailer,
-            fingerprint=fingerprint,
+            combined_artist=item.combined_artist,
+            album_title=item.album_title,
+            variant=item.variant,
+            retailer_name=item.retailer,
+            fingerprint=item.fingerprint,
             embedding=rel_embedding,
         )
         rel_returning = rel_stmt.on_conflict_do_update(
@@ -226,7 +239,7 @@ def persist_extracted_releases(
         rel_id = session.execute(rel_returning).scalar_one()
 
         # Link contributing artists
-        for art_name in artist_names:
+        for art_name in item.artist_names:
             art_text = compute_artist_text(art_name)
             art_embedding = embedding_map[art_text]
 

@@ -1,6 +1,6 @@
 # Reddit Vinyl Releases Scraper
 
-Continuous dual-loop Reddit scraper and structured entity extraction pipeline for `r/vinylreleases`. Ingests community announcements, tracks engagement velocity and flair mutations, extracts multi-artist discography releases using DeepSeek LLM via PydanticAI with array batching and automatic single-submission fallback, and persists normalized relational vinyl entities in PostgreSQL.
+Continuous dual-loop Reddit scraper and structured entity extraction pipeline for `r/vinylreleases`. Ingests community announcements, tracks engagement velocity and flair mutations, performs pre-retrieval semantic catalog lookup (`pgvector` + local CPU `fastembed`) for **Canonical Alignment**, extracts multi-artist discography releases using DeepSeek LLM via PydanticAI with array batching and automatic single-submission fallback, and persists normalized relational and vectorized vinyl entities in PostgreSQL.
 
 ---
 
@@ -20,15 +20,16 @@ flowchart TD
         Worker["Decoupled Extraction Worker Thread"]
     end
 
-    subgraph ExtractionEngine["Batch Extraction Engine"]
+    subgraph ExtractionEngine["Batch Extraction & Canonical Alignment"]
         Batcher["Batch Partitioning (size: llm_batch_size)"]
-        LLMBatch["DeepSeek LLM (Batch Array Prompt)"]
+        RAG["Pre-Retrieval Vector Lookup (FastEmbed + pgvector)"]
+        LLMBatch["DeepSeek LLM (Batch Array Prompt + Catalog Reference)"]
         Fallback["Single-Submission Fallback"]
     end
 
-    subgraph Database["PostgreSQL Storage"]
+    subgraph Database["PostgreSQL + pgvector Storage"]
         SubTable["submissions & snapshots"]
-        RelTable["releases, artists & join tables"]
+        RelTable["releases, artists (384-d HNSW vectors) & join tables"]
     end
 
     RN -->|Poll new| PNew
@@ -37,17 +38,20 @@ flowchart TD
     PHot -->|Update engagement & mutate flairs| SubTable
     PNew -.->|Signal unextracted ready| BQueue
     BQueue --> Batcher
-    Batcher --> LLMBatch
+    Batcher -->|Embed titles & query cosine >= 0.50| RAG
+    RAG <-->|Top-5 Releases & Artists| RelTable
+    RAG -->|Inject Existing Catalog Reference| LLMBatch
     LLMBatch -->|Success| Worker
     LLMBatch -.->|Error or Omission| Fallback
     Fallback --> Worker
-    Worker -->|Persist Releases| RelTable
+    Worker -->|Embed & Persist Releases + Artists| RelTable
 ```
 
 The pipeline operates with:
 - **Dual-loop ingestion**: `/new` polls discover new release announcements, while `/hot` polls monitor engagement velocity and flair mutations (e.g. `SOLD OUT`).
 - **Decoupled extraction worker**: Ingestion loops enqueue unextracted candidate submissions without blocking on LLM inference. A background worker processes candidates in bounded batches.
-- **Array batch extraction with automated fallback**: Bounded candidate batches (default: 5 submissions) are evaluated simultaneously in structured array prompts. If a batch call fails or omits submissions, the worker falls back to individual extraction per submission to guarantee zero data loss.
+- **Pre-retrieval vector search & Canonical Alignment**: Prior to LLM extraction, submission titles are embedded locally on CPU via `fastembed` (`BAAI/bge-small-en-v1.5`, 384 dimensions) and matched against existing `releases` and `artists` in PostgreSQL (`pgvector` HNSW cosine distance index, similarity $\ge 0.50$). Top-5 candidate releases and artists are injected as an `"Existing Catalog Reference"` block so the LLM aligns reversed artist/album titles, reordered multi-artist billings, and intra-batch variations to canonical strings before deterministic SHA-256 fingerprinting.
+- **Array batch extraction with automated fallback**: Bounded candidate batches (default: 5 submissions) are evaluated simultaneously in structured array prompts. If a batch call fails or omits submissions, the worker falls back to individual extraction per submission (preserving candidate context) to guarantee zero data loss.
 
 ---
 
@@ -85,14 +89,18 @@ Configure a `.env` file at the repository root:
 
 ### Database Setup & Migrations
 
-PostgreSQL tables, foreign key relationships, and indexes are managed declaratively via SQLAlchemy metadata:
+PostgreSQL tables, foreign key relationships, `pgvector` extension (`vector`), and HNSW cosine distance indexes (`ix_releases_embedding_hnsw`, `ix_artists_embedding_hnsw`) are managed declaratively via SQLAlchemy metadata:
 
-- **Automatic Initialization**: When running the poller service (`reddit-scrape run`), `reddit_scrape.db.init_db()` is called automatically on startup to ensure all relational tables and indexes exist.
-- **Manual Initialization**: Tables can also be created or verified directly via Python:
+- **Prerequisites**: PostgreSQL with the [`pgvector`](https://github.com/pgvector/pgvector) extension installed.
+- **Automatic Initialization**: When running the poller service (`reddit-scrape run`), `reddit_scrape.db.init_db()` is called automatically on startup to enable `CREATE EXTENSION IF NOT EXISTS vector` and ensure all relational tables and HNSW vector indexes exist.
+- **Manual Initialization / Clean Reset**: Tables can also be created or cleanly re-created directly via Python:
   ```powershell
+  # Idempotent schema initialization
   uv run python -c "from reddit_scrape.db import init_db; init_db()"
+
+  # Clean drop and re-creation of all tables and vector indexes
+  uv run python -c "from reddit_scrape.db import reset_db; reset_db()"
   ```
-- **Migrations**: Declarative tables are created idempotently via `Base.metadata.create_all()`. For automated operational deployments, invoking `init_db()` guarantees database readiness before service execution.
 
 ---
 
@@ -141,9 +149,9 @@ uv run python -m reddit_scrape.cli purge-snapshots --days 14 --batch-size 10000
 
 ---
 
-## Batch Extraction & Resilience Engine
+## Batch Extraction, Canonical Alignment & Resilience Engine
 
-For high throughput during backlogs, `PollerService` partitions candidate submissions into bounded batches (`llm_batch_size`). Submissions within each batch are evaluated simultaneously by `ExtractionWorker.extract_batch` using a structured schema:
+For high throughput during backlogs, `PollerService` partitions candidate submissions into bounded batches (`llm_batch_size`). Before each batch call, `ReleasePersistenceService.find_candidates` embeds the cleaned submission titles in a single local `fastembed` pass and queries PostgreSQL for the top-5 closest existing `Release` and `Artist` records per title ($\text{cosine similarity} \ge 0.50$). Deduplicated candidates are formatted into the prompt's `"Existing Catalog Reference"` block, and submissions within each batch are evaluated simultaneously by `ExtractionWorker.extract_batch` using a structured schema:
 
 ```python
 class BatchExtractedItem(BaseModel):
@@ -155,11 +163,11 @@ class BatchExtractionResult(BaseModel):
 ```
 
 ### Fault Tolerance & Isolation
-1. **Batch Exception Fallback**: If an entire batch request fails (network error, timeout, or schema parsing), the worker catches the error and immediately falls back to extracting each submission individually.
-2. **Omission Fallback**: If the LLM omits one or more submission IDs in its response, missing submissions are automatically extracted via individual fallback. Any failure during individual extraction is safely handled without failing other submissions.
+1. **Batch Exception Fallback**: If an entire batch request fails (network error, timeout, or schema parsing), the worker catches the error and immediately falls back to extracting each submission individually while preserving catalog candidate retrieval/context.
+2. **Omission Fallback**: If the LLM omits one or more submission IDs in its response, missing submissions are automatically extracted via individual fallback with catalog candidate context. Any failure during individual extraction is safely handled without failing other submissions.
 3. **Queue Pause on Shutdown**: When `SIGINT` or `SIGTERM` is received, running batches complete cleanly, and subsequent batches are paused until restart.
 
-See [ADR 0006: Array Batch Extraction with Automated Single-Submission Fallback](docs/adr/0006-array-batch-extraction-with-fallback.md) for architectural details.
+See [ADR 0006: Array Batch Extraction with Automated Single-Submission Fallback](docs/adr/0006-array-batch-extraction-with-fallback.md) and [ADR 0007: Pre-Retrieval Vector Context for Canonical Entity Alignment](docs/adr/0007-vector-canonical-alignment.md) for architectural details.
 
 ---
 

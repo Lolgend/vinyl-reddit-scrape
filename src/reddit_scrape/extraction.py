@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from collections.abc import Awaitable, Callable, Sequence
-from typing import TYPE_CHECKING, Any, Union, cast
+from typing import TYPE_CHECKING, Any, Literal, Union, cast, overload
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -192,13 +192,11 @@ def format_catalog_reference(candidates: CatalogCandidates | None) -> str:
 
     Returns an empty string if candidates is None or has no artists or releases.
     """
-    if not candidates:
-        return ""
-    if getattr(candidates, "is_empty", False):
+    if candidates is None or candidates.is_empty:
         return ""
 
-    has_artists = bool(getattr(candidates, "artists", None))
-    has_releases = bool(getattr(candidates, "releases", None))
+    has_artists = bool(candidates.artists)
+    has_releases = bool(candidates.releases)
 
     if not has_artists and not has_releases:
         return ""
@@ -277,7 +275,29 @@ def build_batch_extraction_prompt(
     return base_prompt
 
 
-# --- Agent Factories ---
+# --- Agent Factory ---
+
+
+@overload
+def create_extraction_agent(
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model_name: str | None = None,
+    thinking_level: str | None = None,
+    *,
+    batch: Literal[False] = False,
+) -> Agent[None, ExtractionResult]: ...
+
+
+@overload
+def create_extraction_agent(
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model_name: str | None = None,
+    thinking_level: str | None = None,
+    *,
+    batch: Literal[True],
+) -> Agent[None, BatchExtractionResult]: ...
 
 
 def create_extraction_agent(
@@ -285,8 +305,10 @@ def create_extraction_agent(
     base_url: str | None = None,
     model_name: str | None = None,
     thinking_level: str | None = None,
-) -> Agent[None, ExtractionResult]:
-    """Create a PydanticAI Agent configured for DeepSeek chat."""
+    *,
+    batch: bool = False,
+) -> Agent[None, ExtractionResult] | Agent[None, BatchExtractionResult]:
+    """Create a PydanticAI Agent configured for single or batch release extraction."""
     key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY")
     if not key:
         raise ValueError(
@@ -310,50 +332,19 @@ def create_extraction_agent(
         api_key=key,
     )
     chat_model = OpenAIChatModel(model, provider=provider)
+
+    if batch:
+        return Agent(
+            chat_model,
+            output_type=BatchExtractionResult,
+            system_prompt=BATCH_EXTRACTION_SYSTEM_PROMPT,
+            model_settings=model_settings,
+        )
 
     return Agent(
         chat_model,
         output_type=ExtractionResult,
         system_prompt=EXTRACTION_SYSTEM_PROMPT,
-        model_settings=model_settings,
-    )
-
-
-def create_batch_extraction_agent(
-    api_key: str | None = None,
-    base_url: str | None = None,
-    model_name: str | None = None,
-    thinking_level: str | None = None,
-) -> Agent[None, BatchExtractionResult]:
-    """Create a PydanticAI Agent configured for batch release extraction."""
-    key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY")
-    if not key:
-        raise ValueError(
-            "DEEPSEEK_API_KEY or DEEPSEEK_KEY environment variable is required"
-        )
-    url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    model = model_name or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
-
-    level = thinking_level or os.getenv("LLM_THINKING_LEVEL")
-    if not level:
-        level = get_default_thinking_level(model)
-
-    model_settings: ModelSettings
-    if level.lower() == "none":
-        model_settings = {"thinking": False}
-    else:
-        model_settings = {"thinking": cast(Any, level.lower())}
-
-    provider = OpenAIProvider(
-        base_url=url,
-        api_key=key,
-    )
-    chat_model = OpenAIChatModel(model, provider=provider)
-
-    return Agent(
-        chat_model,
-        output_type=BatchExtractionResult,
-        system_prompt=BATCH_EXTRACTION_SYSTEM_PROMPT,
         model_settings=model_settings,
     )
 
@@ -370,18 +361,9 @@ async def _resolve_candidates(
         return None
     try:
         result = retriever(titles)
-        resolved: Any
         if inspect.isawaitable(result):
-            resolved = await result
-        else:
-            resolved = result
-        if (
-            resolved is not None
-            and hasattr(resolved, "releases")
-            and hasattr(resolved, "artists")
-        ):
-            return cast("CatalogCandidates", resolved)
-        return None
+            return await result
+        return result
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Candidate retrieval failed (%s: %s); proceeding without catalog reference",
@@ -434,8 +416,9 @@ class ExtractionWorker:
 
     def _get_batch_agent(self) -> Agent[None, BatchExtractionResult]:
         if self.batch_agent is None:
-            self.batch_agent = create_batch_extraction_agent(
-                thinking_level=self.thinking_level
+            self.batch_agent = create_extraction_agent(
+                thinking_level=self.thinking_level,
+                batch=True,
             )
         return self.batch_agent
 
@@ -444,25 +427,18 @@ class ExtractionWorker:
         sub_id: str,
         title: str,
         flair: str | None,
+        candidates: CatalogCandidates | None,
         retriever: CandidateRetriever | None,
         is_omitted: bool = False,
     ) -> ExtractionResult:
         """Safely extract releases for an individual submission during batch fallback."""
-        kwargs: dict[str, Any] = {}
-        if retriever is not None:
-            kwargs["candidate_retriever"] = retriever
-
         try:
-            try:
-                return await self.extract(
-                    title,
-                    flair=flair,
-                    **kwargs,
-                )
-            except TypeError as te:
-                if "candidate_retriever" in str(te):
-                    return await self.extract(title, flair=flair)
-                raise
+            return await self.extract(
+                title,
+                flair=flair,
+                candidates=candidates,
+                candidate_retriever=retriever,
+            )
         except Exception as exc:  # noqa: BLE001
             target_label = "omitted submission" if is_omitted else "submission"
             logger.warning(
@@ -492,16 +468,12 @@ class ExtractionWorker:
         if resolved_candidates is None and retriever is not None:
             resolved_candidates = await _resolve_candidates(retriever, [title])
 
-        kwargs: dict[str, Any] = {}
-        if resolved_candidates is not None:
-            kwargs["candidates"] = resolved_candidates
-
         try:
             return await extract_releases(
                 title,
                 flair=flair,
                 agent=agent,
-                **kwargs,
+                candidates=resolved_candidates,
             )
         except RuntimeError as exc:
             if "Event loop is closed" in str(exc) and self._owns_agent:
@@ -510,7 +482,7 @@ class ExtractionWorker:
                     title,
                     flair=flair,
                     agent=self.agent,
-                    **kwargs,
+                    candidates=resolved_candidates,
                 )
             raise
 
@@ -558,8 +530,9 @@ class ExtractionWorker:
                 run_result = await agent.run(prompt)
             except RuntimeError as exc:
                 if "Event loop is closed" in str(exc) and self._owns_batch_agent:
-                    self.batch_agent = create_batch_extraction_agent(
-                        thinking_level=self.thinking_level
+                    self.batch_agent = create_extraction_agent(
+                        thinking_level=self.thinking_level,
+                        batch=True,
                     )
                     run_result = await self.batch_agent.run(prompt)
                 else:
@@ -580,7 +553,7 @@ class ExtractionWorker:
             fallback_results: dict[str, ExtractionResult] = {}
             for sub_id, title, flair in submissions:
                 fallback_results[sub_id] = await self._fallback_extract_single(
-                    sub_id, title, flair, retriever
+                    sub_id, title, flair, candidates, retriever
                 )
             return fallback_results
 
@@ -593,7 +566,7 @@ class ExtractionWorker:
             for sub_id in missing_ids:
                 title, flair = sub_map[sub_id]
                 results[sub_id] = await self._fallback_extract_single(
-                    sub_id, title, flair, retriever, is_omitted=True
+                    sub_id, title, flair, candidates, retriever, is_omitted=True
                 )
 
         return results
@@ -610,7 +583,6 @@ __all__ = [
     "ExtractionWorker",
     "build_batch_extraction_prompt",
     "build_extraction_prompt",
-    "create_batch_extraction_agent",
     "create_extraction_agent",
     "extract_releases",
     "format_catalog_reference",

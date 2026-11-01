@@ -19,7 +19,6 @@ from reddit_scrape.extraction import (
     ExtractionWorker,
     build_batch_extraction_prompt,
     build_extraction_prompt,
-    create_batch_extraction_agent,
     create_extraction_agent,
     extract_releases,
     format_catalog_reference,
@@ -354,53 +353,54 @@ class TestBatchAgentConfiguration:
         monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
         monkeypatch.delenv("DEEPSEEK_KEY", raising=False)
         with pytest.raises(ValueError, match="DEEPSEEK_API_KEY or DEEPSEEK_KEY"):
-            create_batch_extraction_agent()
+            create_extraction_agent(batch=True)
 
     def test_create_batch_extraction_agent_success(self, monkeypatch):
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-12345")
-        agent = create_batch_extraction_agent()
+        agent = create_extraction_agent(batch=True)
         assert agent is not None
         assert agent.output_type == BatchExtractionResult
         assert any("batches of r/vinylreleases submission titles" in p for p in agent._system_prompts)
 
     def test_create_batch_extraction_agent_explicit_args(self):
-        agent = create_batch_extraction_agent(
+        agent = create_extraction_agent(
             api_key="sk-explicit",
             base_url="https://custom.deepseek.com",
             model_name="deepseek-custom",
+            batch=True,
         )
         assert agent is not None
         assert agent.output_type == BatchExtractionResult
 
     def test_create_batch_extraction_agent_thinking_level_none(self):
-        agent = create_batch_extraction_agent(api_key="sk-test", thinking_level="none")
+        agent = create_extraction_agent(api_key="sk-test", thinking_level="none", batch=True)
         assert agent.model_settings == {"thinking": False}
 
-        agent_upper = create_batch_extraction_agent(api_key="sk-test", thinking_level="NONE")
+        agent_upper = create_extraction_agent(api_key="sk-test", thinking_level="NONE", batch=True)
         assert agent_upper.model_settings == {"thinking": False}
 
     @pytest.mark.parametrize("level", ["minimal", "low", "medium", "high", "max"])
     def test_create_batch_extraction_agent_thinking_levels(self, level):
-        agent = create_batch_extraction_agent(api_key="sk-test", thinking_level=level)
+        agent = create_extraction_agent(api_key="sk-test", thinking_level=level, batch=True)
         assert agent.model_settings == {"thinking": level}
 
     def test_create_batch_extraction_agent_thinking_level_env_var(self, monkeypatch):
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         monkeypatch.setenv("LLM_THINKING_LEVEL", "high")
-        agent = create_batch_extraction_agent()
+        agent = create_extraction_agent(batch=True)
         assert agent.model_settings == {"thinking": "high"}
 
         monkeypatch.setenv("LLM_THINKING_LEVEL", "none")
-        agent_none = create_batch_extraction_agent()
+        agent_none = create_extraction_agent(batch=True)
         assert agent_none.model_settings == {"thinking": False}
 
         monkeypatch.delenv("LLM_THINKING_LEVEL", raising=False)
         # Default for chat model is none -> thinking: False
-        agent_default = create_batch_extraction_agent()
+        agent_default = create_extraction_agent(batch=True)
         assert agent_default.model_settings == {"thinking": False}
 
         # Default for reasoning model is low -> thinking: "low"
-        agent_reasoner = create_batch_extraction_agent(model_name="deepseek-reasoner")
+        agent_reasoner = create_extraction_agent(model_name="deepseek-reasoner", batch=True)
         assert agent_reasoner.model_settings == {"thinking": "low"}
 
 
@@ -498,7 +498,9 @@ class TestExtractionAsyncLogic:
 
         call_count = 0
 
-        async def fake_extract_releases(title, flair=None, agent=None):
+        async def fake_extract_releases(
+            title, flair=None, agent=None, candidates=None, candidate_retriever=None
+        ):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -542,7 +544,9 @@ class TestExtractionAsyncLogic:
         captured_kwargs.clear()
         call_count = 0
 
-        async def fake_extract_releases(title, flair=None, agent=None):
+        async def fake_extract_releases(
+            title, flair=None, agent=None, candidates=None, candidate_retriever=None
+        ):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -745,7 +749,7 @@ class TestBatchExtractionWorker:
         fake_batch_agent.run = fake_run
 
         monkeypatch.setattr(
-            "reddit_scrape.extraction.create_batch_extraction_agent",
+            "reddit_scrape.extraction.create_extraction_agent",
             lambda **kwargs: fake_batch_agent,
         )
 
@@ -767,7 +771,7 @@ class TestBatchExtractionWorker:
             )
 
         monkeypatch.setattr(
-            "reddit_scrape.extraction.create_batch_extraction_agent",
+            "reddit_scrape.extraction.create_extraction_agent",
             fake_create_batch_agent,
         )
         worker = ExtractionWorker(thinking_level="high")
@@ -776,6 +780,7 @@ class TestBatchExtractionWorker:
         agent = worker._get_batch_agent()
         assert agent is not None
         assert captured_kwargs.get("thinking_level") == "high"
+        assert captured_kwargs.get("batch") is True
 
     @pytest.mark.asyncio
     async def test_extract_batch_bounded_batch_size_partitioning(self):
@@ -851,7 +856,12 @@ class TestBatchExtractionWorker:
         worker = ExtractionWorker(batch_agent=batch_agent)
 
         # Single extract will succeed for sub_2, but raise Exception for sub_3
-        async def mock_extract(title, flair=None):
+        async def mock_extract(
+            title,
+            flair=None,
+            candidates=None,
+            candidate_retriever=None,
+        ):
             if "Album 3" in title:
                 raise RuntimeError("LLM rate limit error on single item")
             return ExtractionResult(
@@ -1242,6 +1252,80 @@ class TestBatchExtractionWorker:
         assert "Existing Catalog Reference:" in captured_prompts[0]
         assert "Explicit Artist" in captured_prompts[0]
         assert "Explicit Album" in captured_prompts[0]
+
+    @pytest.mark.asyncio
+    async def test_extract_batch_preserves_explicit_candidates_during_fallback(self):
+        worker_retriever_called = False
+
+        def worker_retriever(titles):
+            nonlocal worker_retriever_called
+            worker_retriever_called = True
+            return CatalogCandidates(artists=["Worker Artist"])
+
+        explicit_candidates = CatalogCandidates(
+            artists=["Explicit Fallback Artist"],
+            releases=[
+                CatalogReleaseCandidate(
+                    id="rel_exp_fb",
+                    combined_artist="Explicit Fallback Artist",
+                    album_title="Explicit Fallback Album",
+                    artists=["Explicit Fallback Artist"],
+                )
+            ],
+        )
+
+        failing_batch_agent = Agent(
+            TestModel(),
+            output_type=BatchExtractionResult,
+            system_prompt=BATCH_EXTRACTION_SYSTEM_PROMPT,
+        )
+
+        async def fail_run(*args, **kwargs):
+            raise RuntimeError("Batch LLM failure")
+
+        failing_batch_agent.run = fail_run
+
+        single_prompts: list[str] = []
+        single_agent = Agent(
+            TestModel(
+                custom_output_args={
+                    "releases": [
+                        {
+                            "artists": ["Explicit Fallback Artist"],
+                            "combined_artist": "Explicit Fallback Artist",
+                            "album_title": "Explicit Fallback Album",
+                        }
+                    ]
+                }
+            ),
+            output_type=ExtractionResult,
+            system_prompt=EXTRACTION_SYSTEM_PROMPT,
+        )
+        original_single_run = single_agent.run
+
+        async def spy_single_run(prompt, *args, **kwargs):
+            single_prompts.append(prompt)
+            return await original_single_run(prompt, *args, **kwargs)
+
+        single_agent.run = spy_single_run
+
+        worker = ExtractionWorker(
+            agent=single_agent,
+            batch_agent=failing_batch_agent,
+            candidate_retriever=worker_retriever,
+        )
+
+        results = await worker.extract_batch(
+            [("sub_exp_fb", "Explicit Fallback Album - Explicit Fallback Artist", None)],
+            candidates=explicit_candidates,
+        )
+
+        assert len(results) == 1
+        assert not worker_retriever_called
+        assert len(single_prompts) == 1
+        assert "Existing Catalog Reference:" in single_prompts[0]
+        assert "Explicit Fallback Artist" in single_prompts[0]
+        assert "Explicit Fallback Album" in single_prompts[0]
 
 
 class TestBenchmarkFixtures:
