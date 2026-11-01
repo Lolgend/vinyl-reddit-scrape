@@ -32,6 +32,10 @@ _Avoid_: Master, LP, record, title, drop
 The retrieval and association of verified musical metadata (canonical titles, release years, genres, styles, tracklists, and external catalog identifiers) from an authoritative music database for extracted artists, albums, or releases.
 _Avoid_: Scraping, tagging, metadata fetching
 
+**Enrichment State**:
+The persistent lifecycle state of an album or release record during external catalog resolution (`pending`, `matched`, `partial_matched`, `not_found`, `failed`).
+_Avoid_: Sync status, verification flag, match flag
+
 **Artist**:
 An individual musical creator, performer, composer, or band contributing to a release. Multi-artist releases associate each contributing artist individually alongside a combined billing.
 _Avoid_: Creator, musician, singer
