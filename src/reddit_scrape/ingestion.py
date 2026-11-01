@@ -32,7 +32,7 @@ def should_ingest_submission(title: str, flair: str | None) -> bool:
     if flair and flair.strip().lower() in NON_RELEASE_FLAIRS:
         return False
 
-    if title and NON_RELEASE_TITLE_PATTERN.match(title.strip()):
+    if title and NON_RELEASE_TITLE_PATTERN.match(title.strip()):  # noqa: SIM103
         return False
 
     return True
@@ -106,7 +106,7 @@ class SubmissionIngester:
             is_release=True,
         )
 
-        upsert_stmt = stmt.on_conflict_do_update(
+        upsert_stmt: Any = stmt.on_conflict_do_update(
             index_elements=[Submission.reddit_id],
             set_={
                 "flair": stmt.excluded.flair,

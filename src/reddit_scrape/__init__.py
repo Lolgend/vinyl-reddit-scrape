@@ -6,12 +6,14 @@ from reddit_scrape.db import (
     get_engine,
     get_session_factory,
     init_db,
+    reset_db,
 )
 from reddit_scrape.extraction import (
     BATCH_EXTRACTION_SYSTEM_PROMPT,
     EXTRACTION_SYSTEM_PROMPT,
     BatchExtractedItem,
     BatchExtractionResult,
+    CandidateRetriever,
     ExtractedRelease,
     ExtractionResult,
     ExtractionWorker,
@@ -20,6 +22,7 @@ from reddit_scrape.extraction import (
     create_batch_extraction_agent,
     create_extraction_agent,
     extract_releases,
+    format_catalog_reference,
     pre_clean_title,
 )
 from reddit_scrape.ingestion import (
@@ -40,8 +43,11 @@ from reddit_scrape.models import (
 )
 from reddit_scrape.persistence import (
     STANDARD_TOKEN,
+    CatalogCandidates,
+    CatalogReleaseCandidate,
     ReleasePersistenceService,
     compute_release_fingerprint,
+    find_catalog_candidates,
     normalize_attribute,
     persist_extracted_releases,
 )
@@ -57,13 +63,14 @@ from reddit_scrape.service import (
     validate_environment,
 )
 
-__all__ = [
+__all__ = [  # noqa: RUF022
     # Database
     "Base",
     "get_database_url",
     "get_engine",
     "get_session_factory",
     "init_db",
+    "reset_db",
     # Models
     "Artist",
     "Release",
@@ -82,6 +89,7 @@ __all__ = [
     "BATCH_EXTRACTION_SYSTEM_PROMPT",
     "BatchExtractedItem",
     "BatchExtractionResult",
+    "CandidateRetriever",
     "EXTRACTION_SYSTEM_PROMPT",
     "ExtractedRelease",
     "ExtractionResult",
@@ -91,11 +99,15 @@ __all__ = [
     "create_batch_extraction_agent",
     "create_extraction_agent",
     "extract_releases",
+    "format_catalog_reference",
     "pre_clean_title",
     # Persistence
+    "CatalogCandidates",
+    "CatalogReleaseCandidate",
     "STANDARD_TOKEN",
     "ReleasePersistenceService",
     "compute_release_fingerprint",
+    "find_catalog_candidates",
     "normalize_attribute",
     "persist_extracted_releases",
     # Retention

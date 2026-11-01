@@ -28,7 +28,7 @@ def engine():
         eng = get_engine()
         init_db(eng)
         return eng
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         pytest.skip(f"Database unavailable: {exc}")
 
 
@@ -365,6 +365,7 @@ def test_python_m_subprocess_execution():
     result = subprocess.run(
         [sys.executable, "-m", "reddit_scrape", "purge-snapshots", "--days", "30"],
         capture_output=True,
+        check=False,
         text=True,
         env=env,
     )

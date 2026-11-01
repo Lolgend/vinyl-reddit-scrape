@@ -16,6 +16,10 @@ _Avoid_: Metric check, poll log, vote record
 A bounded chunk of unextracted candidate submissions (default: 5) evaluated simultaneously in a single LLM prompt with automated fallback to single-submission extraction on failure.
 _Avoid_: Request chunk, extraction group, bulk prompt
 
+**Canonical Alignment**:
+The resolution of extracted artist names, combined billings, album titles, variants, and retailers against semantically similar existing releases and artists so that ordering or formatting variations map to established records rather than creating duplicate entries.
+_Avoid_: Fuzzy deduplication, entry matching, order normalization
+
 **Release**:
 A distinct vinyl record product or edition announced to the public, identified by artist(s), album title, variant, and retailer.
 _Avoid_: Record, vinyl, drop, product, item
