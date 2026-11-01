@@ -21,8 +21,16 @@ The resolution of extracted artist names, combined billings, album titles, varia
 _Avoid_: Fuzzy deduplication, entry matching, order normalization
 
 **Release**:
-A distinct vinyl record product or edition announced to the public, identified by artist(s), album title, variant, and retailer.
+A distinct vinyl record product or edition announced to the public, identified by an associated album, variant, and retailer.
 _Avoid_: Record, vinyl, drop, product, item
+
+**Album**:
+A canonical musical work or collection of tracks created by one or more artists, independent of specific physical vinyl pressings or retailer variants.
+_Avoid_: Master, LP, record, title, drop
+
+**Catalog Enrichment**:
+The retrieval and association of verified musical metadata (canonical titles, release years, genres, styles, tracklists, and external catalog identifiers) from an authoritative music database for extracted artists, albums, or releases.
+_Avoid_: Scraping, tagging, metadata fetching
 
 **Artist**:
 An individual musical creator, performer, composer, or band contributing to a release. Multi-artist releases associate each contributing artist individually alongside a combined billing.

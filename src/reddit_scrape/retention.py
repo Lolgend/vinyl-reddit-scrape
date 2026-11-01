@@ -4,10 +4,11 @@ import logging
 import os
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from dotenv import load_dotenv
 from sqlalchemy import text
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from reddit_scrape.db import get_session_factory
@@ -54,9 +55,9 @@ def _execute_purge_loop(
 
     total_deleted = 0
     while True:
-        result = session.execute(stmt, params)
+        result = cast(CursorResult[Any], session.execute(stmt, params))
         session.commit()
-        batch_deleted = int(getattr(result, "rowcount", 0))
+        batch_deleted = int(result.rowcount or 0)
         total_deleted += batch_deleted
         logger.info(
             "Purged %d snapshots in batch (total deleted so far: %d)",
