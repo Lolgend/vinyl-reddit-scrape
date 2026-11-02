@@ -350,6 +350,7 @@ class TestCatalogCandidateRetrievalUnit:
             assert len(result.releases) == 1
             cand = result.releases[0]
             assert cand.id == "rel-uuid-split"
+            assert cand.album_id == "album-uuid-split"
             assert cand.combined_artist == "Converge / Dropdead"
             assert cand.album_title == "Split"
             assert cand.variant == "Clear 7\""
