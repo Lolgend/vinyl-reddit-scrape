@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
-from unittest.mock import MagicMock
+from typing import Any, cast
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
 from pydantic_ai.models.test import TestModel
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.orm import sessionmaker
 
 from reddit_scrape.db import get_engine, init_db
@@ -2282,6 +2283,795 @@ class TestEnrichmentFailureRecording:
             assert db_alb.discogs_status == "failed"
             assert db_alb.enrichment_attempts == 1
             assert "Fatal LLM quota" in (db_alb.enrichment_error or "")
+
+
+class TestArtistCollisionReparenting:
+    """Tests for Phase 3 canonical Artist collision re-parenting and orphan deletion."""
+
+    def test_artist_collision_on_discogs_id_reparents_and_deletes_orphaned_artist(
+        self, session_factory
+    ) -> None:
+        """When an updated artist's discogs_artist_id collides with an existing artist,
+
+        re-parent album_artists to the surviving artist and delete the orphaned artist.
+        """
+        with session_factory() as session:
+            # Surviving artist already in DB
+            art_surviving = Artist(
+                name="Converge Official",
+                discogs_artist_id=54321,
+                embedding=[0.1] * 384,
+            )
+            # Superseded artist linked to album
+            art_superseded = Artist(
+                name="Converge (Old)",
+                discogs_artist_id=None,
+                embedding=[0.2] * 384,
+            )
+            alb = Album(
+                combined_artist="Converge (Old)",
+                title="Jane Doe",
+                fingerprint="fp_jane_doe_old",
+                discogs_status="pending",
+            )
+            session.add_all([art_surviving, art_superseded, alb])
+            session.commit()
+
+            session.add(AlbumArtist(album_id=alb.id, artist_id=art_superseded.id))
+            session.commit()
+
+            surviving_id = cast(uuid.UUID, art_surviving.id)
+            superseded_id = cast(uuid.UUID, art_superseded.id)
+            alb_id = cast(uuid.UUID, alb.id)
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=MagicMock(spec=DiscogsClient),
+        )
+
+        from reddit_scrape.enrichment import EnrichedAlbumData, EnrichedArtistData
+
+        enriched_data = EnrichedAlbumData(
+            album_id=alb_id,
+            combined_artist="Converge",
+            title="Jane Doe",
+            fingerprint="fp_jane_doe_canonical",
+            discogs_master_id=11111,
+            discogs_release_id=22222,
+            discogs_status="matched",
+            embedding=[0.3] * 384,
+            artists=[
+                EnrichedArtistData(
+                    artist_id=superseded_id,
+                    name="Converge",
+                    discogs_artist_id=54321,  # Collides with art_surviving
+                    embedding=[0.4] * 384,
+                )
+            ],
+        )
+
+        res_album = service.commit_matched_enrichment(enriched_data)
+        assert res_album is not None
+
+        with session_factory() as session:
+            # 1. Superseded artist should be deleted because it is orphaned
+            assert session.get(Artist, superseded_id) is None
+
+            # 2. Surviving artist should be updated with new name, discogs_artist_id, embedding
+            surviving = session.get(Artist, surviving_id)
+            assert surviving is not None
+            assert surviving.name == "Converge"
+            assert surviving.discogs_artist_id == 54321
+            assert pytest.approx(surviving.embedding[0]) == 0.4
+
+            # 3. album_artists should point to surviving_id
+            links = session.execute(
+                select(AlbumArtist).where(AlbumArtist.album_id == alb_id)
+            ).scalars().all()
+            assert len(links) == 1
+            assert links[0].artist_id == surviving_id
+
+    def test_artist_collision_on_name_preserves_unorphaned_superseded_artist(
+        self, session_factory
+    ) -> None:
+        """When an artist collides on name but is still linked to another album,
+
+        re-parent only the enriched album and do NOT delete the superseded artist.
+        """
+        with session_factory() as session:
+            art_surviving = Artist(
+                name="Chelsea Wolfe",
+                discogs_artist_id=11111,
+                embedding=[0.1] * 384,
+            )
+            art_superseded = Artist(
+                name="Chelsea Wolfe (Old)",
+                discogs_artist_id=None,
+                embedding=[0.2] * 384,
+            )
+            alb1 = Album(
+                combined_artist="Chelsea Wolfe (Old)",
+                title="Hiss Spun",
+                fingerprint="fp_hiss_spun",
+                discogs_status="pending",
+            )
+            alb2 = Album(
+                combined_artist="Chelsea Wolfe (Old)",
+                title="Birth of Violence",
+                fingerprint="fp_birth_violence",
+                discogs_status="pending",
+            )
+            session.add_all([art_surviving, art_superseded, alb1, alb2])
+            session.commit()
+
+            session.add_all([
+                AlbumArtist(album_id=alb1.id, artist_id=art_superseded.id),
+                AlbumArtist(album_id=alb2.id, artist_id=art_superseded.id),
+            ])
+            session.commit()
+
+            surviving_id = cast(uuid.UUID, art_surviving.id)
+            superseded_id = cast(uuid.UUID, art_superseded.id)
+            alb1_id = cast(uuid.UUID, alb1.id)
+            alb2_id = cast(uuid.UUID, alb2.id)
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=MagicMock(spec=DiscogsClient),
+        )
+
+        from reddit_scrape.enrichment import EnrichedAlbumData, EnrichedArtistData
+
+        enriched_data = EnrichedAlbumData(
+            album_id=alb1_id,
+            combined_artist="Chelsea Wolfe",
+            title="Hiss Spun",
+            fingerprint="fp_hiss_spun_canonical",
+            discogs_master_id=33333,
+            discogs_release_id=None,
+            discogs_status="matched",
+            embedding=[0.3] * 384,
+            artists=[
+                EnrichedArtistData(
+                    artist_id=superseded_id,
+                    name="Chelsea Wolfe",  # Collides on name
+                    discogs_artist_id=11111,
+                    embedding=[0.4] * 384,
+                )
+            ],
+        )
+
+        res_album = service.commit_matched_enrichment(enriched_data)
+        assert res_album is not None
+
+        with session_factory() as session:
+            # 1. Superseded artist still exists because alb2 still links to it!
+            old_art = session.get(Artist, superseded_id)
+            assert old_art is not None
+
+            # 2. alb1's link is re-parented to surviving_id
+            alb1_links = session.execute(
+                select(AlbumArtist).where(AlbumArtist.album_id == alb1_id)
+            ).scalars().all()
+            assert len(alb1_links) == 1
+            assert alb1_links[0].artist_id == surviving_id
+
+            # 3. alb2's link still points to superseded_id
+            alb2_links = session.execute(
+                select(AlbumArtist).where(AlbumArtist.album_id == alb2_id)
+            ).scalars().all()
+            assert len(alb2_links) == 1
+            assert alb2_links[0].artist_id == superseded_id
+
+
+class TestAlbumCollisionReparenting:
+    """Tests for Phase 3 canonical Album collision re-parenting, child Release re-linking, and superseded deletion."""
+
+    def test_album_collision_reparents_artists_releases_and_deletes_superseded(
+        self, session_factory
+    ) -> None:
+        from reddit_scrape.models import Release, Submission, SubmissionRelease
+        from reddit_scrape.persistence import (
+            compute_album_fingerprint,
+            compute_release_fingerprint,
+        )
+
+        canonical_fp = compute_album_fingerprint("Converge", "Jane Doe")
+
+        with session_factory() as session:
+            # 1. Surviving canonical album already in DB
+            alb_surviving = Album(
+                combined_artist="Converge",
+                title="Jane Doe",
+                fingerprint=canonical_fp,
+                discogs_master_id=11111,
+                discogs_status="matched",
+                embedding=[0.1] * 384,
+            )
+            session.add(alb_surviving)
+            session.flush()
+
+            rel_surviving = Release(
+                album_id=alb_surviving.id,
+                variant="Clear Vinyl /100",
+                retailer_name="Deathwish",
+                fingerprint=compute_release_fingerprint(
+                    alb_surviving.id, "Clear Vinyl /100", "Deathwish"
+                ),
+            )
+            sub_1 = Submission(
+                id="sub_1",
+                reddit_id="red_1",
+                title="Converge - Jane Doe Clear",
+                url="http://reddit.com/r/1",
+                created_utc=datetime.now(timezone.utc),
+            )
+            session.add_all([rel_surviving, sub_1])
+            session.flush()
+            session.add(SubmissionRelease(submission_id=sub_1.id, release_id=rel_surviving.id))
+
+            # 2. Superseded album being enriched
+            alb_superseded = Album(
+                combined_artist="Converge",
+                title="Jane Doe (Remaster)",
+                fingerprint="fp_provisional_remaster",
+                discogs_status="pending",
+                embedding=[0.2] * 384,
+            )
+            session.add(alb_superseded)
+            session.flush()
+
+            art = Artist(name="Converge", discogs_artist_id=54321, embedding=[0.5] * 384)
+            session.add(art)
+            session.flush()
+            session.add(AlbumArtist(album_id=alb_superseded.id, artist_id=art.id))
+
+            # Child release 2A (duplicate of rel_surviving once re-parented)
+            rel_dup = Release(
+                album_id=alb_superseded.id,
+                variant="Clear Vinyl /100",
+                retailer_name="Deathwish",
+                fingerprint=compute_release_fingerprint(
+                    alb_superseded.id, "Clear Vinyl /100", "Deathwish"
+                ),
+            )
+            # Child release 2B (distinct variant)
+            rel_distinct = Release(
+                album_id=alb_superseded.id,
+                variant="Gold Vinyl /500",
+                retailer_name="Deathwish",
+                fingerprint=compute_release_fingerprint(
+                    alb_superseded.id, "Gold Vinyl /500", "Deathwish"
+                ),
+            )
+            sub_2 = Submission(
+                id="sub_2",
+                reddit_id="red_2",
+                title="Converge - Jane Doe Clear Repost",
+                url="http://reddit.com/r/2",
+                created_utc=datetime.now(timezone.utc),
+            )
+            sub_3 = Submission(
+                id="sub_3",
+                reddit_id="red_3",
+                title="Converge - Jane Doe Gold",
+                url="http://reddit.com/r/3",
+                created_utc=datetime.now(timezone.utc),
+            )
+            session.add_all([rel_dup, rel_distinct, sub_2, sub_3])
+            session.flush()
+            session.add_all([
+                SubmissionRelease(submission_id=sub_2.id, release_id=rel_dup.id),
+                SubmissionRelease(submission_id=sub_3.id, release_id=rel_distinct.id),
+            ])
+            session.commit()
+
+            surviving_album_id = cast(uuid.UUID, alb_surviving.id)
+            superseded_album_id = cast(uuid.UUID, alb_superseded.id)
+            surviving_rel_id = cast(uuid.UUID, rel_surviving.id)
+            dup_rel_id = cast(uuid.UUID, rel_dup.id)
+            distinct_rel_id = cast(uuid.UUID, rel_distinct.id)
+            art_id = cast(uuid.UUID, art.id)
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=MagicMock(spec=DiscogsClient),
+        )
+
+        from reddit_scrape.enrichment import EnrichedAlbumData, EnrichedArtistData
+
+        enriched_data = EnrichedAlbumData(
+            album_id=superseded_album_id,
+            combined_artist="Converge",
+            title="Jane Doe",
+            fingerprint=canonical_fp,  # Collides with alb_surviving
+            discogs_master_id=11111,   # Also collides with alb_surviving
+            discogs_release_id=None,
+            discogs_status="matched",
+            embedding=[0.9] * 384,
+            artists=[
+                EnrichedArtistData(
+                    artist_id=art_id,
+                    name="Converge",
+                    discogs_artist_id=54321,
+                    embedding=[0.5] * 384,
+                )
+            ],
+        )
+
+        result_album = service.commit_matched_enrichment(enriched_data)
+
+        # Result should be the surviving canonical album
+        assert result_album.id == surviving_album_id
+
+        with session_factory() as session:
+            # 1. Superseded album is deleted
+            assert session.get(Album, superseded_album_id) is None
+
+            # 2. Surviving album updated
+            surviving_album = session.get(Album, surviving_album_id)
+            assert surviving_album is not None
+            assert surviving_album.fingerprint == canonical_fp
+            assert surviving_album.discogs_master_id == 11111
+            assert surviving_album.discogs_status == "matched"
+            assert pytest.approx(surviving_album.embedding[0]) == 0.9
+
+            # 3. AlbumArtist re-parented to surviving album
+            art_links = session.execute(
+                select(AlbumArtist).where(AlbumArtist.album_id == surviving_album_id)
+            ).scalars().all()
+            assert any(al.artist_id == art_id for al in art_links)
+
+            # 4. Duplicate release deleted, submission_release re-linked
+            assert session.get(Release, dup_rel_id) is None
+            sub2_link = session.execute(
+                select(SubmissionRelease).where(SubmissionRelease.submission_id == "sub_2")
+            ).scalar_one()
+            assert sub2_link.release_id == surviving_rel_id
+
+            # 5. Distinct release re-parented to surviving album with updated fingerprint
+            db_distinct = session.get(Release, distinct_rel_id)
+            assert db_distinct is not None
+            assert db_distinct.album_id == surviving_album_id
+            expected_distinct_fp = compute_release_fingerprint(
+                surviving_album_id, "Gold Vinyl /500", "Deathwish"
+            )
+            assert db_distinct.fingerprint == expected_distinct_fp
+            sub3_link = session.execute(
+                select(SubmissionRelease).where(SubmissionRelease.submission_id == "sub_3")
+            ).scalar_one()
+            assert sub3_link.release_id == distinct_rel_id
+
+    def test_album_collision_on_discogs_release_id_merges_albums(
+        self, session_factory
+    ) -> None:
+        """When an enriched album resolves to a discogs_release_id owned by another album,
+
+        it re-parents and deletes the superseded album.
+        """
+        with session_factory() as session:
+            alb_surviving = Album(
+                combined_artist="Band A",
+                title="Single A",
+                fingerprint="fp_band_a_single_a",
+                discogs_release_id=987654,
+                discogs_status="matched",
+                embedding=[0.1] * 384,
+            )
+            alb_superseded = Album(
+                combined_artist="Band A",
+                title="Single A (7-inch)",
+                fingerprint="fp_band_a_single_a_7inch",
+                discogs_status="pending",
+                embedding=[0.2] * 384,
+            )
+            session.add_all([alb_surviving, alb_superseded])
+            session.commit()
+
+            surviving_id = cast(uuid.UUID, alb_surviving.id)
+            superseded_id = cast(uuid.UUID, alb_superseded.id)
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=MagicMock(spec=DiscogsClient),
+        )
+
+        from reddit_scrape.enrichment import EnrichedAlbumData
+
+        enriched_data = EnrichedAlbumData(
+            album_id=superseded_id,
+            combined_artist="Band A",
+            title="Single A",
+            fingerprint="fp_new_different_fp",
+            discogs_master_id=None,
+            discogs_release_id=987654,  # Collides with alb_surviving
+            discogs_status="matched",
+            embedding=[0.8] * 384,
+            artists=[],
+        )
+
+        res_album = service.commit_matched_enrichment(enriched_data)
+        assert res_album.id == surviving_id
+
+        with session_factory() as session:
+            assert session.get(Album, superseded_id) is None
+            surviving = session.get(Album, surviving_id)
+            assert surviving is not None
+            assert surviving.discogs_release_id == 987654
+            assert pytest.approx(surviving.embedding[0]) == 0.8
+
+
+class TestSiblingReleaseReconciliation:
+    """Tests for Phase 4 detached sibling Release RAG reconciliation and Write Tx 2 commit."""
+
+    def test_reconcile_sibling_releases_identifies_duplicate_variant_groups(self) -> None:
+        from reddit_scrape.enrichment import (
+            SiblingReconciliationResult,
+            SiblingReleaseInfo,
+            create_sibling_reconciliation_agent,
+            reconcile_sibling_releases,
+        )
+
+        mock_output = {
+            "duplicate_groups": [
+                {
+                    "canonical_release_id": "rel-1",
+                    "duplicate_release_ids": ["rel-2"],
+                    "standardized_variant": "Pink /500",
+                    "standardized_retailer": "Deathwish Inc",
+                }
+            ],
+            "reasoning": "rel-1 and rel-2 both represent the 500-copy pink pressing sold via Deathwish",
+        }
+
+        mock_agent = create_sibling_reconciliation_agent(
+            model=TestModel(custom_output_args=mock_output)
+        )
+
+        siblings = [
+            SiblingReleaseInfo(id="rel-1", variant="Pink /500", retailer_name="Deathwish Inc"),
+            SiblingReleaseInfo(
+                id="rel-2",
+                variant="Limited Pink Vinyl (500 copies)",
+                retailer_name="Deathwish",
+            ),
+            SiblingReleaseInfo(id="rel-3", variant="Clear Vinyl /100", retailer_name="Rough Trade"),
+        ]
+
+        result = reconcile_sibling_releases(
+            combined_artist="Converge",
+            album_title="Jane Doe",
+            siblings=siblings,
+            sibling_agent=mock_agent,
+        )
+
+        assert isinstance(result, SiblingReconciliationResult)
+        assert len(result.duplicate_groups) == 1
+        group = result.duplicate_groups[0]
+        assert group.canonical_release_id == "rel-1"
+        assert group.duplicate_release_ids == ["rel-2"]
+        assert group.standardized_variant == "Pink /500"
+        assert group.standardized_retailer == "Deathwish Inc"
+
+    def test_commit_sibling_reconciliation_merges_duplicates_and_relinks_submissions(
+        self, session_factory
+    ) -> None:
+        from reddit_scrape.enrichment import (
+            CatalogEnrichmentService,
+            SiblingDuplicateGroup,
+        )
+        from reddit_scrape.models import Release, Submission, SubmissionRelease
+        from reddit_scrape.persistence import compute_release_fingerprint
+
+        with session_factory() as session:
+            alb = Album(
+                combined_artist="Converge",
+                title="Jane Doe",
+                fingerprint="fp_jane_doe_sibs",
+                discogs_status="matched",
+            )
+            session.add(alb)
+            session.flush()
+
+            rel1 = Release(
+                album_id=alb.id,
+                variant="Pink Vinyl (Limited to 500)",
+                retailer_name="Deathwish Inc",
+                fingerprint=compute_release_fingerprint(
+                    alb.id, "Pink Vinyl (Limited to 500)", "Deathwish Inc"
+                ),
+            )
+            rel2 = Release(
+                album_id=alb.id,
+                variant="Pink /500",
+                retailer_name="Deathwish",
+                fingerprint=compute_release_fingerprint(alb.id, "Pink /500", "Deathwish"),
+            )
+            sub1 = Submission(
+                id="sub_s1",
+                reddit_id="red_s1",
+                title="Jane Doe Pink",
+                url="http://reddit.com/s1",
+                created_utc=datetime.now(timezone.utc),
+            )
+            sub2 = Submission(
+                id="sub_s2",
+                reddit_id="red_s2",
+                title="Jane Doe Pink Repost",
+                url="http://reddit.com/s2",
+                created_utc=datetime.now(timezone.utc),
+            )
+            session.add_all([rel1, rel2, sub1, sub2])
+            session.flush()
+            session.add_all([
+                SubmissionRelease(submission_id=sub1.id, release_id=rel1.id),
+                SubmissionRelease(submission_id=sub2.id, release_id=rel2.id),
+            ])
+            session.commit()
+
+            alb_id = alb.id
+            rel1_id = rel1.id
+            rel2_id = rel2.id
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=MagicMock(spec=DiscogsClient),
+        )
+
+        group = SiblingDuplicateGroup(
+            canonical_release_id=str(rel1_id),
+            duplicate_release_ids=[str(rel2_id)],
+            standardized_variant="Pink /500",
+            standardized_retailer="Deathwish Inc",
+        )
+
+        deleted_count = service.commit_sibling_reconciliation(alb_id, [group])
+        assert deleted_count == 1
+
+        with session_factory() as session:
+            # 1. Duplicate release rel2 is deleted
+            assert session.get(Release, rel2_id) is None
+
+            # 2. Canonical release rel1 has updated variant, retailer, and fingerprint
+            db_rel1 = session.get(Release, rel1_id)
+            assert db_rel1 is not None
+            assert db_rel1.variant == "Pink /500"
+            assert db_rel1.retailer_name == "Deathwish Inc"
+            expected_fp = compute_release_fingerprint(alb_id, "Pink /500", "Deathwish Inc")
+            assert db_rel1.fingerprint == expected_fp
+
+            # 3. Both submissions now point to rel1
+            links = session.execute(
+                select(SubmissionRelease).where(SubmissionRelease.release_id == rel1_id)
+            ).scalars().all()
+            linked_sub_ids = {l.submission_id for l in links}
+            assert linked_sub_ids == {"sub_s1", "sub_s2"}
+
+    def test_enrich_album_end_to_end_triggers_phase_4_sibling_reconciliation(
+        self, session_factory
+    ) -> None:
+        """Full 4-phase flow: Phase 1 (read) -> Phase 2 (search/hydration) ->
+
+        Phase 3 (commit) -> Phase 4 (sibling reconciliation Write Tx 2).
+        """
+        from reddit_scrape.discogs import DiscogsArtistCredit, DiscogsMasterDetail
+        from reddit_scrape.enrichment import (
+            create_candidate_arbiter_agent,
+            create_homonym_disambiguation_agent,
+            create_sibling_reconciliation_agent,
+        )
+        from reddit_scrape.models import Release, Submission, SubmissionRelease
+        from reddit_scrape.persistence import compute_release_fingerprint
+
+        with session_factory() as session:
+            alb = Album(
+                combined_artist="Converge",
+                title="Jane Doe",
+                fingerprint="fp_jd_phase4_test",
+                discogs_status="pending",
+                embedding=[0.1] * 384,
+            )
+            session.add(alb)
+            session.flush()
+
+            rel1 = Release(
+                album_id=alb.id,
+                variant="Pink /500",
+                retailer_name="Deathwish Inc",
+                fingerprint=compute_release_fingerprint(
+                    alb.id, "Pink /500", "Deathwish Inc"
+                ),
+            )
+            rel2 = Release(
+                album_id=alb.id,
+                variant="Limited Pink Vinyl (500 copies)",
+                retailer_name="Deathwish",
+                fingerprint=compute_release_fingerprint(
+                    alb.id, "Limited Pink Vinyl (500 copies)", "Deathwish"
+                ),
+            )
+            sub1 = Submission(
+                id="sub_p4_1",
+                reddit_id="red_p4_1",
+                title="Converge Pink 500",
+                url="http://reddit.com/p4_1",
+                created_utc=datetime.now(timezone.utc),
+            )
+            sub2 = Submission(
+                id="sub_p4_2",
+                reddit_id="red_p4_2",
+                title="Converge Pink 500 Repost",
+                url="http://reddit.com/p4_2",
+                created_utc=datetime.now(timezone.utc),
+            )
+            session.add_all([rel1, rel2, sub1, sub2])
+            session.flush()
+            session.add_all([
+                SubmissionRelease(submission_id=sub1.id, release_id=rel1.id),
+                SubmissionRelease(submission_id=sub2.id, release_id=rel2.id),
+            ])
+            session.commit()
+
+            alb_id = alb.id
+            rel1_id = rel1.id
+            rel2_id = rel2.id
+
+        mock_discogs = MagicMock(spec=DiscogsClient)
+        mock_discogs.search.return_value = [
+            DiscogsSearchCandidate(id=777, type="master", title="Converge - Jane Doe")
+        ]
+        mock_discogs.get_master.return_value = DiscogsMasterDetail(
+            id=777,
+            title="Jane Doe",
+            artists=[DiscogsArtistCredit(id=123, name="Converge")],
+            year=2001,
+        )
+
+        arbiter_agent = create_candidate_arbiter_agent(
+            model=TestModel(
+                custom_output_args={
+                    "is_match": True,
+                    "matched_candidate_id": 777,
+                    "confidence": 0.99,
+                    "reasoning": "Exact match",
+                }
+            )
+        )
+        disambig_agent = create_homonym_disambiguation_agent(
+            model=TestModel(
+                custom_output_args={
+                    "canonical_combined_artist": "Converge",
+                    "canonical_artists": [{"name": "Converge", "discogs_artist_id": 123}],
+                    "canonical_album_title": "Jane Doe",
+                }
+            )
+        )
+        sibling_agent = create_sibling_reconciliation_agent(
+            model=TestModel(
+                custom_output_args={
+                    "duplicate_groups": [
+                        {
+                            "canonical_release_id": str(rel1_id),
+                            "duplicate_release_ids": [str(rel2_id)],
+                            "standardized_variant": "Pink /500",
+                            "standardized_retailer": "Deathwish Inc",
+                        }
+                    ],
+                    "reasoning": "Identical 500-copy pink pressing",
+                }
+            )
+        )
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=mock_discogs,
+            arbiter_agent=arbiter_agent,
+            disambiguation_agent=disambig_agent,
+            sibling_agent=sibling_agent,
+        )
+
+        res = service.enrich_album(alb_id)
+        assert res is not None
+        assert res.discogs_status == "matched"
+        assert res.discogs_master_id == 777
+
+        with session_factory() as session:
+            # Duplicate rel2 is deleted
+            assert session.get(Release, rel2_id) is None
+            # Canonical rel1 survives
+            db_rel1 = session.get(Release, rel1_id)
+            assert db_rel1 is not None
+            assert db_rel1.variant == "Pink /500"
+            # Both submissions point to rel1
+            links = session.execute(
+                select(SubmissionRelease).where(SubmissionRelease.release_id == rel1_id)
+            ).scalars().all()
+            assert len(links) == 2
+
+
+class TestProcessPendingEnrichment:
+    """Tests for batch/queue processing via process_pending_enrichment."""
+
+    def test_process_pending_enrichment_drains_queue_and_returns_count(
+        self, session_factory
+    ) -> None:
+
+        with session_factory() as session:
+            alb1 = Album(
+                combined_artist="Band A",
+                title="Album A",
+                fingerprint="fp_band_a_alb_a",
+                discogs_status="pending",
+            )
+            alb2 = Album(
+                combined_artist="Band B",
+                title="Album B",
+                fingerprint="fp_band_b_alb_b",
+                discogs_status="pending",
+            )
+            session.add_all([alb1, alb2])
+            session.commit()
+            alb1_id = alb1.id
+            alb2_id = alb2.id
+
+        mock_discogs = MagicMock(spec=DiscogsClient)
+        mock_discogs.search.return_value = []  # Unmatched -> not_found
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=mock_discogs,
+        )
+
+        with patch("reddit_scrape.enrichment.search_web_for_release", return_value=[]):
+            count = service.process_pending_enrichment()
+
+        assert count == 2
+
+        with session_factory() as session:
+            # Both should now be not_found (since search returned 0 results)
+            statuses = session.execute(
+                select(Album.discogs_status).where(Album.id.in_([alb1_id, alb2_id]))
+            ).scalars().all()
+            assert set(statuses) == {"not_found"}
+
+    def test_process_pending_enrichment_respects_limit(
+        self, session_factory
+    ) -> None:
+        with session_factory() as session:
+            alb1 = Album(
+                combined_artist="Band C",
+                title="Album C",
+                fingerprint="fp_band_c_alb_c",
+                discogs_status="pending",
+            )
+            alb2 = Album(
+                combined_artist="Band D",
+                title="Album D",
+                fingerprint="fp_band_d_alb_d",
+                discogs_status="pending",
+            )
+            session.add_all([alb1, alb2])
+            session.commit()
+
+        mock_discogs = MagicMock(spec=DiscogsClient)
+        mock_discogs.search.return_value = []
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=mock_discogs,
+        )
+
+        with patch("reddit_scrape.enrichment.search_web_for_release", return_value=[]):
+            count = service.process_pending_enrichment(limit=1)
+
+        assert count == 1
+
+
+
+
+
+
+
 
 
 

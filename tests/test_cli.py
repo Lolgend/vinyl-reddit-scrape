@@ -182,3 +182,36 @@ class TestCliBatchSizeAndVerbosity:
             thinking_level="none",
             llm_batch_size=8,
         )
+
+    @patch("reddit_scrape.cli.validate_environment")
+    @patch("reddit_scrape.cli.PollerService")
+    @patch("reddit_scrape.cli.init_db")
+    def test_cli_run_once_prints_enriched_count(
+        self, mock_init_db, mock_poller_cls, mock_validate_env, capsys
+    ):
+        mock_validate_env.return_value = ServiceConfig(
+            reddit_client_id="id",
+            reddit_client_secret="sec",
+            database_url="postgresql+psycopg://db",
+            deepseek_api_key="key",
+            llm_batch_size=5,
+        )
+        mock_service = MagicMock()
+        mock_service.run_once.return_value = CycleStats(
+            new_stats=MagicMock(inserted=2, updated=1),
+            hot_stats=MagicMock(inserted=0, updated=3),
+            extracted_count=4,
+            enriched_count=5,
+        )
+        mock_poller_cls.return_value = mock_service
+
+        exit_code = main(["run", "--once"])
+        assert exit_code == 0
+        captured = capsys.readouterr()
+        assert "new_inserted=2" in captured.out
+        assert "new_updated=1" in captured.out
+        assert "hot_inserted=0" in captured.out
+        assert "hot_updated=3" in captured.out
+        assert "extracted=4" in captured.out
+        assert "enriched=5" in captured.out
+
