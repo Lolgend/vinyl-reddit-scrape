@@ -11,15 +11,17 @@ import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, cast
 
+import httpx
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, literal, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from reddit_scrape.discogs import (
@@ -88,6 +90,26 @@ Rules:
 """
 
 
+WEB_RECONCILIATION_SYSTEM_PROMPT = """You are an expert discography classifier and catalog reconciliation agent.
+Your task is to evaluate native web search results for a music release (album, EP, single) not yet indexed on Discogs and produce clean, standardized canonical catalog metadata.
+
+Rules:
+1. Canonical Combined Artist & Constituent Artists:
+   - Identify the primary performing artist(s) from the search results.
+   - Separate individual constituent artists in `canonical_artists` (e.g. ['Converge', 'Chelsea Wolfe']).
+   - Produce the standardized `canonical_combined_artist` billing (e.g. 'Converge & Chelsea Wolfe', 'Dropdead / Converge', or single artist 'Kendrick Lamar').
+   - Standardize official capitalization, diacritics, and official artist spelling.
+
+2. Canonical Album Title:
+   - Extract the official canonical work title (e.g. 'Jane Doe', 'GNX', 'Untitled 2027 Studio LP').
+   - Strictly strip retailer, colorway, vinyl pressing weight, run numbering, and packaging descriptors (e.g. '(Target Exclusive Opaque Gold)', '(2LP Gatefold 180g Black)').
+   - Preserve integral subtitles or volume numbers (e.g. 'Bloodmoon: I').
+
+3. Fallback Integrity:
+   - If the search results are ambiguous or tangential, favor the extracted artist and title names while cleaning obvious promotional noise.
+"""
+
+
 class CandidateArbiterResult(BaseModel):
     """Structured LLM evaluation of Discogs search candidates."""
 
@@ -133,6 +155,36 @@ class WorkReconciliationResult(BaseModel):
         None,
         description="Brief explanation of homonym stripping and billing reconstruction decisions.",
     )
+
+
+class WebReconciliationResult(BaseModel):
+    """Structured LLM reconciliation of web search results for unindexed releases."""
+
+    canonical_combined_artist: str = Field(
+        description="Standardized canonical combined artist billing."
+    )
+    canonical_artists: list[str] = Field(
+        description="Standardized canonical individual constituent artist names."
+    )
+    canonical_album_title: str = Field(
+        description="Standardized canonical musical work / album title."
+    )
+    reasoning: str | None = Field(
+        default=None,
+        description="Brief explanation of canonicalization decisions.",
+    )
+
+
+@dataclass
+class WebSearchHit:
+    """A web search hit returned by DeepSeek native web search tool (POST /v1/tools/search)."""
+
+    title: str
+    url: str
+    summary: str = ""
+    snippet: str = ""
+    content: str = ""
+    rerank_score: float | None = None
 
 
 @dataclass
@@ -208,8 +260,8 @@ class EnrichedArtistData:
 
     artist_id: uuid.UUID | None
     name: str
-    discogs_artist_id: int
     embedding: list[float]
+    discogs_artist_id: int | None = None
 
 
 @dataclass
@@ -331,6 +383,84 @@ def score_candidates(
             )
         )
     return scored
+
+
+def search_web_for_release(
+    query: str,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    http_client: httpx.Client | None = None,
+) -> list[WebSearchHit]:
+    """Execute a native web search call to POST {deepseek_base_url}/v1/tools/search.
+
+    Sends:
+        {"query": query[:128], "count": 10, "need_content": True}
+    Returns search hits ordered by rerank_score descending.
+    Gracefully returns an empty list on HTTP errors or network failures.
+    """
+    key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY")
+    if not key:
+        logger.warning("No DeepSeek API key found; skipping native web search")
+        return []
+
+    raw_url = base_url or os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com"
+    endpoint = f"{raw_url.rstrip('/')}/v1/tools/search"
+
+    truncated_query = query[:128]
+    payload: dict[str, Any] = {
+        "query": truncated_query,
+        "count": 10,
+        "need_content": True,
+    }
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+    client = http_client or httpx.Client(timeout=30.0)
+    close_client = http_client is None
+
+    try:
+        response = client.post(endpoint, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("DeepSeek web search call failed for query '%s': %s", truncated_query, exc)
+        return []
+    finally:
+        if close_client:
+            client.close()
+
+    raw_hits: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        raw_hits = data
+    elif isinstance(data, dict):
+        for key_name in ("results", "data", "hits"):
+            candidate_list = data.get(key_name)
+            if isinstance(candidate_list, list):
+                raw_hits = candidate_list
+                break
+
+    hits: list[WebSearchHit] = []
+    for raw in raw_hits:
+        if not isinstance(raw, dict):
+            continue
+        score_val = raw.get("rerank_score") or raw.get("score")
+        rerank_score = float(score_val) if score_val is not None else None
+        hits.append(
+            WebSearchHit(
+                title=str(raw.get("title") or raw.get("name") or "").strip(),
+                url=str(raw.get("url") or raw.get("link") or "").strip(),
+                summary=str(raw.get("summary") or "").strip(),
+                snippet=str(raw.get("snippet") or "").strip(),
+                content=str(raw.get("content") or raw.get("text") or "").strip(),
+                rerank_score=rerank_score,
+            )
+        )
+
+    # Order by rerank_score descending (None treated as lowest)
+    hits.sort(key=lambda h: (h.rerank_score is not None, h.rerank_score or -float("inf")), reverse=True)
+    return hits
 
 
 def build_work_arbiter_prompt(
@@ -556,6 +686,118 @@ def reconcile_artist_homonyms(
     agent = disambiguation_agent or create_homonym_disambiguation_agent()
     prompt = build_homonym_disambiguation_prompt(detail)
     return cast(WorkReconciliationResult, _run_agent_sync(agent, prompt))
+
+
+def build_web_reconciliation_prompt(
+    combined_artist: str,
+    album_title: str,
+    hits: Sequence[WebSearchHit],
+    max_content_chars_per_hit: int = 1000,
+) -> str:
+    """Build LLM user prompt for web search reconciliation."""
+    lines = [
+        "Target Extracted Release:",
+        f"- Combined Artist: {combined_artist}",
+        f"- Album Title: {album_title}",
+        "",
+        "Web Search Hits (ordered by rerank score):",
+    ]
+    if not hits:
+        lines.append("No web search hits returned.")
+    else:
+        for idx, hit in enumerate(hits, start=1):
+            score_str = f"{hit.rerank_score:.4f}" if hit.rerank_score is not None else "N/A"
+            content_excerpt = hit.content[:max_content_chars_per_hit].strip() if hit.content else ""
+            lines.append(
+                f"{idx}. Title: {hit.title}\n"
+                f"   URL: {hit.url}\n"
+                f"   Rerank Score: {score_str}\n"
+                f"   Summary: {hit.summary}\n"
+                f"   Snippet: {hit.snippet}\n"
+                f"   Content Excerpt: {content_excerpt}"
+            )
+    return "\n".join(lines)
+
+
+def create_web_reconciliation_agent(
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model_name: str | None = None,
+    thinking_level: str | None = None,
+    model: Any = None,
+) -> Agent[None, WebReconciliationResult]:
+    """Create a PydanticAI Agent configured for web search reconciliation."""
+    if model is not None:
+        return Agent(
+            model,
+            output_type=WebReconciliationResult,
+            system_prompt=WEB_RECONCILIATION_SYSTEM_PROMPT,
+        )
+
+    key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY")
+    if not key:
+        raise ValueError(
+            "DEEPSEEK_API_KEY or DEEPSEEK_KEY environment variable is required"
+        )
+    url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    model_str = model_name or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
+
+    level = thinking_level or os.getenv("LLM_THINKING_LEVEL")
+    if not level:
+        level = get_default_thinking_level(model_str)
+
+    model_settings: ModelSettings
+    if level.lower() == "none":
+        model_settings = {"thinking": False}
+    else:
+        model_settings = {"thinking": cast(Any, level.lower())}
+
+    provider = OpenAIProvider(base_url=url, api_key=key)
+    chat_model = OpenAIChatModel(model_str, provider=provider)
+
+    return Agent(
+        chat_model,
+        output_type=WebReconciliationResult,
+        system_prompt=WEB_RECONCILIATION_SYSTEM_PROMPT,
+        model_settings=model_settings,
+    )
+
+
+def reconcile_web_search(
+    combined_artist: str,
+    album_title: str,
+    hits: Sequence[WebSearchHit],
+    web_agent: Agent[None, WebReconciliationResult] | None = None,
+) -> WebReconciliationResult:
+    """Pass web search results through LLM to standardize canonical artist/album names.
+
+    Gracefully falls back to extracted names if hits is empty or agent execution errors.
+    """
+    fallback = WebReconciliationResult(
+        canonical_combined_artist=combined_artist,
+        canonical_artists=[combined_artist],
+        canonical_album_title=album_title,
+        reasoning="Fallback to Pass 1 extracted names (0 search hits or error)",
+    )
+    if not hits:
+        return fallback
+
+    agent = web_agent or create_web_reconciliation_agent()
+    prompt = build_web_reconciliation_prompt(
+        combined_artist=combined_artist,
+        album_title=album_title,
+        hits=hits,
+    )
+    try:
+        return cast(WebReconciliationResult, _run_agent_sync(agent, prompt))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Web search reconciliation agent failed for '%s - %s': %s. Retaining extracted names.",
+            combined_artist,
+            album_title,
+            exc,
+        )
+        return fallback
 
 
 def arbitrate_work_candidates(
@@ -888,6 +1130,73 @@ def _clean_homonym_suffix(name: str) -> str:
     return re.sub(r"\s+\(\d+\)$", "", name).strip()
 
 
+def get_next_queued_album(
+    session: Session,
+    now: datetime | None = None,
+) -> Album | None:
+    """Query the next eligible Album from partial index idx_albums_enrichment_queue.
+
+    Priority levels:
+    - P0 ('pending'): discogs_status = 'pending'
+    - P1 ('failed'): discogs_status = 'failed' AND enrichment_attempts < 5
+                    AND (last_enriched_at IS NULL OR last_enriched_at <= now - (5m * 2^(enrichment_attempts - 1)))
+    - P2 ('partial_matched'): discogs_status = 'partial_matched'
+                             AND (last_enriched_at IS NULL OR last_enriched_at <= now - 7 days)
+                             AND created_at >= now - 60 days
+
+    Ordering:
+    CASE discogs_status WHEN 'pending' THEN 0 WHEN 'failed' THEN 1 WHEN 'partial_matched' THEN 2 ELSE 9 END ASC,
+    created_at ASC,
+    last_enriched_at ASC NULLS FIRST
+    """
+    now_expr = literal(now) if now is not None else func.now()
+
+    p0_cond = Album.discogs_status == "pending"
+
+    p1_cond = and_(
+        Album.discogs_status == "failed",
+        Album.enrichment_attempts < 5,
+        or_(
+            Album.last_enriched_at.is_(None),
+            Album.last_enriched_at
+            <= now_expr
+            - (
+                text("interval '5 minutes'")
+                * func.power(2, Album.enrichment_attempts - 1)
+            ),
+        ),
+    )
+
+    p2_cond = and_(
+        Album.discogs_status == "partial_matched",
+        or_(
+            Album.last_enriched_at.is_(None),
+            Album.last_enriched_at <= now_expr - text("interval '7 days'"),
+        ),
+        Album.created_at >= now_expr - text("interval '60 days'"),
+    )
+
+    priority_case = case(
+        (Album.discogs_status == "pending", 0),
+        (Album.discogs_status == "failed", 1),
+        (Album.discogs_status == "partial_matched", 2),
+        else_=9,
+    )
+
+    stmt = (
+        select(Album)
+        .where(or_(p0_cond, p1_cond, p2_cond))
+        .order_by(
+            priority_case.asc(),
+            Album.created_at.asc(),
+            Album.last_enriched_at.asc().nulls_first(),
+        )
+        .limit(1)
+    )
+
+    return session.execute(stmt).scalars().first()
+
+
 class CatalogEnrichmentService:
     """Orchestrates multi-phase detached Discogs catalog enrichment."""
 
@@ -897,11 +1206,50 @@ class CatalogEnrichmentService:
         discogs_client: DiscogsClient,
         arbiter_agent: Agent[None, CandidateArbiterResult] | None = None,
         disambiguation_agent: Agent[None, WorkReconciliationResult] | None = None,
+        web_agent: Agent[None, WebReconciliationResult] | None = None,
+        deepseek_api_key: str | None = None,
+        deepseek_base_url: str | None = None,
+        deepseek_http_client: httpx.Client | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.discogs_client = discogs_client
         self.arbiter_agent = arbiter_agent
         self.disambiguation_agent = disambiguation_agent
+        self.web_agent = web_agent
+        self.deepseek_api_key = deepseek_api_key
+        self.deepseek_base_url = deepseek_base_url
+        self.deepseek_http_client = deepseek_http_client
+
+    def fetch_next_queued_album(self, now: datetime | None = None) -> PendingAlbumData | None:
+        """Query the next eligible album from the queue and return its metadata in a short read session."""
+        with self.session_factory() as session:
+            album = get_next_queued_album(session, now=now)
+            if album is None:
+                return None
+            album_id = album.id
+            stmt = (
+                select(Artist)
+                .join(AlbumArtist, AlbumArtist.artist_id == Artist.id)
+                .where(AlbumArtist.album_id == album_id)
+                .order_by(AlbumArtist.created_at)
+            )
+            artists = session.execute(stmt).scalars().all()
+            artist_items = [
+                PendingConstituentArtist(
+                    id=cast(uuid.UUID, a.id),
+                    name=str(a.name),
+                    discogs_artist_id=cast("int | None", a.discogs_artist_id),
+                )
+                for a in artists
+            ]
+            return PendingAlbumData(
+                id=cast(uuid.UUID, album.id),
+                combined_artist=str(album.combined_artist),
+                title=str(album.title),
+                fingerprint=str(album.fingerprint),
+                discogs_status=str(album.discogs_status),
+                artists=artist_items,
+            )
 
     def fetch_pending_album(self, album_id: uuid.UUID | str | Any) -> PendingAlbumData | None:
         """Phase 1: Fetch pending album and its constituent artists in a short read session."""
@@ -1027,7 +1375,121 @@ class CatalogEnrichmentService:
                 reasoning=reconciled.reasoning,
             )
 
-        return None
+        # Line 3 DeepSeek Native Web Search Fallback (Tiers 1-4 unmatched)
+        has_discogs_artist = any(
+            a.discogs_artist_id is not None and a.discogs_artist_id > 0
+            for a in pending.artists
+        ) or any(
+            m.discogs_artist_id > 0 for m in cascade_result.artist_matches.values()
+        )
+        target_status = "partial_matched" if has_discogs_artist else "not_found"
+
+        search_query = f"{pending.combined_artist} {pending.title} vinyl album"
+        hits = search_web_for_release(
+            query=search_query,
+            api_key=self.deepseek_api_key,
+            base_url=self.deepseek_base_url,
+            http_client=self.deepseek_http_client,
+        )
+
+        web_reconciled = reconcile_web_search(
+            combined_artist=pending.combined_artist,
+            album_title=pending.title,
+            hits=hits,
+            web_agent=self.web_agent,
+        )
+
+        web_combined = web_reconciled.canonical_combined_artist
+        web_title = web_reconciled.canonical_album_title
+        web_artist_names: list[str] = (
+            web_reconciled.canonical_artists or [pending.combined_artist]
+        )
+
+        web_album_text = compute_album_text(web_combined, web_title)
+        web_artist_texts = [compute_artist_text(name) for name in web_artist_names]
+        web_all_texts = [web_album_text] + web_artist_texts
+        web_vectors = embed_texts(web_all_texts)
+        web_album_vec = web_vectors[0]
+        web_artist_vecs = web_vectors[1:]
+
+        web_fp = compute_album_fingerprint(web_combined, web_title)
+
+        web_enriched_artists: list[EnrichedArtistData] = []
+        remaining_pending = list(pending.artists)
+        total_canonical = len(web_artist_names)
+
+        for idx, (art_name, vec) in enumerate(zip(web_artist_names, web_artist_vecs)):
+            norm_ca = normalize_attribute(art_name)
+            norm_ca_clean = normalize_attribute(_clean_homonym_suffix(art_name))
+
+            matched_pending = next(
+                (p for p in remaining_pending if normalize_attribute(p.name) == norm_ca),
+                None,
+            )
+            if matched_pending is None:
+                matched_pending = next(
+                    (
+                        p
+                        for p in remaining_pending
+                        if normalize_attribute(_clean_homonym_suffix(p.name)) == norm_ca_clean
+                    ),
+                    None,
+                )
+            if (
+                matched_pending is None
+                and len(remaining_pending) == (total_canonical - idx)
+                or matched_pending is None
+                and len(remaining_pending) == 1
+            ):
+                matched_pending = remaining_pending[0]
+
+            if matched_pending is not None:
+                remaining_pending.remove(matched_pending)
+                p_id = matched_pending.id
+                discogs_id = matched_pending.discogs_artist_id
+                if discogs_id is None and matched_pending.name in cascade_result.artist_matches:
+                    discogs_id = cascade_result.artist_matches[matched_pending.name].discogs_artist_id
+            else:
+                p_id = None
+                discogs_id = None
+                if art_name in cascade_result.artist_matches:
+                    discogs_id = cascade_result.artist_matches[art_name].discogs_artist_id
+
+            web_enriched_artists.append(
+                EnrichedArtistData(
+                    artist_id=p_id,
+                    name=art_name,
+                    discogs_artist_id=discogs_id,
+                    embedding=vec,
+                )
+            )
+
+        for p in remaining_pending:
+            p_vec = embed_texts([compute_artist_text(p.name)])[0]
+            discogs_id = p.discogs_artist_id
+            if discogs_id is None and p.name in cascade_result.artist_matches:
+                discogs_id = cascade_result.artist_matches[p.name].discogs_artist_id
+            web_enriched_artists.append(
+                EnrichedArtistData(
+                    artist_id=p.id,
+                    name=p.name,
+                    discogs_artist_id=discogs_id,
+                    embedding=p_vec,
+                )
+            )
+
+        return EnrichedAlbumData(
+            album_id=pending.id,
+            combined_artist=web_combined,
+            title=web_title,
+            fingerprint=web_fp,
+            discogs_master_id=None,
+            discogs_release_id=None,
+            discogs_status=target_status,
+            embedding=web_album_vec,
+            artists=web_enriched_artists,
+            reasoning=web_reconciled.reasoning,
+        )
 
     def commit_matched_enrichment(self, enriched: EnrichedAlbumData) -> Album:
         """Phase 3: Update Album and constituent Artists in a short write session."""
@@ -1052,13 +1514,16 @@ class CatalogEnrichmentService:
                     artist = session.get(Artist, art_data.artist_id)
                     if artist is not None:
                         artist.name = art_data.name
-                        artist.discogs_artist_id = art_data.discogs_artist_id
+                        if art_data.discogs_artist_id is not None:
+                            artist.discogs_artist_id = art_data.discogs_artist_id
                         artist.embedding = art_data.embedding
                 else:
+                    where_clauses = [Artist.name == art_data.name]
+                    if art_data.discogs_artist_id is not None:
+                        where_clauses.append(Artist.discogs_artist_id == art_data.discogs_artist_id)
                     existing_art = session.execute(
                         select(Artist).where(
-                            (Artist.discogs_artist_id == art_data.discogs_artist_id)
-                            | (Artist.name == art_data.name)
+                            where_clauses[0] if len(where_clauses) == 1 else (where_clauses[0] | where_clauses[1])
                         )
                     ).scalar_one_or_none()
                     if existing_art is None:
@@ -1072,7 +1537,8 @@ class CatalogEnrichmentService:
                         target_art_id = new_art.id
                     else:
                         existing_art.name = art_data.name
-                        existing_art.discogs_artist_id = art_data.discogs_artist_id
+                        if art_data.discogs_artist_id is not None:
+                            existing_art.discogs_artist_id = art_data.discogs_artist_id
                         existing_art.embedding = art_data.embedding
                         target_art_id = existing_art.id
 
@@ -1090,17 +1556,59 @@ class CatalogEnrichmentService:
             session.expunge(album)
             return album
 
-    def enrich_album(self, album_id: uuid.UUID | str | Any) -> Album | None:
+    commit_enrichment = commit_matched_enrichment
+
+    def record_failure(
+        self,
+        album_id: uuid.UUID | str | Any,
+        error: str | Exception,
+    ) -> None:
+        """Record an unhandled enrichment failure in a short write transaction."""
+        record_enrichment_failure(
+            session_factory=self.session_factory,
+            album_id=album_id,
+            error=error,
+        )
+
+    def enrich_album(
+        self,
+        album_id: uuid.UUID | str | Any,
+        raise_on_error: bool = False,
+    ) -> Album | None:
         """Execute Phase 1, Phase 2, and Phase 3 detached enrichment for a single album."""
         pending = self.fetch_pending_album(album_id)
         if pending is None:
             return None
 
-        enriched = self.execute_detached_enrichment(pending)
-        if enriched is not None:
-            return self.commit_matched_enrichment(enriched)
+        try:
+            enriched = self.execute_detached_enrichment(pending)
+            if enriched is not None:
+                return self.commit_matched_enrichment(enriched)
+            return None
+        except Exception as exc:
+            logger.exception("Enrichment failed for album %s", album_id)
+            self.record_failure(album_id, exc)
+            if raise_on_error:
+                raise
+            return None
 
-        return None
+
+def record_enrichment_failure(
+    session_factory: sessionmaker[Session] | Any,
+    album_id: uuid.UUID | str | Any,
+    error: str | Exception,
+) -> None:
+    """Record an unhandled enrichment failure in a short write transaction."""
+    uid = uuid.UUID(str(album_id)) if not isinstance(album_id, uuid.UUID) else album_id
+    error_msg = str(error)
+    with session_factory() as session:
+        album = session.get(Album, uid)
+        if album is not None:
+            album.discogs_status = "failed"
+            album.enrichment_attempts = (album.enrichment_attempts or 0) + 1
+            album.last_enriched_at = func.now()
+            album.enrichment_error = error_msg
+            session.commit()
 
 
 def enrich_album(
@@ -1109,6 +1617,11 @@ def enrich_album(
     discogs_client: DiscogsClient,
     arbiter_agent: Agent[None, CandidateArbiterResult] | None = None,
     disambiguation_agent: Agent[None, WorkReconciliationResult] | None = None,
+    web_agent: Agent[None, WebReconciliationResult] | None = None,
+    deepseek_api_key: str | None = None,
+    deepseek_base_url: str | None = None,
+    deepseek_http_client: httpx.Client | None = None,
+    raise_on_error: bool = False,
 ) -> Album | None:
     """Convenience helper to enrich a single album using CatalogEnrichmentService."""
     service = CatalogEnrichmentService(
@@ -1116,13 +1629,18 @@ def enrich_album(
         discogs_client=discogs_client,
         arbiter_agent=arbiter_agent,
         disambiguation_agent=disambiguation_agent,
+        web_agent=web_agent,
+        deepseek_api_key=deepseek_api_key,
+        deepseek_base_url=deepseek_base_url,
+        deepseek_http_client=deepseek_http_client,
     )
-    return service.enrich_album(album_id)
+    return service.enrich_album(album_id, raise_on_error=raise_on_error)
 
 
 __all__ = [
     "CANDIDATE_ARBITER_SYSTEM_PROMPT",
     "HOMONYM_DISAMBIGUATION_SYSTEM_PROMPT",
+    "WEB_RECONCILIATION_SYSTEM_PROMPT",
     "CandidateArbiterResult",
     "CanonicalArtistCredit",
     "CascadeResult",
@@ -1136,22 +1654,30 @@ __all__ = [
     "ResolvedArtistMatch",
     "ResolvedWorkMatch",
     "ScoredCandidate",
+    "WebReconciliationResult",
+    "WebSearchHit",
     "WorkReconciliationResult",
     "arbitrate_artist_candidates",
     "arbitrate_work_candidates",
     "build_artist_arbiter_prompt",
     "build_homonym_disambiguation_prompt",
+    "build_web_reconciliation_prompt",
     "build_work_arbiter_prompt",
     "compute_cosine_similarity",
     "create_candidate_arbiter_agent",
     "create_homonym_disambiguation_agent",
+    "create_web_reconciliation_agent",
     "deduplicate_candidates",
     "enrich_album",
+    "get_next_queued_album",
     "hydrate_work_detail",
     "reconcile_artist_homonyms",
+    "reconcile_web_search",
     "reconstruct_combined_artist",
+    "record_enrichment_failure",
     "run_discogs_search_cascade",
     "score_candidates",
+    "search_web_for_release",
 ]
 
 

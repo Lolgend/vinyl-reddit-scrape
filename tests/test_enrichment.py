@@ -2,18 +2,42 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Any
+from unittest.mock import MagicMock
+
+import httpx
 import pytest
+from pydantic_ai.models.test import TestModel
 from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
 from reddit_scrape.db import get_engine, init_db
-from reddit_scrape.discogs import DiscogsSearchCandidate
-from reddit_scrape.enrichment import (
-    ScoredCandidate,
-    compute_cosine_similarity,
-    deduplicate_candidates,
-    score_candidates,
+from reddit_scrape.discogs import (
+    DiscogsAPIError,
+    DiscogsClient,
+    DiscogsSearchCandidate,
 )
+from reddit_scrape.enrichment import (
+    WEB_RECONCILIATION_SYSTEM_PROMPT,
+    CatalogEnrichmentService,
+    ScoredCandidate,
+    WebReconciliationResult,
+    WebSearchHit,
+    build_web_reconciliation_prompt,
+    compute_cosine_similarity,
+    create_candidate_arbiter_agent,
+    create_web_reconciliation_agent,
+    deduplicate_candidates,
+    get_next_queued_album,
+    reconcile_web_search,
+    record_enrichment_failure,
+    score_candidates,
+    search_web_for_release,
+)
+from reddit_scrape.models import Album, AlbumArtist, Artist
+from reddit_scrape.persistence import compute_album_fingerprint
 
 
 @pytest.fixture(scope="session")
@@ -1478,6 +1502,787 @@ class TestDetachedEnrichmentWriteBack:
             assert a2.discogs_artist_id == 222
             assert a2.embedding is not None
             assert len(a2.embedding) == EMBEDDING_DIM
+
+
+class TestWebSearchTool:
+    """Tests for Line 3 DeepSeek native Web Search fallback tool (POST /v1/tools/search)."""
+
+    def test_search_web_truncates_query_and_sends_required_payload(self) -> None:
+        long_query = "A" * 150 + " vinyl album"
+        expected_query = long_query[:128]
+
+        captured_request: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_request["url"] = str(request.url)
+            captured_request["headers"] = dict(request.headers)
+            captured_request["json"] = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "title": "Kendrick Lamar - Untitled Album",
+                            "url": "https://pitchfork.com/reviews/kendrick",
+                            "summary": "Pitchfork review of the upcoming vinyl LP",
+                            "snippet": "Kendrick Lamar announces upcoming 2027 vinyl release.",
+                            "content": "Full article text detailing Kendrick Lamar's new work.",
+                            "rerank_score": 0.94,
+                        }
+                    ]
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport)
+
+        hits = search_web_for_release(
+            query=long_query,
+            api_key="sk-test-deepseek-key",
+            base_url="https://api.deepseek.com",
+            http_client=client,
+        )
+
+        assert captured_request["url"] == "https://api.deepseek.com/v1/tools/search"
+        assert captured_request["headers"]["authorization"] == "Bearer sk-test-deepseek-key"
+        assert captured_request["json"] == {
+            "query": expected_query,
+            "count": 10,
+            "need_content": True,
+        }
+        assert len(hits) == 1
+        assert hits[0].title == "Kendrick Lamar - Untitled Album"
+        assert hits[0].rerank_score == 0.94
+        assert hits[0].url == "https://pitchfork.com/reviews/kendrick"
+
+    def test_search_web_orders_hits_by_rerank_score_descending(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"title": "Low Score Hit", "url": "https://example.com/1", "rerank_score": 0.45},
+                        {"title": "High Score Hit", "url": "https://example.com/2", "rerank_score": 0.98},
+                        {"title": "Mid Score Hit", "url": "https://example.com/3", "rerank_score": 0.72},
+                    ]
+                },
+            )
+
+        transport = httpx.MockTransport(handler)
+        client = httpx.Client(transport=transport)
+
+        hits = search_web_for_release(
+            query="Converge Jane Doe vinyl",
+            api_key="sk-test",
+            base_url="https://api.deepseek.com",
+            http_client=client,
+        )
+
+        assert len(hits) == 3
+        assert [h.title for h in hits] == ["High Score Hit", "Mid Score Hit", "Low Score Hit"]
+        assert [h.rerank_score for h in hits] == [0.98, 0.72, 0.45]
+
+    def test_search_web_gracefully_handles_http_error_or_network_failure(self) -> None:
+        def error_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="Internal Server Error")
+
+        transport = httpx.MockTransport(error_handler)
+        client = httpx.Client(transport=transport)
+
+        hits = search_web_for_release(
+            query="Failing Query",
+            api_key="sk-test",
+            http_client=client,
+        )
+        assert hits == []
+
+
+class TestWebReconciliationAgent:
+    """Tests for DeepSeek PydanticAI web search reconciliation agent and prompts."""
+
+    def test_web_reconciliation_prompt_and_schema_definitions(self) -> None:
+        assert "canonical" in WEB_RECONCILIATION_SYSTEM_PROMPT.lower()
+        assert "strip" in WEB_RECONCILIATION_SYSTEM_PROMPT.lower()
+        res = WebReconciliationResult(
+            canonical_combined_artist="A",
+            canonical_artists=["A"],
+            canonical_album_title="B",
+        )
+        assert res.canonical_combined_artist == "A"
+
+    def test_build_web_reconciliation_prompt_formats_hits_and_bounds_content(self) -> None:
+        hits = [
+            WebSearchHit(
+                title="Review: Kendrick Lamar - GNX",
+                url="https://pitchfork.com/reviews/albums/kendrick-lamar-gnx/",
+                summary="Pitchfork album review",
+                snippet="Kendrick Lamar surprise-releases sixth studio album GNX on vinyl.",
+                content="X" * 3000,
+                rerank_score=0.96,
+            )
+        ]
+
+        prompt = build_web_reconciliation_prompt(
+            combined_artist="Kendrick Lamar",
+            album_title="GNX Vinyl LP",
+            hits=hits,
+        )
+
+        assert "Kendrick Lamar" in prompt
+        assert "GNX Vinyl LP" in prompt
+        assert "Review: Kendrick Lamar - GNX" in prompt
+        assert "https://pitchfork.com/reviews/albums/kendrick-lamar-gnx/" in prompt
+        assert "0.96" in prompt
+        assert "X" * 1500 not in prompt
+
+    def test_reconcile_web_search_with_test_model(self) -> None:
+        hits = [
+            WebSearchHit(
+                title="Kendrick Lamar - GNX Official Announcement",
+                url="https://example.com/gnx",
+                snippet="Official album details for GNX by Kendrick Lamar.",
+                rerank_score=0.99,
+            )
+        ]
+
+        agent = create_web_reconciliation_agent(
+            model=TestModel(
+                custom_output_args={
+                    "canonical_combined_artist": "Kendrick Lamar",
+                    "canonical_artists": ["Kendrick Lamar"],
+                    "canonical_album_title": "GNX",
+                    "reasoning": "Standardized canonical title stripping vinyl descriptor",
+                }
+            )
+        )
+
+        result = reconcile_web_search(
+            combined_artist="Kendrick Lamar",
+            album_title="GNX Vinyl LP",
+            hits=hits,
+            web_agent=agent,
+        )
+
+        assert result.canonical_combined_artist == "Kendrick Lamar"
+        assert result.canonical_artists == ["Kendrick Lamar"]
+        assert result.canonical_album_title == "GNX"
+        assert result.reasoning == "Standardized canonical title stripping vinyl descriptor"
+
+    def test_reconcile_web_search_empty_hits_falls_back_gracefully(self) -> None:
+        result = reconcile_web_search(
+            combined_artist="Brand New Artist",
+            album_title="Debut EP",
+            hits=[],
+            web_agent=None,
+        )
+
+        assert result.canonical_combined_artist == "Brand New Artist"
+        assert result.canonical_artists == ["Brand New Artist"]
+        assert result.canonical_album_title == "Debut EP"
+        assert "Fallback" in (result.reasoning or "")
+
+    def test_reconcile_web_search_handles_llm_exception_gracefully(self) -> None:
+        mock_agent = MagicMock()
+        mock_agent.run_sync.side_effect = RuntimeError("LLM rate limit reached")
+
+        result = reconcile_web_search(
+            combined_artist="Converge & Chelsea Wolfe",
+            album_title="Bloodmoon",
+            hits=[WebSearchHit(title="Search hit", url="https://example.com")],
+            web_agent=mock_agent,
+        )
+
+        assert result.canonical_combined_artist == "Converge & Chelsea Wolfe"
+        assert result.canonical_album_title == "Bloodmoon"
+        assert "Fallback" in (result.reasoning or "")
+
+
+class TestWebSearchEnrichmentStateMachine:
+    """Tests for Line 3 Web Search fallback, state transitions ('partial_matched', 'not_found'), and embedding overwrites."""
+
+    def test_unmatched_work_with_tier5_artist_match_transitions_to_partial_matched(
+        self, session_factory
+    ) -> None:
+        with session_factory() as session:
+            artist = Artist(name="Kendrick Lamar", discogs_artist_id=None)
+            album = Album(
+                combined_artist="Kendrick Lamar",
+                title="Untitled 2027 Studio LP",
+                fingerprint="fp_kendrick_lp",
+                discogs_status="pending",
+                embedding=[0.01] * 384,
+            )
+            session.add_all([artist, album])
+            session.flush()
+            session.add(AlbumArtist(album_id=album.id, artist_id=artist.id))
+            session.commit()
+            album_id = album.id
+            artist_id = artist.id
+
+        mock_discogs = MagicMock(spec=DiscogsClient)
+        def search_side_effect(**kwargs: Any) -> list[DiscogsSearchCandidate]:
+            search_type = kwargs.get("type")
+            if search_type == "artist":
+                return [
+                    DiscogsSearchCandidate(
+                        id=1778977,
+                        type="artist",
+                        title="Kendrick Lamar",
+                    )
+                ]
+            return []
+
+        mock_discogs.search.side_effect = search_side_effect
+
+        arbiter_agent = create_candidate_arbiter_agent(
+            model=TestModel(
+                custom_output_args={
+                    "is_match": True,
+                    "matched_candidate_id": 1778977,
+                    "reasoning": "Tier 5 artist match confirmed",
+                }
+            )
+        )
+
+        def mock_web_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "title": "Kendrick Lamar Announces GNX Studio Album",
+                            "url": "https://example.com/gnx",
+                            "snippet": "Kendrick Lamar reveals canonical title GNX",
+                            "rerank_score": 0.95,
+                        }
+                    ]
+                },
+            )
+
+        web_client = httpx.Client(transport=httpx.MockTransport(mock_web_handler))
+        web_agent = create_web_reconciliation_agent(
+            model=TestModel(
+                custom_output_args={
+                    "canonical_combined_artist": "Kendrick Lamar",
+                    "canonical_artists": ["Kendrick Lamar"],
+                    "canonical_album_title": "GNX",
+                    "reasoning": "Standardized canonical title via web search",
+                }
+            )
+        )
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=mock_discogs,
+            arbiter_agent=arbiter_agent,
+            web_agent=web_agent,
+            deepseek_http_client=web_client,
+        )
+
+        enriched = service.enrich_album(album_id)
+        assert enriched is not None
+        assert enriched.discogs_status == "partial_matched"
+        assert enriched.discogs_master_id is None
+        assert enriched.discogs_release_id is None
+        assert enriched.combined_artist == "Kendrick Lamar"
+        assert enriched.title == "GNX"
+        assert enriched.fingerprint == compute_album_fingerprint("Kendrick Lamar", "GNX")
+        assert len(enriched.embedding) == 384
+
+        with session_factory() as session:
+            db_artist = session.get(Artist, artist_id)
+            assert db_artist is not None
+            assert db_artist.discogs_artist_id == 1778977
+            assert len(db_artist.embedding) == 384
+
+    def test_unmatched_work_with_preexisting_db_artist_discogs_id_transitions_to_partial_matched(
+        self, session_factory
+    ) -> None:
+        with session_factory() as session:
+            artist = Artist(name="Converge", discogs_artist_id=292633)
+            album = Album(
+                combined_artist="Converge",
+                title="Unreleased Tour Split 7-inch",
+                fingerprint="fp_converge_split",
+                discogs_status="pending",
+                embedding=[0.05] * 384,
+            )
+            session.add_all([artist, album])
+            session.flush()
+            session.add(AlbumArtist(album_id=album.id, artist_id=artist.id))
+            session.commit()
+            album_id = album.id
+
+        mock_discogs = MagicMock(spec=DiscogsClient)
+        mock_discogs.search.return_value = []
+
+        def mock_web_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "title": "Converge Unreleased Tour Split Vinyl",
+                            "url": "https://example.com/converge-tour",
+                            "rerank_score": 0.90,
+                        }
+                    ]
+                },
+            )
+
+        web_client = httpx.Client(transport=httpx.MockTransport(mock_web_handler))
+        web_agent = create_web_reconciliation_agent(
+            model=TestModel(
+                custom_output_args={
+                    "canonical_combined_artist": "Converge",
+                    "canonical_artists": ["Converge"],
+                    "canonical_album_title": "Tour Split",
+                    "reasoning": "Standardized title to Tour Split",
+                }
+            )
+        )
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=mock_discogs,
+            web_agent=web_agent,
+            deepseek_http_client=web_client,
+        )
+
+        enriched = service.enrich_album(album_id)
+        assert enriched is not None
+        assert enriched.discogs_status == "partial_matched"
+        assert enriched.discogs_master_id is None
+        assert enriched.combined_artist == "Converge"
+        assert enriched.title == "Tour Split"
+
+    def test_unmatched_work_with_zero_discogs_artist_matches_transitions_to_not_found(
+        self, session_factory
+    ) -> None:
+        with session_factory() as session:
+            artist = Artist(name="Xylophonic Nebula Syndicate", discogs_artist_id=None)
+            album = Album(
+                combined_artist="Xylophonic Nebula Syndicate",
+                title="Quantum Groove Odyssey",
+                fingerprint="fp_xns_qgo",
+                discogs_status="pending",
+                embedding=[0.02] * 384,
+            )
+            session.add_all([artist, album])
+            session.flush()
+            session.add(AlbumArtist(album_id=album.id, artist_id=artist.id))
+            session.commit()
+            album_id = album.id
+            artist_id = artist.id
+
+        mock_discogs = MagicMock(spec=DiscogsClient)
+        mock_discogs.search.return_value = []
+
+        def mock_web_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "title": "Xylophonic Nebula Syndicate - Quantum Groove Odyssey Bandcamp",
+                            "url": "https://xns.bandcamp.com/album/quantum-groove-odyssey",
+                            "rerank_score": 0.91,
+                        }
+                    ]
+                },
+            )
+
+        web_client = httpx.Client(transport=httpx.MockTransport(mock_web_handler))
+        web_agent = create_web_reconciliation_agent(
+            model=TestModel(
+                custom_output_args={
+                    "canonical_combined_artist": "Xylophonic Nebula Syndicate",
+                    "canonical_artists": ["Xylophonic Nebula Syndicate"],
+                    "canonical_album_title": "Quantum Groove Odyssey",
+                    "reasoning": "Bandcamp release canonicalization",
+                }
+            )
+        )
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=mock_discogs,
+            web_agent=web_agent,
+            deepseek_http_client=web_client,
+        )
+
+        enriched = service.enrich_album(album_id)
+        assert enriched is not None
+        assert enriched.discogs_status == "not_found"
+        assert enriched.discogs_master_id is None
+        assert enriched.discogs_release_id is None
+        assert enriched.combined_artist == "Xylophonic Nebula Syndicate"
+        assert enriched.title == "Quantum Groove Odyssey"
+
+        with session_factory() as session:
+            db_artist = session.get(Artist, artist_id)
+            assert db_artist is not None
+            assert db_artist.discogs_artist_id is None
+            assert len(db_artist.embedding) == 384
+
+    def test_web_search_error_falls_back_to_pass_1_names_and_completes(
+        self, session_factory
+    ) -> None:
+        with session_factory() as session:
+            artist = Artist(name="Unknown Indie Act", discogs_artist_id=None)
+            album = Album(
+                combined_artist="Unknown Indie Act",
+                title="Self Titled EP",
+                fingerprint="fp_unknown_act",
+                discogs_status="pending",
+                embedding=[0.01] * 384,
+            )
+            session.add_all([artist, album])
+            session.flush()
+            session.add(AlbumArtist(album_id=album.id, artist_id=artist.id))
+            session.commit()
+            album_id = album.id
+
+        mock_discogs = MagicMock(spec=DiscogsClient)
+        mock_discogs.search.return_value = []
+
+        def failing_web_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="Internal Server Error")
+
+        web_client = httpx.Client(transport=httpx.MockTransport(failing_web_handler))
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=mock_discogs,
+            deepseek_http_client=web_client,
+        )
+
+        enriched = service.enrich_album(album_id)
+        assert enriched is not None
+        assert enriched.discogs_status == "not_found"
+        assert enriched.combined_artist == "Unknown Indie Act"
+        assert enriched.title == "Self Titled EP"
+        assert len(enriched.embedding) == 384
+
+
+class TestPriorityQueueSelector:
+    """Tests for priority queue selector idx_albums_enrichment_queue and retry state machine."""
+
+    def test_priority_ordering_pending_p0_before_failed_p1_before_partial_matched_p2(
+        self, session_factory
+    ) -> None:
+        now = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+
+        with session_factory() as session:
+            alb_p2 = Album(
+                combined_artist="Artist 2",
+                title="Album Partial",
+                fingerprint="fp_p2",
+                discogs_status="partial_matched",
+                created_at=now - timedelta(days=20),
+                last_enriched_at=now - timedelta(days=8),
+            )
+            alb_p1 = Album(
+                combined_artist="Artist 1",
+                title="Album Failed",
+                fingerprint="fp_p1",
+                discogs_status="failed",
+                enrichment_attempts=1,
+                created_at=now - timedelta(hours=1),
+                last_enriched_at=now - timedelta(minutes=10),
+            )
+            alb_p0 = Album(
+                combined_artist="Artist 0",
+                title="Album Pending",
+                fingerprint="fp_p0",
+                discogs_status="pending",
+                created_at=now - timedelta(minutes=5),
+            )
+            session.add_all([alb_p2, alb_p1, alb_p0])
+            session.commit()
+
+            # P0 must be picked first
+            next_alb = get_next_queued_album(session, now=now)
+            assert next_alb is not None
+            assert next_alb.discogs_status == "pending"
+            assert next_alb.fingerprint == "fp_p0"
+
+            # Transition P0 out of queue
+            next_alb.discogs_status = "matched"  # type: ignore[assignment]
+            session.commit()
+
+            # Next must be P1
+            next_alb = get_next_queued_album(session, now=now)
+            assert next_alb is not None
+            assert next_alb.discogs_status == "failed"
+            assert next_alb.fingerprint == "fp_p1"
+
+            # Transition P1 out of queue
+            next_alb.discogs_status = "matched"  # type: ignore[assignment]
+            session.commit()
+
+            # Next must be P2
+            next_alb = get_next_queued_album(session, now=now)
+            assert next_alb is not None
+            assert next_alb.discogs_status == "partial_matched"
+            assert next_alb.fingerprint == "fp_p2"
+
+    def test_exponential_backoff_for_failed_albums(self, session_factory) -> None:
+        now = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+
+        test_cases = [
+            (1, timedelta(minutes=4), False),  # 4m < 5m backoff -> not due
+            (1, timedelta(minutes=6), True),   # 6m >= 5m backoff -> due
+            (2, timedelta(minutes=8), False),  # 8m < 10m backoff -> not due
+            (2, timedelta(minutes=11), True),  # 11m >= 10m backoff -> due
+            (3, timedelta(minutes=15), False), # 15m < 20m backoff -> not due
+            (3, timedelta(minutes=22), True),  # 22m >= 20m backoff -> due
+            (4, timedelta(minutes=35), False), # 35m < 40m backoff -> not due
+            (4, timedelta(minutes=45), True),  # 45m >= 40m backoff -> due
+        ]
+
+        for attempts, delta, should_be_due in test_cases:
+            with session_factory() as session:
+                alb = Album(
+                    combined_artist="Fail Band",
+                    title=f"Fail {attempts} {delta}",
+                    fingerprint=f"fp_fail_{attempts}_{delta.total_seconds()}",
+                    discogs_status="failed",
+                    enrichment_attempts=attempts,
+                    created_at=now - timedelta(hours=2),
+                    last_enriched_at=now - delta,
+                )
+                session.add(alb)
+                session.commit()
+
+                res = get_next_queued_album(session, now=now)
+                if should_be_due:
+                    assert res is not None, f"Expected due for attempts={attempts}, delta={delta}"
+                    assert res.fingerprint == alb.fingerprint
+                else:
+                    assert res is None, f"Expected NOT due for attempts={attempts}, delta={delta}"
+
+                session.delete(alb)
+                session.commit()
+
+    def test_dead_letter_for_failed_at_5_attempts(self, session_factory) -> None:
+        now = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+
+        with session_factory() as session:
+            alb = Album(
+                combined_artist="Dead Letter Band",
+                title="Dead Letter Album",
+                fingerprint="fp_dead_letter",
+                discogs_status="failed",
+                enrichment_attempts=5,
+                created_at=now - timedelta(days=2),
+                last_enriched_at=now - timedelta(hours=5),
+            )
+            session.add(alb)
+            session.commit()
+
+            assert get_next_queued_album(session, now=now) is None
+
+    def test_partial_matched_cadence_and_age_out(self, session_factory) -> None:
+        now = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+
+        with session_factory() as session:
+            alb1 = Album(
+                combined_artist="Artist PM1",
+                title="Title 1",
+                fingerprint="fp_pm1",
+                discogs_status="partial_matched",
+                created_at=now - timedelta(days=10),
+                last_enriched_at=now - timedelta(days=5),
+            )
+            session.add(alb1)
+            session.commit()
+            assert get_next_queued_album(session, now=now) is None
+            session.delete(alb1)
+            session.commit()
+
+            alb2 = Album(
+                combined_artist="Artist PM2",
+                title="Title 2",
+                fingerprint="fp_pm2",
+                discogs_status="partial_matched",
+                created_at=now - timedelta(days=30),
+                last_enriched_at=now - timedelta(days=8),
+            )
+            session.add(alb2)
+            session.commit()
+            res = get_next_queued_album(session, now=now)
+            assert res is not None
+            assert res.fingerprint == "fp_pm2"
+            session.delete(alb2)
+            session.commit()
+
+            alb3 = Album(
+                combined_artist="Artist PM3",
+                title="Title 3",
+                fingerprint="fp_pm3",
+                discogs_status="partial_matched",
+                created_at=now - timedelta(days=65),
+                last_enriched_at=now - timedelta(days=10),
+            )
+            session.add(alb3)
+            session.commit()
+            assert get_next_queued_album(session, now=now) is None
+
+    def test_matched_and_not_found_albums_not_queued(self, session_factory) -> None:
+        now = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+
+        with session_factory() as session:
+            alb_matched = Album(
+                combined_artist="Matched Band",
+                title="Matched Album",
+                fingerprint="fp_matched",
+                discogs_status="matched",
+                created_at=now - timedelta(days=5),
+                last_enriched_at=now - timedelta(days=5),
+            )
+            alb_not_found = Album(
+                combined_artist="NF Band",
+                title="NF Album",
+                fingerprint="fp_not_found",
+                discogs_status="not_found",
+                created_at=now - timedelta(days=5),
+                last_enriched_at=now - timedelta(days=5),
+            )
+            session.add_all([alb_matched, alb_not_found])
+            session.commit()
+
+            assert get_next_queued_album(session, now=now) is None
+
+
+class TestEnrichmentFailureRecording:
+    """Tests for recording transient and unhandled enrichment failures with exponential backoff."""
+
+    def test_record_failure_sets_status_failed_increments_attempts_and_sets_error(
+        self, session_factory
+    ) -> None:
+        with session_factory() as session:
+            alb = Album(
+                combined_artist="Failure Act",
+                title="Album Crash",
+                fingerprint="fp_crash",
+                discogs_status="pending",
+                enrichment_attempts=0,
+            )
+            session.add(alb)
+            session.commit()
+            alb_id = alb.id
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=MagicMock(spec=DiscogsClient),
+        )
+
+        service.record_failure(alb_id, "Discogs 429 Retry Exhausted")
+
+        with session_factory() as session:
+            db_alb = session.get(Album, alb_id)
+            assert db_alb is not None
+            assert db_alb.discogs_status == "failed"
+            assert db_alb.enrichment_attempts == 1
+            assert db_alb.last_enriched_at is not None
+            assert "Discogs 429" in (db_alb.enrichment_error or "")
+
+    def test_record_failure_increments_consecutive_failures(
+        self, session_factory
+    ) -> None:
+        with session_factory() as session:
+            alb = Album(
+                combined_artist="Repeated Fail Act",
+                title="Album Crash Repeated",
+                fingerprint="fp_crash_rep",
+                discogs_status="failed",
+                enrichment_attempts=2,
+                enrichment_error="Previous error",
+            )
+            session.add(alb)
+            session.commit()
+            alb_id = alb.id
+
+        record_enrichment_failure(
+            session_factory=session_factory,
+            album_id=alb_id,
+            error="Connection timeout to Discogs",
+        )
+
+        with session_factory() as session:
+            db_alb = session.get(Album, alb_id)
+            assert db_alb is not None
+            assert db_alb.discogs_status == "failed"
+            assert db_alb.enrichment_attempts == 3
+            assert "Connection timeout" in (db_alb.enrichment_error or "")
+
+    def test_enrich_album_catches_unhandled_exception_records_failure_and_returns_none(
+        self, session_factory
+    ) -> None:
+        with session_factory() as session:
+            alb = Album(
+                combined_artist="Broken Act",
+                title="Broken Release",
+                fingerprint="fp_broken",
+                discogs_status="pending",
+                enrichment_attempts=0,
+            )
+            session.add(alb)
+            session.commit()
+            alb_id = alb.id
+
+        mock_discogs = MagicMock(spec=DiscogsClient)
+        mock_discogs.search.side_effect = DiscogsAPIError("502 Bad Gateway from Discogs")
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=mock_discogs,
+        )
+
+        res = service.enrich_album(alb_id)
+        assert res is None
+
+        with session_factory() as session:
+            db_alb = session.get(Album, alb_id)
+            assert db_alb is not None
+            assert db_alb.discogs_status == "failed"
+            assert db_alb.enrichment_attempts == 1
+            assert "502 Bad Gateway" in (db_alb.enrichment_error or "")
+
+    def test_enrich_album_with_raise_on_error_records_failure_then_raises(
+        self, session_factory
+    ) -> None:
+        with session_factory() as session:
+            alb = Album(
+                combined_artist="Fatal Act",
+                title="Fatal Release",
+                fingerprint="fp_fatal",
+                discogs_status="pending",
+                enrichment_attempts=0,
+            )
+            session.add(alb)
+            session.commit()
+            alb_id = alb.id
+
+        mock_discogs = MagicMock(spec=DiscogsClient)
+        mock_discogs.search.side_effect = RuntimeError("Fatal LLM quota exhausted")
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=mock_discogs,
+        )
+
+        with pytest.raises(RuntimeError, match="Fatal LLM quota"):
+            service.enrich_album(alb_id, raise_on_error=True)
+
+        with session_factory() as session:
+            db_alb = session.get(Album, alb_id)
+            assert db_alb is not None
+            assert db_alb.discogs_status == "failed"
+            assert db_alb.enrichment_attempts == 1
+            assert "Fatal LLM quota" in (db_alb.enrichment_error or "")
+
 
 
 
