@@ -8,6 +8,18 @@ from reddit_scrape.db import (
     init_db,
     reset_db,
 )
+from reddit_scrape.discogs import (
+    DEFAULT_DISCOGS_BASE_URL,
+    DEFAULT_DISCOGS_USER_AGENT,
+    DEFAULT_RATE_LIMIT_FLOOR_SECONDS,
+    DiscogsAPIError,
+    DiscogsArtistCredit,
+    DiscogsArtistDetail,
+    DiscogsClient,
+    DiscogsMasterDetail,
+    DiscogsReleaseDetail,
+    DiscogsSearchCandidate,
+)
 from reddit_scrape.embeddings import (
     compute_album_text,
     compute_artist_text,
@@ -128,6 +140,17 @@ __all__ = [  # noqa: RUF022
     # Retention
     "get_default_retention_days",
     "purge_snapshots",
+    # Discogs
+    "DEFAULT_DISCOGS_BASE_URL",
+    "DEFAULT_DISCOGS_USER_AGENT",
+    "DEFAULT_RATE_LIMIT_FLOOR_SECONDS",
+    "DiscogsAPIError",
+    "DiscogsArtistCredit",
+    "DiscogsArtistDetail",
+    "DiscogsClient",
+    "DiscogsMasterDetail",
+    "DiscogsReleaseDetail",
+    "DiscogsSearchCandidate",
     # Service
     "CycleStats",
     "PollerService",

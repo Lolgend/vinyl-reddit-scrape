@@ -49,7 +49,11 @@ def engine():
 
 
 @pytest.fixture(autouse=True)
-def clean_db(engine):
+def clean_db(request):
+    if request.cls and request.cls.__name__ == "TestEnvironmentValidation":
+        yield
+        return
+    engine = request.getfixturevalue("engine")
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -72,16 +76,20 @@ def session_factory(engine):
     return sessionmaker(bind=engine)
 
 
+VALID_ENV = {
+    "REDDIT_CLIENT_ID": "mock_client_id",
+    "REDDIT_CLIENT_SECRET": "mock_client_secret",
+    "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+    "DEEPSEEK_API_KEY": "mock_deepseek_key",
+    "DISCOGS_TOKEN": "mock_discogs_token",
+}
+
+
 class TestEnvironmentValidation:
     """Test environment validation and configuration parsing."""
 
     def test_validate_environment_success(self):
-        env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_deepseek_key",
-        }
+        env = dict(VALID_ENV)
         config = validate_environment(env)
         assert isinstance(config, ServiceConfig)
         assert config.reddit_client_id == "mock_client_id"
@@ -91,6 +99,110 @@ class TestEnvironmentValidation:
         assert config.poll_interval_seconds == 300
         assert config.hot_poll_interval_seconds == 900
         assert config.reddit_user_agent == "python:vinyl-releases-scraper:v0.1.0"
+        assert config.discogs_token == "mock_discogs_token"
+        assert config.discogs_user_agent == "VinylReleasesScraper/0.1.0"
+        assert config.enrichment_interval_seconds == 60
+
+    def test_validate_environment_discogs_token_success(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_deepseek_key",
+            "DISCOGS_TOKEN": "test_token_123",
+        }
+        config = validate_environment(env)
+        assert config.discogs_token == "test_token_123"
+        assert config.discogs_consumer_key is None
+        assert config.discogs_consumer_secret is None
+        assert config.discogs_user_agent == "VinylReleasesScraper/0.1.0"
+        assert config.enrichment_interval_seconds == 60
+
+    def test_validate_environment_discogs_key_secret_success(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_deepseek_key",
+            "DISCOGS_CONSUMER_KEY": "test_consumer_key",
+            "DISCOGS_CONSUMER_SECRET": "test_consumer_secret",
+        }
+        config = validate_environment(env)
+        assert config.discogs_token is None
+        assert config.discogs_consumer_key == "test_consumer_key"
+        assert config.discogs_consumer_secret == "test_consumer_secret"
+        assert config.discogs_user_agent == "VinylReleasesScraper/0.1.0"
+        assert config.enrichment_interval_seconds == 60
+
+    def test_validate_environment_discogs_prefers_token_over_key_secret(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_deepseek_key",
+            "DISCOGS_TOKEN": "token_preferred",
+            "DISCOGS_CONSUMER_KEY": "key_secondary",
+            "DISCOGS_CONSUMER_SECRET": "secret_secondary",
+        }
+        config = validate_environment(env)
+        assert config.discogs_token == "token_preferred"
+        assert config.discogs_consumer_key == "key_secondary"
+        assert config.discogs_consumer_secret == "secret_secondary"
+
+    def test_validate_environment_missing_discogs_credentials(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_deepseek_key",
+        }
+        with pytest.raises(ValueError, match="Discogs credentials"):
+            validate_environment(env)
+
+    @pytest.mark.parametrize(
+        "partial_discogs_env",
+        [
+            {"DISCOGS_CONSUMER_KEY": "only_key"},
+            {"DISCOGS_CONSUMER_SECRET": "only_secret"},
+        ],
+    )
+    def test_validate_environment_partial_discogs_key_secret(self, partial_discogs_env):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_deepseek_key",
+            **partial_discogs_env,
+        }
+        with pytest.raises(ValueError, match="Discogs credentials"):
+            validate_environment(env)
+
+    def test_validate_environment_custom_discogs_user_agent(self):
+        env = {
+            **VALID_ENV,
+            "DISCOGS_USER_AGENT": "CustomUserAgent/2.0",
+        }
+        config = validate_environment(env)
+        assert config.discogs_user_agent == "CustomUserAgent/2.0"
+
+    def test_validate_environment_enrichment_interval_valid(self):
+        env = {
+            **VALID_ENV,
+            "ENRICHMENT_INTERVAL_SECONDS": "45",
+        }
+        config = validate_environment(env)
+        assert config.enrichment_interval_seconds == 45
+
+    @pytest.mark.parametrize("invalid_interval", ["0", "-5", "-100", "invalid", "12.5"])
+    def test_validate_environment_enrichment_interval_invalid(self, invalid_interval):
+        env = {
+            **VALID_ENV,
+            "ENRICHMENT_INTERVAL_SECONDS": invalid_interval,
+        }
+        with pytest.raises(
+            ValueError, match="ENRICHMENT_INTERVAL_SECONDS must be a positive integer"
+        ):
+            validate_environment(env)
 
     def test_validate_environment_deepseek_key_alias(self):
         env = {
@@ -98,16 +210,14 @@ class TestEnvironmentValidation:
             "REDDIT_CLIENT_SECRET": "mock_client_secret",
             "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
             "DEEPSEEK_KEY": "mock_deepseek_alias_key",
+            "DISCOGS_TOKEN": "mock_discogs_token",
         }
         config = validate_environment(env)
         assert config.deepseek_api_key == "mock_deepseek_alias_key"
 
     def test_validate_environment_custom_intervals(self):
         env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
+            **VALID_ENV,
             "POLL_INTERVAL_SECONDS": "60",
             "HOT_POLL_INTERVAL_SECONDS": "180",
         }
@@ -116,22 +226,14 @@ class TestEnvironmentValidation:
         assert config.hot_poll_interval_seconds == 180
 
     def test_validate_environment_thinking_level_default(self):
-        env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
-        }
+        env = dict(VALID_ENV)
         config = validate_environment(env)
         # Default for deepseek-chat is none
         assert config.llm_thinking_level == "none"
 
     def test_validate_environment_thinking_level_default_reasoning(self):
         env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
+            **VALID_ENV,
             "DEEPSEEK_MODEL": "deepseek-reasoner",
         }
         config = validate_environment(env)
@@ -154,10 +256,7 @@ class TestEnvironmentValidation:
     )
     def test_validate_environment_thinking_level_valid(self, level, expected):
         env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
+            **VALID_ENV,
             "LLM_THINKING_LEVEL": level,
         }
         config = validate_environment(env)
@@ -166,31 +265,20 @@ class TestEnvironmentValidation:
     @pytest.mark.parametrize("invalid_level", ["ultra", "off", "1", "false", "turbo"])
     def test_validate_environment_thinking_level_invalid(self, invalid_level):
         env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
+            **VALID_ENV,
             "LLM_THINKING_LEVEL": invalid_level,
         }
         with pytest.raises(ValueError, match="Invalid LLM_THINKING_LEVEL"):
             validate_environment(env)
 
     def test_validate_environment_llm_batch_size_default(self):
-        env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
-        }
+        env = dict(VALID_ENV)
         config = validate_environment(env)
         assert config.llm_batch_size == 5
 
     def test_validate_environment_llm_batch_size_custom(self):
         env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
+            **VALID_ENV,
             "LLM_BATCH_SIZE": "10",
         }
         config = validate_environment(env)
@@ -199,10 +287,7 @@ class TestEnvironmentValidation:
     @pytest.mark.parametrize("invalid_size", ["0", "-1", "-10", "abc"])
     def test_validate_environment_llm_batch_size_invalid(self, invalid_size):
         env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
+            **VALID_ENV,
             "LLM_BATCH_SIZE": invalid_size,
         }
         with pytest.raises(ValueError, match="LLM_BATCH_SIZE must be a positive integer"):
@@ -218,12 +303,7 @@ class TestEnvironmentValidation:
         ],
     )
     def test_validate_environment_missing_keys(self, missing_key):
-        env = {
-            "REDDIT_CLIENT_ID": "mock_id",
-            "REDDIT_CLIENT_SECRET": "mock_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
-        }
+        env = dict(VALID_ENV)
         del env[missing_key]
         with pytest.raises(ValueError) as excinfo:
             validate_environment(env)
