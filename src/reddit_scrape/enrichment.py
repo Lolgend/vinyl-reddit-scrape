@@ -7,6 +7,8 @@ import concurrent.futures
 import logging
 import math
 import os
+import re
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -17,14 +19,25 @@ from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, sessionmaker
 
-from reddit_scrape.discogs import DiscogsClient, DiscogsSearchCandidate
+from reddit_scrape.discogs import (
+    DiscogsArtistCredit,
+    DiscogsClient,
+    DiscogsSearchCandidate,
+)
 from reddit_scrape.embeddings import (
     compute_album_text,
     compute_artist_text,
     embed_texts,
 )
 from reddit_scrape.extraction import get_default_thinking_level
+from reddit_scrape.models import Album, AlbumArtist, Artist
+from reddit_scrape.persistence import (
+    compute_album_fingerprint,
+    normalize_attribute,
+)
 
 load_dotenv()
 
@@ -51,6 +64,29 @@ Evaluation Rules:
    - Provide concise `reasoning` explaining your decision.
 """
 
+HOMONYM_DISAMBIGUATION_SYSTEM_PROMPT = """You are an expert discography classifier and catalog reconciliation agent.
+Your task is to take hydrated Discogs work metadata (work title, artists[] credits including id, name, anv, join) and produce clean canonical catalog metadata.
+
+Rules:
+1. Canonical Artist Homonym Disambiguation:
+   - Discogs appends numeric homonym suffixes in parentheses to artist names to distinguish different artists with the same name (e.g., 'Nirvana (2)', 'Blink (3)', 'The Smile (5)', 'Death (2)').
+   - Strip numeric homonym suffixes like '(2)', '(3)' to produce the clean artist name (e.g., 'Nirvana', 'Blink', 'The Smile', 'Death').
+   - PRESERVE legitimate parenthetical or symbolic names that are an integral part of the actual band name (e.g., 'Sunn O)))', 'Someone (Somewhere)'). Never strip non-numeric or legitimate names.
+   - Pair each cleaned canonical artist name with its exact `discogs_artist_id`.
+
+2. Combined Artist Billing Reconstruction:
+   - Reconstruct the official combined artist billing using the `join` delimiters provided in the Discogs artists array.
+   - For example:
+     - Artist 1 'Converge (2)' (join='/') + Artist 2 'Dropdead' -> 'Converge / Dropdead'
+     - Artist 1 'Kanye West' (join='&') + Artist 2 'Ty Dolla $ign' -> 'Kanye West & Ty Dolla $ign'
+     - Artist 1 'Artist A' (join='feat.') + Artist 2 'Artist B' -> 'Artist A feat. Artist B'
+   - If join is empty or missing between multiple artists, default to ' / '.
+   - If there is only one artist, combined_artist is just the cleaned artist name.
+
+3. Canonical Album Title:
+   - Return the official canonical work title from Discogs, cleaning any extraneous whitespace or obvious formatting errors while preserving official punctuation.
+"""
+
 
 class CandidateArbiterResult(BaseModel):
     """Structured LLM evaluation of Discogs search candidates."""
@@ -72,6 +108,33 @@ class CandidateArbiterResult(BaseModel):
     )
 
 
+class CanonicalArtistCredit(BaseModel):
+    """Canonical constituent artist name and Discogs artist ID."""
+
+    discogs_artist_id: int = Field(description="The Discogs artist ID.")
+    name: str = Field(
+        description="Clean canonical artist name, with Discogs numeric homonym suffix (e.g. '(2)') stripped, but legitimate parenthetical names preserved."
+    )
+
+
+class WorkReconciliationResult(BaseModel):
+    """Structured LLM reconciliation of Discogs work title and artist credits."""
+
+    canonical_combined_artist: str = Field(
+        description="Reconstructed combined artist billing using Discogs artists[].join delimiters (e.g. 'Converge / Dropdead', 'Kanye West & Ty Dolla $ign')."
+    )
+    canonical_artists: list[CanonicalArtistCredit] = Field(
+        description="List of canonical artist credits with clean names and discogs_artist_id."
+    )
+    canonical_album_title: str = Field(
+        description="Clean canonical album title from the Discogs work title."
+    )
+    reasoning: str | None = Field(
+        None,
+        description="Brief explanation of homonym stripping and billing reconstruction decisions.",
+    )
+
+
 @dataclass
 class ResolvedWorkMatch:
     """A confirmed musical work match from Tiers 1-4 with resolved master/release IDs."""
@@ -83,6 +146,19 @@ class ResolvedWorkMatch:
     cosine_similarity: float
     search_rank: int
     reasoning: str | None = None
+
+
+@dataclass
+class HydratedWorkDetail:
+    """Detail payload retrieved from a follow-up GET /masters/{id} or GET /releases/{id} call."""
+
+    resolved_master_id: int | None
+    resolved_release_id: int | None
+    title: str
+    artists: list[DiscogsArtistCredit]
+    year: int | None = None
+    genres: list[str] = field(default_factory=list)
+    styles: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -103,6 +179,53 @@ class ConstituentArtistInfo:
 
     name: str
     discogs_artist_id: int | None = None
+
+
+@dataclass
+class PendingConstituentArtist:
+    """Constituent artist retrieved during Phase 1 read."""
+
+    id: uuid.UUID
+    name: str
+    discogs_artist_id: int | None = None
+
+
+@dataclass
+class PendingAlbumData:
+    """Pending album metadata and linked artists retrieved during Phase 1 read."""
+
+    id: uuid.UUID
+    combined_artist: str
+    title: str
+    fingerprint: str
+    discogs_status: str
+    artists: list[PendingConstituentArtist] = field(default_factory=list)
+
+
+@dataclass
+class EnrichedArtistData:
+    """Canonical constituent artist prepared for Phase 3 write."""
+
+    artist_id: uuid.UUID | None
+    name: str
+    discogs_artist_id: int
+    embedding: list[float]
+
+
+@dataclass
+class EnrichedAlbumData:
+    """Canonical album and artists prepared during Phase 2 for Phase 3 commit."""
+
+    album_id: uuid.UUID
+    combined_artist: str
+    title: str
+    fingerprint: str
+    discogs_master_id: int | None
+    discogs_release_id: int | None
+    discogs_status: str
+    embedding: list[float]
+    artists: list[EnrichedArtistData] = field(default_factory=list)
+    reasoning: str | None = None
 
 
 @dataclass
@@ -317,9 +440,9 @@ def create_candidate_arbiter_agent(
     )
 
 
-def _run_arbiter_sync(
-    agent: Agent[None, CandidateArbiterResult], prompt: str
-) -> CandidateArbiterResult:
+def _run_agent_sync(
+    agent: Agent[Any, Any], prompt: str
+) -> Any:
     """Run agent synchronously, handling active or non-active asyncio event loops."""
     try:
         loop = asyncio.get_running_loop()
@@ -331,6 +454,108 @@ def _run_arbiter_sync(
             return executor.submit(asyncio.run, agent.run(prompt)).result().output
     else:
         return agent.run_sync(prompt).output
+
+
+_run_arbiter_sync = _run_agent_sync
+
+
+def reconstruct_combined_artist(
+    artists: Sequence[DiscogsArtistCredit],
+    canonical_names: Sequence[str],
+) -> str:
+    """Reconstruct canonical combined artist billing using Discogs artists[].join delimiters."""
+    parts: list[str] = []
+    for idx, art in enumerate(artists):
+        name = canonical_names[idx] if idx < len(canonical_names) else art.name
+        join_tok = (art.join or "").strip()
+        parts.append(name)
+        if idx < len(artists) - 1:
+            if join_tok:
+                delim = f"{join_tok} " if join_tok in (",", ";") else f" {join_tok} "
+                parts.append(delim)
+            else:
+                parts.append(" / ")
+    return "".join(parts).strip()
+
+
+def build_homonym_disambiguation_prompt(detail: HydratedWorkDetail) -> str:
+    """Build the LLM user prompt for artist homonym disambiguation and billing reconstruction."""
+    lines = [
+        "Hydrated Discogs Work Detail:",
+        f"- Work Title: {detail.title}",
+        f"- Master ID: {detail.resolved_master_id if detail.resolved_master_id is not None else 'None'}",
+        f"- Release ID: {detail.resolved_release_id if detail.resolved_release_id is not None else 'None'}",
+        f"- Year: {detail.year if detail.year is not None else 'Unknown'}",
+        "",
+        "Contributing Artists Credit Array:",
+    ]
+    if not detail.artists:
+        lines.append("No artist credits provided in payload.")
+    else:
+        for idx, art in enumerate(detail.artists, start=1):
+            join_str = f"'{art.join}'" if art.join else "None"
+            anv_str = f"'{art.anv}'" if art.anv else "None"
+            lines.append(
+                f"{idx}. ID: {art.id}\n"
+                f"   Name: {art.name}\n"
+                f"   ANV: {anv_str}\n"
+                f"   Join: {join_str}"
+            )
+    return "\n".join(lines)
+
+
+def create_homonym_disambiguation_agent(
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model_name: str | None = None,
+    thinking_level: str | None = None,
+    model: Any = None,
+) -> Agent[None, WorkReconciliationResult]:
+    """Create a PydanticAI Agent configured for artist homonym disambiguation and billing reconstruction."""
+    if model is not None:
+        return Agent(
+            model,
+            output_type=WorkReconciliationResult,
+            system_prompt=HOMONYM_DISAMBIGUATION_SYSTEM_PROMPT,
+        )
+
+    key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY")
+    if not key:
+        raise ValueError(
+            "DEEPSEEK_API_KEY or DEEPSEEK_KEY environment variable is required"
+        )
+    url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    model_str = model_name or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
+
+    level = thinking_level or os.getenv("LLM_THINKING_LEVEL")
+    if not level:
+        level = get_default_thinking_level(model_str)
+
+    model_settings: ModelSettings
+    if level.lower() == "none":
+        model_settings = {"thinking": False}
+    else:
+        model_settings = {"thinking": cast(Any, level.lower())}
+
+    provider = OpenAIProvider(base_url=url, api_key=key)
+    chat_model = OpenAIChatModel(model_str, provider=provider)
+
+    return Agent(
+        chat_model,
+        output_type=WorkReconciliationResult,
+        system_prompt=HOMONYM_DISAMBIGUATION_SYSTEM_PROMPT,
+        model_settings=model_settings,
+    )
+
+
+def reconcile_artist_homonyms(
+    detail: HydratedWorkDetail,
+    disambiguation_agent: Agent[None, WorkReconciliationResult] | None = None,
+) -> WorkReconciliationResult:
+    """Pass hydrated Discogs work metadata through LLM to strip numeric homonyms and reconstruct billing."""
+    agent = disambiguation_agent or create_homonym_disambiguation_agent()
+    prompt = build_homonym_disambiguation_prompt(detail)
+    return cast(WorkReconciliationResult, _run_agent_sync(agent, prompt))
 
 
 def arbitrate_work_candidates(
@@ -618,21 +843,313 @@ def run_discogs_search_cascade(
     )
 
 
+def hydrate_work_detail(
+    discogs_client: DiscogsClient,
+    work_match: ResolvedWorkMatch,
+) -> HydratedWorkDetail:
+    """Execute 1 follow-up detail call to retrieve structured artists[] and canonical work title.
+
+    Calls GET /masters/{resolved_master_id} when resolved_master_id is present, recording
+    main_release as resolved_release_id when available and not already set.
+    Calls GET /releases/{resolved_release_id} when the release is unmastered.
+    """
+    if work_match.resolved_master_id is not None:
+        master = discogs_client.get_master(work_match.resolved_master_id)
+        resolved_rel_id = work_match.resolved_release_id
+        if resolved_rel_id is None and master.main_release is not None:
+            resolved_rel_id = master.main_release
+        return HydratedWorkDetail(
+            resolved_master_id=work_match.resolved_master_id,
+            resolved_release_id=resolved_rel_id,
+            title=master.title,
+            artists=master.artists,
+            year=master.year,
+            genres=master.genres,
+            styles=master.styles,
+        )
+
+    if work_match.resolved_release_id is not None:
+        release = discogs_client.get_release(work_match.resolved_release_id)
+        return HydratedWorkDetail(
+            resolved_master_id=release.master_id,
+            resolved_release_id=work_match.resolved_release_id,
+            title=release.title,
+            artists=release.artists,
+            year=release.year,
+            genres=release.genres,
+            styles=release.styles,
+        )
+
+    raise ValueError("Cannot hydrate work detail without resolved_master_id or resolved_release_id")
+
+
+def _clean_homonym_suffix(name: str) -> str:
+    """Strip numeric homonym suffix (e.g. 'Artist (2)' -> 'Artist')."""
+    return re.sub(r"\s+\(\d+\)$", "", name).strip()
+
+
+class CatalogEnrichmentService:
+    """Orchestrates multi-phase detached Discogs catalog enrichment."""
+
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session] | Any,
+        discogs_client: DiscogsClient,
+        arbiter_agent: Agent[None, CandidateArbiterResult] | None = None,
+        disambiguation_agent: Agent[None, WorkReconciliationResult] | None = None,
+    ) -> None:
+        self.session_factory = session_factory
+        self.discogs_client = discogs_client
+        self.arbiter_agent = arbiter_agent
+        self.disambiguation_agent = disambiguation_agent
+
+    def fetch_pending_album(self, album_id: uuid.UUID | str | Any) -> PendingAlbumData | None:
+        """Phase 1: Fetch pending album and its constituent artists in a short read session."""
+        uid = uuid.UUID(str(album_id)) if not isinstance(album_id, uuid.UUID) else album_id
+        with self.session_factory() as session:
+            album = session.get(Album, uid)
+            if album is None:
+                return None
+            stmt = (
+                select(Artist)
+                .join(AlbumArtist, AlbumArtist.artist_id == Artist.id)
+                .where(AlbumArtist.album_id == uid)
+                .order_by(AlbumArtist.created_at)
+            )
+            artists = session.execute(stmt).scalars().all()
+            artist_items = [
+                PendingConstituentArtist(
+                    id=cast(uuid.UUID, a.id),
+                    name=str(a.name),
+                    discogs_artist_id=cast("int | None", a.discogs_artist_id),
+                )
+                for a in artists
+            ]
+            return PendingAlbumData(
+                id=cast(uuid.UUID, album.id),
+                combined_artist=str(album.combined_artist),
+                title=str(album.title),
+                fingerprint=str(album.fingerprint),
+                discogs_status=str(album.discogs_status),
+                artists=artist_items,
+            )
+
+    def execute_detached_enrichment(self, pending: PendingAlbumData) -> EnrichedAlbumData | None:
+        """Phase 2: Execute Discogs cascade, hydration, LLM reconciliation, and FastEmbed vectors with zero open DB session."""
+        constituent_inputs = [
+            ConstituentArtistInfo(name=a.name, discogs_artist_id=a.discogs_artist_id)
+            for a in pending.artists
+        ]
+        cascade_result = run_discogs_search_cascade(
+            discogs_client=self.discogs_client,
+            combined_artist=pending.combined_artist,
+            title=pending.title,
+            constituent_artists=constituent_inputs,
+            arbiter_agent=self.arbiter_agent,
+        )
+
+        if cascade_result.work_match is not None:
+            detail = hydrate_work_detail(
+                discogs_client=self.discogs_client,
+                work_match=cascade_result.work_match,
+            )
+
+            reconciled = reconcile_artist_homonyms(
+                detail=detail,
+                disambiguation_agent=self.disambiguation_agent,
+            )
+
+            canonical_combined = reconciled.canonical_combined_artist
+            canonical_title = reconciled.canonical_album_title
+            canonical_artists = reconciled.canonical_artists
+
+            album_text = compute_album_text(canonical_combined, canonical_title)
+            artist_texts = [compute_artist_text(ca.name) for ca in canonical_artists]
+            all_texts = [album_text] + artist_texts
+            vectors = embed_texts(all_texts)
+            album_vec = vectors[0]
+            artist_vecs = vectors[1:]
+
+            canonical_fp = compute_album_fingerprint(canonical_combined, canonical_title)
+
+            enriched_artists: list[EnrichedArtistData] = []
+            remaining_pending = list(pending.artists)
+            total_canonical = len(canonical_artists)
+
+            for idx, (ca, vec) in enumerate(zip(canonical_artists, artist_vecs)):
+                norm_ca = normalize_attribute(ca.name)
+                norm_ca_clean = normalize_attribute(_clean_homonym_suffix(ca.name))
+
+                # 1. Exact match on normalized name
+                matched_pending = next(
+                    (p for p in remaining_pending if normalize_attribute(p.name) == norm_ca),
+                    None,
+                )
+                # 2. Match after stripping homonym suffixes (n)
+                if matched_pending is None:
+                    matched_pending = next(
+                        (
+                            p
+                            for p in remaining_pending
+                            if normalize_attribute(_clean_homonym_suffix(p.name)) == norm_ca_clean
+                        ),
+                        None,
+                    )
+                # 3. Match by position if remaining counts align
+                if matched_pending is None and len(remaining_pending) == (total_canonical - idx) or matched_pending is None and len(remaining_pending) == 1:
+                    matched_pending = remaining_pending[0]
+
+                if matched_pending is not None:
+                    remaining_pending.remove(matched_pending)
+                    p_id = matched_pending.id
+                else:
+                    p_id = None
+
+                enriched_artists.append(
+                    EnrichedArtistData(
+                        artist_id=p_id,
+                        name=ca.name,
+                        discogs_artist_id=ca.discogs_artist_id,
+                        embedding=vec,
+                    )
+                )
+
+            return EnrichedAlbumData(
+                album_id=pending.id,
+                combined_artist=canonical_combined,
+                title=canonical_title,
+                fingerprint=canonical_fp,
+                discogs_master_id=detail.resolved_master_id,
+                discogs_release_id=detail.resolved_release_id,
+                discogs_status="matched",
+                embedding=album_vec,
+                artists=enriched_artists,
+                reasoning=reconciled.reasoning,
+            )
+
+        return None
+
+    def commit_matched_enrichment(self, enriched: EnrichedAlbumData) -> Album:
+        """Phase 3: Update Album and constituent Artists in a short write session."""
+        with self.session_factory() as session:
+            album = session.get(Album, enriched.album_id)
+            if album is None:
+                raise ValueError(f"Album {enriched.album_id} not found for enrichment commit")
+
+            album.combined_artist = enriched.combined_artist
+            album.title = enriched.title
+            album.fingerprint = enriched.fingerprint
+            album.discogs_master_id = enriched.discogs_master_id
+            album.discogs_release_id = enriched.discogs_release_id
+            album.embedding = enriched.embedding
+            album.discogs_status = enriched.discogs_status
+            album.enrichment_attempts = 0
+            album.enrichment_error = None
+            album.last_enriched_at = func.now()
+
+            for art_data in enriched.artists:
+                if art_data.artist_id is not None:
+                    artist = session.get(Artist, art_data.artist_id)
+                    if artist is not None:
+                        artist.name = art_data.name
+                        artist.discogs_artist_id = art_data.discogs_artist_id
+                        artist.embedding = art_data.embedding
+                else:
+                    existing_art = session.execute(
+                        select(Artist).where(
+                            (Artist.discogs_artist_id == art_data.discogs_artist_id)
+                            | (Artist.name == art_data.name)
+                        )
+                    ).scalar_one_or_none()
+                    if existing_art is None:
+                        new_art = Artist(
+                            name=art_data.name,
+                            discogs_artist_id=art_data.discogs_artist_id,
+                            embedding=art_data.embedding,
+                        )
+                        session.add(new_art)
+                        session.flush()
+                        target_art_id = new_art.id
+                    else:
+                        existing_art.name = art_data.name
+                        existing_art.discogs_artist_id = art_data.discogs_artist_id
+                        existing_art.embedding = art_data.embedding
+                        target_art_id = existing_art.id
+
+                    link_exists = session.execute(
+                        select(AlbumArtist).where(
+                            AlbumArtist.album_id == album.id,
+                            AlbumArtist.artist_id == target_art_id,
+                        )
+                    ).scalar_one_or_none()
+                    if link_exists is None:
+                        session.add(AlbumArtist(album_id=album.id, artist_id=target_art_id))
+
+            session.commit()
+            session.refresh(album)
+            session.expunge(album)
+            return album
+
+    def enrich_album(self, album_id: uuid.UUID | str | Any) -> Album | None:
+        """Execute Phase 1, Phase 2, and Phase 3 detached enrichment for a single album."""
+        pending = self.fetch_pending_album(album_id)
+        if pending is None:
+            return None
+
+        enriched = self.execute_detached_enrichment(pending)
+        if enriched is not None:
+            return self.commit_matched_enrichment(enriched)
+
+        return None
+
+
+def enrich_album(
+    album_id: uuid.UUID | str | Any,
+    session_factory: sessionmaker[Session] | Any,
+    discogs_client: DiscogsClient,
+    arbiter_agent: Agent[None, CandidateArbiterResult] | None = None,
+    disambiguation_agent: Agent[None, WorkReconciliationResult] | None = None,
+) -> Album | None:
+    """Convenience helper to enrich a single album using CatalogEnrichmentService."""
+    service = CatalogEnrichmentService(
+        session_factory=session_factory,
+        discogs_client=discogs_client,
+        arbiter_agent=arbiter_agent,
+        disambiguation_agent=disambiguation_agent,
+    )
+    return service.enrich_album(album_id)
+
+
 __all__ = [
     "CANDIDATE_ARBITER_SYSTEM_PROMPT",
+    "HOMONYM_DISAMBIGUATION_SYSTEM_PROMPT",
     "CandidateArbiterResult",
+    "CanonicalArtistCredit",
     "CascadeResult",
+    "CatalogEnrichmentService",
     "ConstituentArtistInfo",
+    "EnrichedAlbumData",
+    "EnrichedArtistData",
+    "HydratedWorkDetail",
+    "PendingAlbumData",
+    "PendingConstituentArtist",
     "ResolvedArtistMatch",
     "ResolvedWorkMatch",
     "ScoredCandidate",
+    "WorkReconciliationResult",
     "arbitrate_artist_candidates",
     "arbitrate_work_candidates",
     "build_artist_arbiter_prompt",
+    "build_homonym_disambiguation_prompt",
     "build_work_arbiter_prompt",
     "compute_cosine_similarity",
     "create_candidate_arbiter_agent",
+    "create_homonym_disambiguation_agent",
     "deduplicate_candidates",
+    "enrich_album",
+    "hydrate_work_detail",
+    "reconcile_artist_homonyms",
+    "reconstruct_combined_artist",
     "run_discogs_search_cascade",
     "score_candidates",
 ]
