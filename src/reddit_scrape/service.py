@@ -51,6 +51,11 @@ class ServiceConfig:
     deepseek_model: str = "deepseek-chat"
     llm_thinking_level: str = "none"
     llm_batch_size: int = 5
+    discogs_token: str | None = None
+    discogs_consumer_key: str | None = None
+    discogs_consumer_secret: str | None = None
+    discogs_user_agent: str = "VinylReleasesScraper/0.1.0"
+    enrichment_interval_seconds: int = 60
 
 
 def validate_environment(
@@ -129,6 +134,59 @@ def validate_environment(
         if llm_batch_size <= 0:
             raise ValueError("LLM_BATCH_SIZE must be a positive integer")
 
+    # Discogs credentials validation
+    raw_discogs_token = env.get("DISCOGS_TOKEN")
+    discogs_token = (
+        str(raw_discogs_token).strip()
+        if raw_discogs_token and str(raw_discogs_token).strip()
+        else None
+    )
+
+    raw_consumer_key = env.get("DISCOGS_CONSUMER_KEY")
+    discogs_consumer_key = (
+        str(raw_consumer_key).strip()
+        if raw_consumer_key and str(raw_consumer_key).strip()
+        else None
+    )
+
+    raw_consumer_secret = env.get("DISCOGS_CONSUMER_SECRET")
+    discogs_consumer_secret = (
+        str(raw_consumer_secret).strip()
+        if raw_consumer_secret and str(raw_consumer_secret).strip()
+        else None
+    )
+
+    has_token = bool(discogs_token)
+    has_key_secret = bool(discogs_consumer_key and discogs_consumer_secret)
+
+    if not (has_token or has_key_secret):
+        raise ValueError(
+            "Missing Discogs credentials: provide either DISCOGS_TOKEN "
+            "or both DISCOGS_CONSUMER_KEY and DISCOGS_CONSUMER_SECRET"
+        )
+
+    raw_discogs_ua = env.get("DISCOGS_USER_AGENT")
+    discogs_user_agent = (
+        str(raw_discogs_ua).strip()
+        if raw_discogs_ua and str(raw_discogs_ua).strip()
+        else "VinylReleasesScraper/0.1.0"
+    )
+
+    raw_enrichment_interval = env.get("ENRICHMENT_INTERVAL_SECONDS")
+    if raw_enrichment_interval is None or not str(raw_enrichment_interval).strip():
+        enrichment_interval_seconds = 60
+    else:
+        try:
+            enrichment_interval_seconds = int(str(raw_enrichment_interval).strip())
+        except ValueError:
+            raise ValueError(
+                "ENRICHMENT_INTERVAL_SECONDS must be a positive integer"
+            )
+        if enrichment_interval_seconds <= 0:
+            raise ValueError(
+                "ENRICHMENT_INTERVAL_SECONDS must be a positive integer"
+            )
+
     return ServiceConfig(
         reddit_client_id=str(reddit_client_id),
         reddit_client_secret=str(reddit_client_secret),
@@ -141,6 +199,11 @@ def validate_environment(
         deepseek_model=str(deepseek_model),
         llm_thinking_level=thinking_level,
         llm_batch_size=llm_batch_size,
+        discogs_token=discogs_token,
+        discogs_consumer_key=discogs_consumer_key,
+        discogs_consumer_secret=discogs_consumer_secret,
+        discogs_user_agent=discogs_user_agent,
+        enrichment_interval_seconds=enrichment_interval_seconds,
     )
 
 
