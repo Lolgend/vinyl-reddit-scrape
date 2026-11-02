@@ -1190,10 +1190,17 @@ class TestMultiCycleCanonicalAlignmentIntegration:
             for s in all_subs:
                 assert s.is_extracted is True
 
+            all_albums = session.execute(select(Album)).scalars().all()
+            assert len(all_albums) == 1
+            canonical_album = all_albums[0]
+            assert canonical_album.combined_artist == "Converge / Dropdead"
+            assert canonical_album.title == 'Split 7"'
+
             all_releases = session.execute(select(Release)).scalars().all()
             assert len(all_releases) == 1
             canonical_release = all_releases[0]
             assert canonical_release.id == rel1.id
+            assert canonical_release.album_id == canonical_album.id
 
             all_artists = session.execute(select(Artist).order_by(Artist.name.asc())).scalars().all()
             assert len(all_artists) == 2
@@ -1316,13 +1323,20 @@ class TestMultiCycleCanonicalAlignmentIntegration:
         assert "- Dropdead" in c2_prompt
 
         # Verify PostgreSQL state:
-        # Distinct Release for the new variant, but reuses canonical Artists!
+        # Distinct Release for the new variant, but reuses canonical Artists and Album!
         with session_factory() as session:
+            all_albums = session.execute(select(Album)).scalars().all()
+            assert len(all_albums) == 1
+            canonical_album = all_albums[0]
+            assert canonical_album.combined_artist == "Converge / Dropdead"
+            assert canonical_album.title == 'Split 7"'
+
             all_releases = session.execute(
                 select(Release).order_by(Release.variant.asc())
             ).scalars().all()
             assert len(all_releases) == 2
             for r in all_releases:
+                assert r.album_id == canonical_album.id
                 assert r.combined_artist == "Converge / Dropdead"
                 assert r.album_title == 'Split 7"'
                 assert r.retailer_name == "Deathwish"
@@ -1348,6 +1362,154 @@ class TestMultiCycleCanonicalAlignmentIntegration:
             assert len(sr1) == 1
             assert len(sr2) == 1
             assert sr1[0].release_id != sr2[0].release_id
+
+        service.stop()
+
+    def test_multi_cycle_canonical_alignment_clean_work_title_and_sibling_release(
+        self, session_factory
+    ):
+        """End-to-end multi-cycle test verifying clean work title extraction, vector candidate
+        sibling release hydration, and canonical alignment without duplicate Album or Artist records.
+
+        - Cycle 1: Announce 'Converge - Jane Doe (20th Anniversary Remaster, Clear LP) [Deathwish]'
+          Extracts:
+            combined_artist='Converge', album_title='Jane Doe',
+            variant='20th Anniversary Remaster, Clear LP', retailer='Deathwish'
+        - Cycle 2: Announce 'Jane Doe - Converge (Red & Black Smoke LP) [Deathwish]' (reversed artist/album, new variant)
+          Extracts:
+            aligned canonical album_title='Jane Doe', combined_artist='Converge',
+            variant='Red & Black Smoke LP', retailer='Deathwish'
+        """
+        created_now = datetime.now(timezone.utc)
+        sub1 = RawSubmission(
+            id="c1_jane",
+            title="Converge - Jane Doe (20th Anniversary Remaster, Clear LP) [Deathwish]",
+            url="https://reddit.com/r/vinylreleases/c1_jane",
+            created_utc=created_now,
+            fullname="t3_c1_jane",
+        )
+        sub2 = RawSubmission(
+            id="c2_jane",
+            title="Jane Doe - Converge (Red & Black Smoke LP) [Deathwish]",
+            url="https://reddit.com/r/vinylreleases/c2_jane",
+            created_utc=created_now,
+            fullname="t3_c2_jane",
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_hot.return_value = []
+
+        captured_prompts: list[str] = []
+        mock_batch_agent = MagicMock()
+
+        async def fake_agent_run(prompt: str):
+            captured_prompts.append(prompt)
+            if "c1_jane" in prompt or "20th Anniversary Remaster" in prompt:
+                return MagicMock(
+                    output=BatchExtractionResult(
+                        items=[
+                            BatchExtractedItem(
+                                submission_id="t3_c1_jane",
+                                releases=[
+                                    ExtractedRelease(
+                                        artists=["Converge"],
+                                        combined_artist="Converge",
+                                        album_title="Jane Doe",
+                                        variant="20th Anniversary Remaster, Clear LP",
+                                        retailer="Deathwish",
+                                    )
+                                ],
+                            )
+                        ]
+                    )
+                )
+            else:
+                return MagicMock(
+                    output=BatchExtractionResult(
+                        items=[
+                            BatchExtractedItem(
+                                submission_id="t3_c2_jane",
+                                releases=[
+                                    ExtractedRelease(
+                                        artists=["Converge"],
+                                        combined_artist="Converge",
+                                        album_title="Jane Doe",
+                                        variant="Red & Black Smoke LP",
+                                        retailer="Deathwish",
+                                    )
+                                ],
+                            )
+                        ]
+                    )
+                )
+
+        mock_batch_agent.run = AsyncMock(side_effect=fake_agent_run)
+        persistence_svc = ReleasePersistenceService(session_factory)
+        worker = ExtractionWorker(
+            batch_agent=mock_batch_agent,
+            candidate_retriever=persistence_svc.find_candidates,
+        )
+
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=worker,
+            persistence_service=persistence_svc,
+        )
+
+        # --- Cycle 1 ---
+        mock_adapter.fetch_new.return_value = [sub1]
+        stats1 = service.poll_and_extract_cycle()
+        assert stats1.new_stats.inserted == 1
+        assert stats1.extracted_count == 1
+
+        # --- Cycle 2 ---
+        mock_adapter.fetch_new.return_value = [sub2]
+        stats2 = service.poll_and_extract_cycle()
+        assert stats2.new_stats.inserted == 1
+        assert stats2.extracted_count == 1
+        assert len(captured_prompts) == 2
+
+        # Verify Cycle 2 prompt received canonical Album and Cycle 1 sibling Release
+        c2_prompt = captured_prompts[1]
+        assert "Existing Catalog Reference:" in c2_prompt
+        assert "Canonical Artists:" in c2_prompt
+        assert "- Converge" in c2_prompt
+        assert "Canonical Releases:" in c2_prompt
+        assert "Combined Artist: Converge" in c2_prompt
+        assert "Album Title: Jane Doe" in c2_prompt
+        assert "Variant: 20th Anniversary Remaster, Clear LP" in c2_prompt
+        assert "Retailer: Deathwish" in c2_prompt
+
+        # Verify PostgreSQL database state:
+        # Exactly 1 Album, exactly 1 Artist, exactly 2 child Releases linked to the same Album!
+        with session_factory() as session:
+            all_albums = session.execute(select(Album)).scalars().all()
+            assert len(all_albums) == 1
+            canonical_album = all_albums[0]
+            assert canonical_album.title == "Jane Doe"
+            assert canonical_album.combined_artist == "Converge"
+
+            all_artists = session.execute(select(Artist)).scalars().all()
+            assert len(all_artists) == 1
+            assert all_artists[0].name == "Converge"
+
+            all_releases = session.execute(
+                select(Release).order_by(Release.variant.asc())
+            ).scalars().all()
+            assert len(all_releases) == 2
+            for r in all_releases:
+                assert r.album_id == canonical_album.id
+                assert r.combined_artist == "Converge"
+                assert r.album_title == "Jane Doe"
+                assert r.retailer_name == "Deathwish"
+
+            assert all_releases[0].variant == "20th Anniversary Remaster, Clear LP"
+            assert all_releases[1].variant == "Red & Black Smoke LP"
+
+            # Both submissions are marked extracted and linked via SubmissionRelease
+            sub_rels = session.execute(select(SubmissionRelease)).scalars().all()
+            assert len(sub_rels) == 2
 
         service.stop()
 

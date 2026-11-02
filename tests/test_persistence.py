@@ -585,3 +585,37 @@ class TestCatalogCandidateRetrievalIntegration:
         # Artist names must be unique
         assert len(candidates.artists) == len(set(candidates.artists))
         assert any(r.combined_artist == "Daft Punk" for r in candidates.releases)
+
+    def test_find_candidates_hydrates_multiple_sibling_releases(self, session_factory):
+        service = ReleasePersistenceService(session_factory)
+
+        # Seed an additional sibling release for Converge / Dropdead - Split
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "sub_seed_1b", "red_seed_1b", "Converge / Dropdead - Split Pink")
+
+        service.persist("sub_seed_1b", [
+            ExtractedRelease(
+                artists=["Converge", "Dropdead"],
+                combined_artist="Converge / Dropdead",
+                album_title="Split",
+                variant="Pink /500",
+                retailer="Deathwish",
+            )
+        ])
+
+        candidates = service.find_candidates("Converge / Dropdead - Split", top_k=5, min_similarity=0.50)
+        split_releases = [r for r in candidates.releases if r.album_title == "Split"]
+        assert len(split_releases) == 2
+        # Both sibling releases must share the same canonical album metadata and album_id
+        assert split_releases[0].album_id is not None
+        assert split_releases[0].album_id == split_releases[1].album_id
+        assert split_releases[0].combined_artist == "Converge / Dropdead"
+        assert split_releases[1].combined_artist == "Converge / Dropdead"
+        assert split_releases[0].artists == ["Converge", "Dropdead"]
+        assert split_releases[1].artists == ["Converge", "Dropdead"]
+
+        variants = {r.variant for r in split_releases}
+        assert variants == {'Clear 7"', 'Pink /500'}
+        for r in split_releases:
+            assert r.retailer == "Deathwish"
+

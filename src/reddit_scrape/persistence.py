@@ -45,6 +45,7 @@ class CatalogReleaseCandidate:
     variant: str | None = None
     retailer: str | None = None
     similarity: float = 0.0
+    album_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -443,6 +444,7 @@ def find_catalog_candidates(
                             variant=str(child.variant) if child.variant is not None else None,
                             retailer=str(child.retailer_name) if child.retailer_name is not None else None,
                             similarity=round(sim, 4),
+                            album_id=str(album_obj.id),
                         )
                     )
         else:
@@ -458,6 +460,7 @@ def find_catalog_candidates(
                         variant=None,
                         retailer=None,
                         similarity=round(sim, 4),
+                        album_id=str(album_obj.id),
                     )
                 )
 

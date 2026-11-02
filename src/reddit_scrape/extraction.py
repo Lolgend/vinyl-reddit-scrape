@@ -63,11 +63,19 @@ class ExtractedRelease(BaseModel):
         description="Combined billing string for multi-artist/collaborative releases (e.g. 'Converge / Dropdead', 'Kanye West & Ty Dolla $ign')",
     )
     album_title: str = Field(
-        description="Album, EP, or single title"
+        description=(
+            "Extract only the core canonical musical work title (e.g., 'Jane Doe', 'Illmatic', 'Bloodmoon: I'). "
+            "Strip anniversary, remaster, reissue, deluxe, expanded, and soundtrack edition descriptors from album_title "
+            "unless they are an inseparable part of a distinct release's official title."
+        )
     )
     variant: str | None = Field(
         None,
-        description="Physical pressing variation (e.g. 'Opaque Emerald LP', '180g 45RPM 2LP Box', 'Pink /500')",
+        description=(
+            "Physical pressing variation and edition descriptors (colorway, weight, LP count, run numbering, "
+            "alongside anniversary, remaster, reissue, deluxe, and expanded edition descriptors, "
+            "e.g. '20th Anniversary Remaster, Blue & White Galaxy 2LP /1000', 'Opaque Emerald LP', '180g 45RPM 2LP Box', 'Pink /500')."
+        ),
     )
     retailer: str | None = Field(
         None,
@@ -133,8 +141,8 @@ Rules:
 2. Specific Release Announcements -> Extract each release:
    - `artists`: List of individual artist/band names. For splits ('A / B') or collaborations ('A & B', 'A feat. B'), extract each artist as a separate list item. Keep multi-word/comma artist names intact (e.g. ["Tyler, The Creator"]).
    - `combined_artist`: For multi-artist releases, provide the collaborative billing string (e.g. "Converge / Dropdead", "Kanye West & Ty Dolla $ign"). For single artist releases, provide the single artist name.
-   - `album_title`: Clean title of the album/single. Never hallucinate an album title if none is specified in the submission.
-   - `variant`: The physical pressing variant details (e.g. "Opaque Emerald LP", "180g 45RPM 2LP Box", "Pink /500", "Clear Zoetrope").
+   - `album_title`: Extract ONLY the core canonical musical work title (e.g., "Jane Doe", "Illmatic", "Bloodmoon: I"). Strip anniversary, remaster, reissue, deluxe, expanded, and soundtrack edition descriptors from `album_title` unless they are an inseparable part of a distinct release's official title. Never hallucinate an album title if none is specified in the submission.
+   - `variant`: Capture anniversary, remaster, reissue, deluxe, and expanded edition descriptors alongside physical pressing variations (colorway, weight, LP count, run numbering), e.g., "20th Anniversary Remaster, Blue & White Galaxy 2LP /1000", "Opaque Emerald LP", "180g 45RPM 2LP Box", "Pink /500", "Clear Zoetrope".
    - `retailer`: Exclusive seller or store if mentioned (e.g. "Blood Records", "Target", "Rough Trade", "VMP").
 
 3. Strict Anti-Hallucination:
@@ -144,6 +152,7 @@ Rules:
    When an "Existing Catalog Reference" section is present in the prompt:
    - Exact & Reordered Match Alignment: If the submission announces an artist or release that semantically matches an existing canonical record (even if artist/album order is reversed, multi-artist billing order is rearranged, or intra-field tokens differ in formatting/word order), you MUST align to the exact canonical strings from the reference for `combined_artist`, `artists`, `album_title`, `variant`, and `retailer`.
    - Partial Match Support: If the submission announces a new variant or retailer for an album already present in the catalog reference, reuse the exact canonical `artists`, `combined_artist`, and `album_title` from the reference while extracting the new `variant` and/or `retailer` from the submission.
+   - Sibling Releases: Reuse exact canonical `combined_artist`, `artists`, and `album_title` strings from matched Albums in the Existing Catalog Reference, and reuse canonical `variant` and `retailer` strings when announcing an already-known sibling Release while extracting new `variant`/`retailer` strings when announcing a new pressing of an existing Album.
    - Anti-Hallucination Preservation: Never force a match to an unrelated catalog candidate if the submission announces a genuinely different artist, album, or entity. Only align when the entity is semantically the same.
 """
 
@@ -163,8 +172,8 @@ Rules for Each Submission:
 2. Specific Release Announcements -> Extract each release:
    - `artists`: List of individual artist/band names. For splits ('A / B') or collaborations ('A & B', 'A feat. B'), extract each artist as a separate list item. Keep multi-word/comma artist names intact (e.g. ["Tyler, The Creator"]).
    - `combined_artist`: For multi-artist releases, provide the collaborative billing string (e.g. "Converge / Dropdead", "Kanye West & Ty Dolla $ign"). For single artist releases, provide the single artist name.
-   - `album_title`: Clean title of the album/single. Never hallucinate an album title if none is specified in the submission.
-   - `variant`: The physical pressing variant details (e.g. "Opaque Emerald LP", "180g 45RPM 2LP Box", "Pink /500", "Clear Zoetrope").
+   - `album_title`: Extract ONLY the core canonical musical work title (e.g., "Jane Doe", "Illmatic", "Bloodmoon: I"). Strip anniversary, remaster, reissue, deluxe, expanded, and soundtrack edition descriptors from `album_title` unless they are an inseparable part of a distinct release's official title. Never hallucinate an album title if none is specified in the submission.
+   - `variant`: Capture anniversary, remaster, reissue, deluxe, and expanded edition descriptors alongside physical pressing variations (colorway, weight, LP count, run numbering), e.g., "20th Anniversary Remaster, Blue & White Galaxy 2LP /1000", "Opaque Emerald LP", "180g 45RPM 2LP Box", "Pink /500", "Clear Zoetrope".
    - `retailer`: Exclusive seller or store if mentioned (e.g. "Blood Records", "Target", "Rough Trade", "VMP").
 
 3. Strict Anti-Hallucination:
@@ -174,6 +183,7 @@ Rules for Each Submission:
    When an "Existing Catalog Reference" section is present in the prompt:
    - Exact & Reordered Match Alignment: If the submission announces an artist or release that semantically matches an existing canonical record (even if artist/album order is reversed, multi-artist billing order is rearranged, or intra-field tokens differ in formatting/word order), you MUST align to the exact canonical strings from the reference for `combined_artist`, `artists`, `album_title`, `variant`, and `retailer`.
    - Partial Match Support: If the submission announces a new variant or retailer for an album already present in the catalog reference, reuse the exact canonical `artists`, `combined_artist`, and `album_title` from the reference while extracting the new `variant` and/or `retailer` from the submission.
+   - Sibling Releases: Reuse exact canonical `combined_artist`, `artists`, and `album_title` strings from matched Albums in the Existing Catalog Reference, and reuse canonical `variant` and `retailer` strings when announcing an already-known sibling Release while extracting new `variant`/`retailer` strings when announcing a new pressing of an existing Album.
    - Anti-Hallucination Preservation: Never force a match to an unrelated catalog candidate if the submission announces a genuinely different artist, album, or entity. Only align when the entity is semantically the same.
 
 5. Intra-Batch Canonical Alignment:
