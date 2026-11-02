@@ -1,3 +1,5 @@
+import hashlib
+import uuid
 from datetime import datetime, timezone
 
 import pytest
@@ -10,14 +12,16 @@ load_dotenv()
 from reddit_scrape.db import get_engine, init_db
 from reddit_scrape.extraction import ExtractedRelease, ExtractionResult
 from reddit_scrape.models import (
+    Album,
+    AlbumArtist,
     Artist,
     Release,
-    ReleaseArtist,
     Submission,
     SubmissionRelease,
 )
 from reddit_scrape.persistence import (
     ReleasePersistenceService,
+    compute_album_fingerprint,
     compute_release_fingerprint,
     normalize_attribute,
 )
@@ -38,14 +42,14 @@ def clean_db(engine):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE submission_snapshots, submission_releases, release_artists, releases, artists, submissions CASCADE;"
+                "TRUNCATE TABLE submission_snapshots, submission_releases, releases, album_artists, albums, artists, submissions CASCADE;"
             )
         )
     yield
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE submission_snapshots, submission_releases, release_artists, releases, artists, submissions CASCADE;"
+                "TRUNCATE TABLE submission_snapshots, submission_releases, releases, album_artists, albums, artists, submissions CASCADE;"
             )
         )
 
@@ -71,88 +75,54 @@ def create_test_submission(session, sub_id: str, reddit_id: str, title: str) -> 
     return sub
 
 
-class TestReleaseFingerprint:
-    def test_normalization_and_standard_token(self):
-        """Verify lowercase, collapsed whitespace, normalized dashes, and [standard] placeholder."""
-        fp1 = compute_release_fingerprint(
-            combined_artist="  Daft   Punk  ",
-            album_title="Discovery",
-            variant=None,
-            retailer=None,
-        )
-        fp2 = compute_release_fingerprint(
-            combined_artist="daft punk",
-            album_title="discovery",
-            variant="",
-            retailer="   ",
-        )
+class TestAlbumAndReleaseFingerprints:
+    def test_album_fingerprint_normalization_and_digest(self):
+        """Verify lowercase, collapsed whitespace, normalized dashes, and deterministic digest."""
+        fp1 = compute_album_fingerprint("  Daft   Punk  ", "Discovery")
+        fp2 = compute_album_fingerprint("daft punk", "discovery")
         assert fp1 == fp2
         assert len(fp1) == 64
+        expected = hashlib.sha256(b"daft punk|discovery").hexdigest()
+        assert fp1 == expected
 
-    def test_punctuation_preservation(self):
+    def test_album_fingerprint_punctuation_preservation(self):
         """Punctuation like '/', '&', and commas are preserved in normalized attributes and fingerprints."""
-        assert normalize_attribute("Pink /500") == "pink /500"
         assert normalize_attribute("Converge / Dropdead") == "converge / dropdead"
         assert normalize_attribute("Tyler, The Creator") == "tyler, the creator"
 
-        fp1 = compute_release_fingerprint(
-            combined_artist="Tyler, The Creator",
-            album_title="IGOR",
-            variant="Pink /500",
-            retailer="Golf Wang",
-        )
-        fp2 = compute_release_fingerprint(
-            combined_artist="Tyler The Creator",
-            album_title="IGOR",
-            variant="Pink 500",
-            retailer="Golf Wang",
-        )
+        fp1 = compute_album_fingerprint("Tyler, The Creator", "IGOR")
+        fp2 = compute_album_fingerprint("Tyler The Creator", "IGOR")
         assert fp1 != fp2
 
-    def test_unicode_dash_normalization(self):
+    def test_album_fingerprint_unicode_dash_normalization(self):
         """Unicode dashes (\u2013, \u2014, etc.) normalize to hyphen."""
-        fp1 = compute_release_fingerprint(
-            combined_artist="Artist",
-            album_title="Album \u2013 Part 1",
-            variant="180g \u2014 Limited",
-            retailer="Store",
-        )
-        fp2 = compute_release_fingerprint(
-            combined_artist="Artist",
-            album_title="Album - Part 1",
-            variant="180g - Limited",
-            retailer="Store",
-        )
+        fp1 = compute_album_fingerprint("Artist", "Album \u2013 Part 1")
+        fp2 = compute_album_fingerprint("Artist", "Album - Part 1")
         assert fp1 == fp2
 
-    def test_collision_prevention_standard_vs_exclusive(self):
-        """Standard pressings must never collide with variant pressings or retailer exclusives."""
-        fp_standard = compute_release_fingerprint(
-            combined_artist="Radiohead",
-            album_title="OK Computer",
-            variant=None,
-            retailer=None,
-        )
-        fp_variant = compute_release_fingerprint(
-            combined_artist="Radiohead",
-            album_title="OK Computer",
-            variant="Blue Opaque Vinyl",
-            retailer=None,
-        )
-        fp_retailer = compute_release_fingerprint(
-            combined_artist="Radiohead",
-            album_title="OK Computer",
-            variant=None,
-            retailer="Rough Trade",
-        )
-        assert fp_standard != fp_variant
-        assert fp_standard != fp_retailer
-        assert fp_variant != fp_retailer
+    def test_release_fingerprint_scoped_to_album_id(self):
+        """Release fingerprint scopes identity under parent album_id."""
+        album_id = uuid.uuid4()
+        fp_standard = compute_release_fingerprint(album_id, variant=None, retailer=None)
+        fp_variant = compute_release_fingerprint(album_id, variant="Blue Opaque Vinyl", retailer=None)
+        fp_retailer = compute_release_fingerprint(album_id, variant=None, retailer="Rough Trade")
+        fp_both = compute_release_fingerprint(album_id, variant="Blue Opaque Vinyl", retailer="Rough Trade")
+
+        assert len({fp_standard, fp_variant, fp_retailer, fp_both}) == 4
+        assert len(fp_standard) == 64
+
+    def test_release_fingerprint_different_albums_same_variant(self):
+        """Same variant for different albums produces distinct fingerprints."""
+        album1 = uuid.uuid4()
+        album2 = uuid.uuid4()
+        fp1 = compute_release_fingerprint(album1, variant="Red Vinyl", retailer="Store")
+        fp2 = compute_release_fingerprint(album2, variant="Red Vinyl", retailer="Store")
+        assert fp1 != fp2
 
 
 class TestReleasePersistence:
     def test_persist_single_artist_release(self, session_factory):
-        """Verify single-artist release persistence, artist row, and join records."""
+        """Verify single-artist release persistence, album, artist row, and join records."""
         with session_factory() as session, session.begin():
             create_test_submission(session, "sub1", "red1", "Daft Punk - Discovery")
 
@@ -173,13 +143,23 @@ class TestReleasePersistence:
         assert rel.variant == "2LP Gatefold"
         assert rel.retailer_name is None
         assert rel.fingerprint is not None
-        assert rel.embedding is not None
-        assert len(rel.embedding) == 384
 
         with session_factory() as session:
             # Check submission updated
             updated_sub = session.get(Submission, "sub1")
             assert updated_sub.is_extracted is True
+
+            # Check album created with pending status and provisional embedding
+            albums = session.execute(select(Album)).scalars().all()
+            assert len(albums) == 1
+            alb = albums[0]
+            assert alb.combined_artist == "Daft Punk"
+            assert alb.title == "Discovery"
+            assert alb.discogs_status == "pending"
+            assert alb.enrichment_attempts == 0
+            assert alb.embedding is not None
+            assert len(alb.embedding) == 384
+            assert rel.album_id == alb.id
 
             # Check artist created
             artists = session.execute(select(Artist)).scalars().all()
@@ -188,11 +168,11 @@ class TestReleasePersistence:
             assert artists[0].embedding is not None
             assert len(artists[0].embedding) == 384
 
-            # Check release_artists link
-            rel_artists = session.execute(select(ReleaseArtist)).scalars().all()
-            assert len(rel_artists) == 1
-            assert rel_artists[0].release_id == rel.id
-            assert rel_artists[0].artist_id == artists[0].id
+            # Check album_artists link
+            alb_artists = session.execute(select(AlbumArtist)).scalars().all()
+            assert len(alb_artists) == 1
+            assert alb_artists[0].album_id == alb.id
+            assert alb_artists[0].artist_id == artists[0].id
 
             # Check submission_releases link
             sub_releases = session.execute(select(SubmissionRelease)).scalars().all()
@@ -201,7 +181,7 @@ class TestReleasePersistence:
             assert sub_releases[0].release_id == rel.id
 
     def test_persist_multi_artist_release(self, session_factory):
-        """Verify multi-artist split/collaboration associates each artist individually."""
+        """Verify multi-artist split/collaboration associates each artist individually in album_artists."""
         with session_factory() as session, session.begin():
             create_test_submission(session, "sub2", "red2", "Converge / Dropdead Split")
 
@@ -217,10 +197,18 @@ class TestReleasePersistence:
 
         assert len(result) == 1
         rel = result[0]
-        assert rel.embedding is not None
-        assert len(rel.embedding) == 384
 
         with session_factory() as session:
+            albums = session.execute(select(Album)).scalars().all()
+            assert len(albums) == 1
+            alb = albums[0]
+            assert alb.combined_artist == "Converge / Dropdead"
+            assert alb.title == "Converge / Dropdead Split"
+            assert alb.discogs_status == "pending"
+            assert alb.embedding is not None
+            assert len(alb.embedding) == 384
+            assert rel.album_id == alb.id
+
             artists = session.execute(select(Artist).order_by(Artist.name)).scalars().all()
             assert len(artists) == 2
             artist_names = [a.name for a in artists]
@@ -228,11 +216,116 @@ class TestReleasePersistence:
             assert "Dropdead" in artist_names
             assert all(a.embedding is not None and len(a.embedding) == 384 for a in artists)
 
-            # Check both artists linked to this release
+            # Check both artists linked to this album
             links = session.execute(
-                select(ReleaseArtist).where(ReleaseArtist.release_id == rel.id)
+                select(AlbumArtist).where(AlbumArtist.album_id == alb.id)
             ).scalars().all()
             assert len(links) == 2
+
+    def test_persist_multiple_releases_single_canonical_album(self, session_factory):
+        """When multiple releases (different variants/retailers) of same work are persisted,
+        a single canonical Album row (discogs_status='pending', 384-d provisional embedding) is created.
+        """
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "sub_multi_var", "red_multi_var", "Multiple Variants Post")
+
+        service = ReleasePersistenceService(session_factory)
+        ext1 = ExtractedRelease(
+            artists=["Radiohead"],
+            combined_artist="Radiohead",
+            album_title="OK Computer",
+            variant="Standard Black Vinyl",
+            retailer="Amazon",
+        )
+        ext2 = ExtractedRelease(
+            artists=["Radiohead"],
+            combined_artist="Radiohead",
+            album_title="OK Computer",
+            variant="Opaque Blue Vinyl",
+            retailer="Rough Trade",
+        )
+        ext3 = ExtractedRelease(
+            artists=["Radiohead"],
+            combined_artist="Radiohead",
+            album_title="OK Computer",
+            variant="White Vinyl 2LP",
+            retailer="W.A.S.T.E.",
+        )
+
+        results = service.persist("sub_multi_var", [ext1, ext2, ext3])
+        assert len(results) == 3
+        # All 3 releases point to the same album_id
+        album_ids = {r.album_id for r in results}
+        assert len(album_ids) == 1
+        common_album_id = album_ids.pop()
+
+        with session_factory() as session:
+            albums = session.execute(select(Album)).scalars().all()
+            assert len(albums) == 1
+            alb = albums[0]
+            assert alb.id == common_album_id
+            assert alb.discogs_status == "pending"
+            assert alb.enrichment_attempts == 0
+            assert alb.embedding is not None
+            assert len(alb.embedding) == 384
+
+            releases = session.execute(select(Release).order_by(Release.variant)).scalars().all()
+            assert len(releases) == 3
+            variants = [r.variant for r in releases]
+            assert "Standard Black Vinyl" in variants
+            assert "Opaque Blue Vinyl" in variants
+            assert "White Vinyl 2LP" in variants
+
+    def test_reingest_preserves_matched_discogs_status_and_embedding(self, session_factory):
+        """Re-ingesting a submission or persisting a new Release for an Album whose
+        discogs_status is already 'matched', 'partial_matched', or 'not_found' preserves its
+        existing discogs_status and canonical Album.embedding.
+        """
+        service = ReleasePersistenceService(session_factory)
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "sub_init", "red_init", "Post 1: Fontaines D.C. - Romance")
+
+        ext1 = ExtractedRelease(
+            artists=["Fontaines D.C."],
+            combined_artist="Fontaines D.C.",
+            album_title="Romance",
+            variant="Standard Black",
+            retailer="XL Recordings",
+        )
+        res1 = service.persist("sub_init", [ext1])
+        assert len(res1) == 1
+        album_id = res1[0].album_id
+
+        # Simulate Pass 2 enrichment marking the album as 'matched' with a canonical vector
+        canonical_vec = [0.99] * 384
+        with session_factory() as session, session.begin():
+            alb = session.get(Album, album_id)
+            alb.discogs_status = "matched"
+            alb.discogs_master_id = 987654
+            alb.embedding = canonical_vec
+
+        # Persist a new variant for the same album via another submission
+        with session_factory() as session, session.begin():
+            create_test_submission(session, "sub_new_drop", "red_new_drop", "Post 2: Fontaines D.C. - Romance (Pink)")
+
+        ext2 = ExtractedRelease(
+            artists=["Fontaines D.C."],
+            combined_artist="Fontaines D.C.",
+            album_title="Romance",
+            variant="Limited Pink LP",
+            retailer="Rough Trade",
+        )
+        res2 = service.persist("sub_new_drop", [ext2])
+        assert len(res2) == 1
+        assert res2[0].album_id == album_id
+
+        # Verify that discogs_status and canonical embedding were NOT overwritten by provisional vector
+        with session_factory() as session:
+            alb_after = session.get(Album, album_id)
+            assert alb_after.discogs_status == "matched"
+            assert alb_after.discogs_master_id == 987654
+            assert alb_after.embedding is not None
+            assert pytest.approx(alb_after.embedding[0], rel=1e-3) == 0.99
 
     def test_deduplication_two_submissions_same_release(self, session_factory):
         """Two different submissions for the exact same pressing resolve to the same Release row."""
@@ -265,11 +358,16 @@ class TestReleasePersistence:
         assert res1[0].id == res2[0].id
 
         with session_factory() as session:
+            # Only 1 canonical Album record
+            all_albums = session.execute(select(Album)).scalars().all()
+            assert len(all_albums) == 1
+            assert all_albums[0].embedding is not None
+            assert len(all_albums[0].embedding) == 384
+
             # Only 1 canonical Release record
             all_releases = session.execute(select(Release)).scalars().all()
             assert len(all_releases) == 1
-            assert all_releases[0].embedding is not None
-            assert len(all_releases[0].embedding) == 384
+            assert all_releases[0].album_id == all_albums[0].id
 
             # Only 1 canonical Artist record
             all_artists = session.execute(select(Artist)).scalars().all()
@@ -340,10 +438,12 @@ class TestReleasePersistence:
         assert res1[0].id == res2[0].id
 
         with session_factory() as session:
+            all_albums = session.execute(select(Album)).scalars().all()
+            assert len(all_albums) == 1
+            assert all_albums[0].embedding is not None
+
             all_releases = session.execute(select(Release)).scalars().all()
             assert len(all_releases) == 1
-            assert all_releases[0].embedding is not None
-            assert len(all_releases[0].embedding) == 384
 
             all_sub_rels = session.execute(select(SubmissionRelease)).scalars().all()
             assert len(all_sub_rels) == 1
@@ -433,7 +533,6 @@ class TestCatalogCandidateRetrievalIntegration:
 
     def test_query_with_reversed_billing_order(self, session_factory):
         service = ReleasePersistenceService(session_factory)
-        # Reversed billing order: "Dropdead / Converge - Split 7\""
         candidates = service.find_candidates("Dropdead / Converge - Split 7\"", top_k=5, min_similarity=0.50)
         assert len(candidates.releases) >= 1
         top_rel = candidates.releases[0]
@@ -441,12 +540,10 @@ class TestCatalogCandidateRetrievalIntegration:
         assert top_rel.album_title == "Split"
         assert "Converge" in top_rel.artists and "Dropdead" in top_rel.artists
         assert top_rel.similarity >= 0.50
-        # Contributing artists also retrieved in artists
         assert "Converge" in candidates.artists or "Dropdead" in candidates.artists
 
     def test_query_with_swapped_artist_album_order(self, session_factory):
         service = ReleasePersistenceService(session_factory)
-        # Swapped artist/album: "Discovery - Daft Punk"
         candidates = service.find_candidates("Discovery - Daft Punk", top_k=5, min_similarity=0.50)
         assert len(candidates.releases) >= 1
         top_rel = candidates.releases[0]
@@ -458,7 +555,6 @@ class TestCatalogCandidateRetrievalIntegration:
 
     def test_query_with_reordered_variant_tokens(self, session_factory):
         service = ReleasePersistenceService(session_factory)
-        # Reordered variant tokens
         candidates = service.find_candidates("Daft Punk - Discovery (Gatefold 2LP)", top_k=5, min_similarity=0.50)
         assert len(candidates.releases) >= 1
         top_rel = candidates.releases[0]
@@ -468,7 +564,6 @@ class TestCatalogCandidateRetrievalIntegration:
 
     def test_unrelated_query_below_threshold_excluded(self, session_factory):
         service = ReleasePersistenceService(session_factory)
-        # High threshold for unrelated query
         candidates = service.find_candidates(
             "Beethoven - Symphony No. 9 in D minor",
             top_k=5,
@@ -479,7 +574,6 @@ class TestCatalogCandidateRetrievalIntegration:
 
     def test_batch_query_deduplicates_across_titles(self, session_factory):
         service = ReleasePersistenceService(session_factory)
-        # Two queries matching the same canonical release
         candidates = service.find_candidates([
             "Daft Punk - Discovery (Gatefold)",
             "Discovery by Daft Punk",

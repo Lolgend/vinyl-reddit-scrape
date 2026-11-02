@@ -20,9 +20,10 @@ from reddit_scrape.extraction import (
 )
 from reddit_scrape.ingestion import RawSubmission
 from reddit_scrape.models import (
+    Album,
+    AlbumArtist,
     Artist,
     Release,
-    ReleaseArtist,
     Submission,
     SubmissionRelease,
     SubmissionSnapshot,
@@ -57,7 +58,7 @@ def clean_db(request):
         conn.execute(
             text(
                 "TRUNCATE TABLE submission_snapshots, submission_releases, "
-                "release_artists, releases, artists, submissions CASCADE;"
+                "releases, album_artists, albums, artists, submissions CASCADE;"
             )
         )
     yield
@@ -65,7 +66,7 @@ def clean_db(request):
         conn.execute(
             text(
                 "TRUNCATE TABLE submission_snapshots, submission_releases, "
-                "release_artists, releases, artists, submissions CASCADE;"
+                "releases, album_artists, albums, artists, submissions CASCADE;"
             )
         )
 
@@ -450,7 +451,7 @@ class TestPollerServiceEndToEnd:
 
             # Verify releases table
             releases = session.execute(
-                select(Release).order_by(Release.album_title.asc())
+                select(Release).join(Album).order_by(Album.title.asc())
             ).scalars().all()
             assert len(releases) == 2
             assert releases[0].album_title == "OK Computer"
@@ -471,7 +472,7 @@ class TestPollerServiceEndToEnd:
             # Verify release_artists join table
             split_rel = releases[1]
             ra_links = session.execute(
-                select(ReleaseArtist).where(ReleaseArtist.release_id == split_rel.id)
+                select(AlbumArtist).where(AlbumArtist.album_id == split_rel.album_id)
             ).scalars().all()
             assert len(ra_links) == 2
 

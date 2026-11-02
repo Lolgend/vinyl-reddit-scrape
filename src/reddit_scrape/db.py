@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
@@ -51,6 +51,8 @@ def init_db(engine: Engine | None = None, drop_existing: bool = False) -> None:
     """Create all tables and indexes defined in Base metadata.
 
     If drop_existing is True, drops all existing tables before re-creating them.
+    Also detects and drops incompatible legacy 2-tier catalog tables
+    (release_artists, legacy flat releases/artists) before create_all.
     """
     if engine is None:
         engine = get_engine()
@@ -63,6 +65,36 @@ def init_db(engine: Engine | None = None, drop_existing: bool = False) -> None:
     with engine.begin() as conn:
         if engine.dialect.name == "postgresql":
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+
+            # Check for incompatible legacy 2-tier catalog tables
+            inspector = inspect(engine)
+            existing_tables = set(inspector.get_table_names())
+
+            is_legacy = False
+            if "release_artists" in existing_tables:
+                is_legacy = True
+            elif "releases" in existing_tables:
+                col_names = {c["name"] for c in inspector.get_columns("releases")}
+                if "album_id" not in col_names or "embedding" in col_names:
+                    is_legacy = True
+            elif "artists" in existing_tables:
+                col_names = {c["name"] for c in inspector.get_columns("artists")}
+                if "discogs_artist_id" not in col_names:
+                    is_legacy = True
+
+            if is_legacy:
+                # Cleanly drop legacy catalog tables in dependent order
+                # Preserves submissions and submission_snapshots
+                legacy_drop_sqls = [
+                    "DROP TABLE IF EXISTS submission_releases CASCADE;",
+                    "DROP TABLE IF EXISTS release_artists CASCADE;",
+                    "DROP TABLE IF EXISTS album_artists CASCADE;",
+                    "DROP TABLE IF EXISTS releases CASCADE;",
+                    "DROP TABLE IF EXISTS albums CASCADE;",
+                    "DROP TABLE IF EXISTS artists CASCADE;",
+                ]
+                for sql in legacy_drop_sqls:
+                    conn.execute(text(sql))
 
     Base.metadata.create_all(engine)
 

@@ -3,6 +3,7 @@ from fastembed import TextEmbedding
 from reddit_scrape.embeddings import (
     DEFAULT_EMBEDDING_MODEL,
     EMBEDDING_DIM,
+    compute_album_text,
     compute_artist_text,
     compute_release_text,
     embed_texts,
@@ -11,6 +12,14 @@ from reddit_scrape.embeddings import (
 
 
 class TestEmbeddingTextFormatting:
+    def test_compute_album_text_basic(self):
+        text = compute_album_text(combined_artist="Daft Punk", album_title="Discovery")
+        assert text == "Daft Punk - Discovery"
+
+    def test_compute_album_text_whitespace(self):
+        text = compute_album_text(combined_artist="  Daft Punk  ", album_title="  Discovery  ")
+        assert text == "Daft Punk - Discovery"
+
     def test_compute_release_text_basic(self):
         text = compute_release_text(combined_artist="Daft Punk", album_title="Discovery")
         assert text == "Daft Punk - Discovery"
