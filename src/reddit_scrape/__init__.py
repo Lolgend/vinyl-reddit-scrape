@@ -8,6 +8,12 @@ from reddit_scrape.db import (
     init_db,
     reset_db,
 )
+from reddit_scrape.embeddings import (
+    compute_album_text,
+    compute_artist_text,
+    compute_release_text,
+    embed_texts,
+)
 from reddit_scrape.extraction import (
     BATCH_EXTRACTION_SYSTEM_PROMPT,
     EXTRACTION_SYSTEM_PROMPT,
@@ -33,6 +39,8 @@ from reddit_scrape.ingestion import (
     should_ingest_submission,
 )
 from reddit_scrape.models import (
+    Album,
+    AlbumArtist,
     Artist,
     Release,
     ReleaseArtist,
@@ -45,6 +53,7 @@ from reddit_scrape.persistence import (
     CatalogCandidates,
     CatalogReleaseCandidate,
     ReleasePersistenceService,
+    compute_album_fingerprint,
     compute_release_fingerprint,
     find_catalog_candidates,
     normalize_attribute,
@@ -71,12 +80,19 @@ __all__ = [  # noqa: RUF022
     "init_db",
     "reset_db",
     # Models
+    "Album",
+    "AlbumArtist",
     "Artist",
     "Release",
     "ReleaseArtist",
     "Submission",
     "SubmissionRelease",
     "SubmissionSnapshot",
+    # Embeddings
+    "compute_album_text",
+    "compute_artist_text",
+    "compute_release_text",
+    "embed_texts",
     # Ingestion
     "NON_RELEASE_FLAIRS",
     "IngestionStats",
@@ -104,6 +120,7 @@ __all__ = [  # noqa: RUF022
     "CatalogReleaseCandidate",
     "STANDARD_TOKEN",
     "ReleasePersistenceService",
+    "compute_album_fingerprint",
     "compute_release_fingerprint",
     "find_catalog_candidates",
     "normalize_attribute",

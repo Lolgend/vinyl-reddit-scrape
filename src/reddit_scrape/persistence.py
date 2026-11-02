@@ -13,8 +13,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from reddit_scrape.embeddings import (
+    compute_album_text,
     compute_artist_text,
-    compute_release_text,
     embed_texts,
 )
 from reddit_scrape.extraction import (
@@ -23,9 +23,10 @@ from reddit_scrape.extraction import (
     pre_clean_title,
 )
 from reddit_scrape.models import (
+    Album,
+    AlbumArtist,
     Artist,
     Release,
-    ReleaseArtist,
     Submission,
     SubmissionRelease,
 )
@@ -69,8 +70,8 @@ class _PreparedReleaseItem:
     album_title: str
     variant: str | None
     retailer: str | None
-    fingerprint: str
-    rel_text: str
+    album_fingerprint: str
+    album_text: str
     artist_names: list[str]
 
 
@@ -103,23 +104,35 @@ def normalize_attribute(val: str | None, default_token: str | None = None) -> st
     return cleaned
 
 
-def compute_release_fingerprint(
+def compute_album_fingerprint(
     combined_artist: str,
     album_title: str,
-    variant: str | None = None,
-    retailer: str | None = None,
 ) -> str:
-    """Compute a deterministic SHA-256 fingerprint over normalized release metadata.
+    """Compute a deterministic SHA-256 fingerprint over normalized album metadata.
 
-    Format: sha256("{norm_artist}|{norm_album}|{norm_variant}|{norm_retailer}")
-    Missing variant or retailer maps to "[standard]".
+    Format: sha256("{norm_combined_artist}|{norm_title}")
     """
     norm_artist = normalize_attribute(combined_artist)
     norm_album = normalize_attribute(album_title)
+    payload = f"{norm_artist}|{norm_album}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_release_fingerprint(
+    album_id: Any,
+    variant: str | None = None,
+    retailer: str | None = None,
+) -> str:
+    """Compute a deterministic SHA-256 fingerprint over release metadata scoped to an album.
+
+    Format: sha256("{album_id}|{norm_variant}|{norm_retailer}")
+    Missing variant or retailer maps to "[standard]".
+    """
+    norm_album_id = str(album_id).strip().lower()
     norm_variant = normalize_attribute(variant, default_token=STANDARD_TOKEN)
     norm_retailer = normalize_attribute(retailer, default_token=STANDARD_TOKEN)
 
-    payload = f"{norm_artist}|{norm_album}|{norm_variant}|{norm_retailer}"
+    payload = f"{norm_album_id}|{norm_variant}|{norm_retailer}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -131,11 +144,12 @@ def persist_extracted_releases(
     """Persist extracted releases within the caller's active database session.
 
     Atomically:
-    1. Generates 384-dimensional dense vector embeddings for releases and contributing artists.
-    2. Idempotently upserts Release records based on fingerprint conflict, preserving/populating embeddings.
-    3. Idempotently inserts/updates Artist records with embeddings and links them in release_artists.
-    4. Links parent submission to releases in submission_releases (ON CONFLICT DO NOTHING).
-    5. Marks submission.is_extracted = TRUE.
+    1. Generates 384-dimensional dense vector embeddings for albums and contributing artists.
+    2. Idempotently upserts Album records (pending on insert, preserving existing embedding and discogs_status).
+    3. Idempotently upserts Artist records and links them in album_artists.
+    4. Idempotently upserts Release records scoped by album_id.
+    5. Links parent submission to releases in submission_releases (ON CONFLICT DO NOTHING).
+    6. Marks submission.is_extracted = TRUE.
     """
     sub = session.get(Submission, submission_id)
     if sub is None:
@@ -178,20 +192,16 @@ def persist_extracted_releases(
         variant = ext.variant.strip() if ext.variant and ext.variant.strip() else None
         retailer = ext.retailer.strip() if ext.retailer and ext.retailer.strip() else None
 
-        fingerprint = compute_release_fingerprint(
+        album_fp = compute_album_fingerprint(
             combined_artist=combined_artist,
             album_title=album_title,
-            variant=variant,
-            retailer=retailer,
         )
 
-        rel_text = compute_release_text(
+        album_text = compute_album_text(
             combined_artist=combined_artist,
             album_title=album_title,
-            variant=variant,
-            retailer=retailer,
         )
-        ordered_texts.append(rel_text)
+        ordered_texts.append(album_text)
 
         contributing_artists = ext.artists if ext.artists else ([combined_artist] if combined_artist else [])
         artist_names = list(
@@ -206,8 +216,8 @@ def persist_extracted_releases(
                 album_title=album_title,
                 variant=variant,
                 retailer=retailer,
-                fingerprint=fingerprint,
-                rel_text=rel_text,
+                album_fingerprint=album_fp,
+                album_text=album_text,
                 artist_names=artist_names,
             )
         )
@@ -219,26 +229,27 @@ def persist_extracted_releases(
     persisted_releases: list[Release] = []
 
     for item in items_to_persist:
-        rel_embedding = embedding_map[item.rel_text]
+        album_embedding = embedding_map[item.album_text]
 
-        rel_stmt = pg_insert(Release).values(
+        # 1. Upsert Album (discogs_status='pending' on insert, preserved on conflict)
+        album_stmt = pg_insert(Album).values(
             combined_artist=item.combined_artist,
-            album_title=item.album_title,
-            variant=item.variant,
-            retailer_name=item.retailer,
-            fingerprint=item.fingerprint,
-            embedding=rel_embedding,
+            title=item.album_title,
+            fingerprint=item.album_fingerprint,
+            discogs_status="pending",
+            enrichment_attempts=0,
+            embedding=album_embedding,
         )
-        rel_returning = rel_stmt.on_conflict_do_update(
-            index_elements=[Release.fingerprint],
+        album_upsert = album_stmt.on_conflict_do_update(
+            index_elements=[Album.fingerprint],
             set_={
                 "updated_at": func.now(),
-                "embedding": func.coalesce(Release.embedding, rel_stmt.excluded.embedding),
+                "embedding": func.coalesce(Album.embedding, album_stmt.excluded.embedding),
             },
-        ).returning(Release.id)
-        rel_id = session.execute(rel_returning).scalar_one()
+        ).returning(Album.id)
+        album_id = session.execute(album_upsert).scalar_one()
 
-        # Link contributing artists
+        # 2. Upsert constituent Artists and link AlbumArtist
         for art_name in item.artist_names:
             art_text = compute_artist_text(art_name)
             art_embedding = embedding_map[art_text]
@@ -247,23 +258,43 @@ def persist_extracted_releases(
                 name=art_name,
                 embedding=art_embedding,
             )
-            art_returning = art_stmt.on_conflict_do_update(
+            art_upsert = art_stmt.on_conflict_do_update(
                 index_elements=[Artist.name],
                 set_={
-                    "name": art_stmt.excluded.name,
+                    "updated_at": func.now(),
                     "embedding": func.coalesce(Artist.embedding, art_stmt.excluded.embedding),
                 },
             ).returning(Artist.id)
-            art_id = session.execute(art_returning).scalar_one()
+            art_id = session.execute(art_upsert).scalar_one()
 
-            ra_stmt = (
-                pg_insert(ReleaseArtist)
-                .values(release_id=rel_id, artist_id=art_id)
+            aa_stmt = (
+                pg_insert(AlbumArtist)
+                .values(album_id=album_id, artist_id=art_id)
                 .on_conflict_do_nothing()
             )
-            session.execute(ra_stmt)
+            session.execute(aa_stmt)
 
-        # Link submission to release
+        # 3. Upsert Release scoped by album_id
+        rel_fp = compute_release_fingerprint(
+            album_id=album_id,
+            variant=item.variant,
+            retailer=item.retailer,
+        )
+        rel_stmt = pg_insert(Release).values(
+            album_id=album_id,
+            variant=item.variant,
+            retailer_name=item.retailer,
+            fingerprint=rel_fp,
+        )
+        rel_upsert = rel_stmt.on_conflict_do_update(
+            index_elements=[Release.fingerprint],
+            set_={
+                "updated_at": func.now(),
+            },
+        ).returning(Release.id)
+        rel_id = session.execute(rel_upsert).scalar_one()
+
+        # 4. Link SubmissionRelease
         sr_stmt = (
             pg_insert(SubmissionRelease)
             .values(submission_id=sub.id, release_id=rel_id)
@@ -283,7 +314,7 @@ def persist_extracted_releases(
 
 
 def _build_cosine_similarity_query(
-    model: type[Release | Artist],
+    model: type[Album | Artist],
     vector: list[float],
     max_distance: float,
     top_k: int,
@@ -309,11 +340,12 @@ def find_catalog_candidates(
 
     1. Normalizes input query strings and pre-cleans them with `pre_clean_title`.
     2. Embeds all unique query titles in a single vectorized batch call using `embed_texts`.
-    3. Queries PostgreSQL for up to `top_k` Releases and `top_k` Artists per query vector
+    3. Queries PostgreSQL for up to `top_k` Albums and `top_k` Artists per query vector
        having cosine distance <= (1.0 - min_similarity).
-    4. Deduplicates releases and artists across the query batch, keeping the highest similarity.
-    5. Hydrates matched releases with their contributing artists from `ReleaseArtist` / `Artist`.
-    6. Returns clean `CatalogCandidates` sorted by similarity descending.
+    4. Deduplicates albums and artists across the query batch, keeping the highest similarity.
+    5. Hydrates contributing artists from `AlbumArtist` -> `Artist`.
+    6. Hydrates child `Release` variants and retailers for matched albums.
+    7. Returns clean `CatalogCandidates` sorted by similarity descending.
     """
     if isinstance(query_titles, str):
         raw_titles = [query_titles]
@@ -330,8 +362,8 @@ def find_catalog_candidates(
     vectors = embed_texts(unique_titles)
     vector_map = dict(zip(unique_titles, vectors))
 
-    # Map release ID to (Release, best_similarity)
-    best_releases: dict[Any, tuple[Release, float]] = {}
+    # Map album ID to (Album, best_similarity)
+    best_albums: dict[Any, tuple[Album, float]] = {}
     # Map artist name to best_similarity
     best_artists: dict[str, float] = {}
 
@@ -340,15 +372,15 @@ def find_catalog_candidates(
     for title in valid_titles:
         vec = vector_map[title]
 
-        # 1. Query top_k Releases using pgvector cosine distance
-        rel_stmt = _build_cosine_similarity_query(Release, vec, max_distance, top_k)
-        rel_rows = session.execute(rel_stmt).all()
-        for rel_obj, dist in rel_rows:
+        # 1. Query top_k Albums using pgvector cosine distance
+        album_stmt = _build_cosine_similarity_query(Album, vec, max_distance, top_k)
+        album_rows = session.execute(album_stmt).all()
+        for album_obj, dist in album_rows:
             sim = 1.0 - float(dist)
             if sim >= min_similarity and (
-                rel_obj.id not in best_releases or sim > best_releases[rel_obj.id][1]
+                album_obj.id not in best_albums or sim > best_albums[album_obj.id][1]
             ):
-                best_releases[rel_obj.id] = (rel_obj, sim)
+                best_albums[album_obj.id] = (album_obj, sim)
 
         # 2. Query top_k Artists using pgvector cosine distance
         art_stmt = _build_cosine_similarity_query(Artist, vec, max_distance, top_k)
@@ -360,40 +392,76 @@ def find_catalog_candidates(
             ):
                 best_artists[art_obj.name] = sim
 
-    # 3. Hydrate contributing artists for all matched releases
-    matched_rel_ids = list(best_releases.keys())
-    rel_artists_map: dict[Any, list[str]] = {rid: [] for rid in matched_rel_ids}
-    if matched_rel_ids:
-        ra_stmt = (
-            select(ReleaseArtist.release_id, Artist.name)
-            .join(Artist, ReleaseArtist.artist_id == Artist.id)
-            .where(ReleaseArtist.release_id.in_(matched_rel_ids))
+    # 3. Hydrate contributing artists for all matched albums
+    matched_album_ids = list(best_albums.keys())
+    album_artists_map: dict[Any, list[str]] = {aid: [] for aid in matched_album_ids}
+    if matched_album_ids:
+        aa_stmt = (
+            select(AlbumArtist.album_id, Artist.name)
+            .join(Artist, AlbumArtist.artist_id == Artist.id)
+            .where(AlbumArtist.album_id.in_(matched_album_ids))
         )
-        ra_rows = session.execute(ra_stmt).all()
-        for r_id, a_name in ra_rows:
-            if a_name not in rel_artists_map[r_id]:
-                rel_artists_map[r_id].append(str(a_name))
+        aa_rows = session.execute(aa_stmt).all()
+        for a_id, a_name in aa_rows:
+            if a_name not in album_artists_map[a_id]:
+                album_artists_map[a_id].append(str(a_name))
 
-    # 4. Assemble deduplicated CatalogReleaseCandidate list sorted by similarity descending
-    sorted_releases = sorted(best_releases.values(), key=lambda pair: pair[1], reverse=True)
+    # 4. Hydrate child releases for matched albums
+    album_releases_map: dict[Any, list[Release]] = {aid: [] for aid in matched_album_ids}
+    if matched_album_ids:
+        rel_stmt = (
+            select(Release)
+            .where(Release.album_id.in_(matched_album_ids))
+            .order_by(Release.created_at.asc())
+        )
+        rel_rows = session.execute(rel_stmt).scalars().all()
+        for r in rel_rows:
+            album_releases_map[r.album_id].append(r)
+
+    # 5. Assemble deduplicated CatalogReleaseCandidate list sorted by similarity descending
+    sorted_albums = sorted(best_albums.values(), key=lambda pair: pair[1], reverse=True)
     candidate_releases: list[CatalogReleaseCandidate] = []
-    for rel_obj, sim in sorted_releases:
-        artists = rel_artists_map.get(rel_obj.id, [])
-        if not artists and rel_obj.combined_artist:
-            artists = [str(rel_obj.combined_artist)]
-        candidate_releases.append(
-            CatalogReleaseCandidate(
-                id=str(rel_obj.id),
-                combined_artist=str(rel_obj.combined_artist),
-                album_title=str(rel_obj.album_title),
-                artists=artists,
-                variant=str(rel_obj.variant) if rel_obj.variant is not None else None,
-                retailer=str(rel_obj.retailer_name) if rel_obj.retailer_name is not None else None,
-                similarity=round(sim, 4),
-            )
-        )
+    seen_rel_ids: set[str] = set()
 
-    # 5. Assemble deduplicated artist names sorted by similarity descending
+    for album_obj, sim in sorted_albums:
+        artists = album_artists_map.get(album_obj.id, [])
+        if not artists and album_obj.combined_artist:
+            artists = [str(album_obj.combined_artist)]
+
+        child_releases = album_releases_map.get(album_obj.id, [])
+        if child_releases:
+            for child in child_releases:
+                cid = str(child.id)
+                if cid not in seen_rel_ids:
+                    seen_rel_ids.add(cid)
+                    candidate_releases.append(
+                        CatalogReleaseCandidate(
+                            id=cid,
+                            combined_artist=str(album_obj.combined_artist),
+                            album_title=str(album_obj.title),
+                            artists=artists,
+                            variant=str(child.variant) if child.variant is not None else None,
+                            retailer=str(child.retailer_name) if child.retailer_name is not None else None,
+                            similarity=round(sim, 4),
+                        )
+                    )
+        else:
+            aid = str(album_obj.id)
+            if aid not in seen_rel_ids:
+                seen_rel_ids.add(aid)
+                candidate_releases.append(
+                    CatalogReleaseCandidate(
+                        id=aid,
+                        combined_artist=str(album_obj.combined_artist),
+                        album_title=str(album_obj.title),
+                        artists=artists,
+                        variant=None,
+                        retailer=None,
+                        similarity=round(sim, 4),
+                    )
+                )
+
+    # 6. Assemble deduplicated artist names sorted by similarity descending
     sorted_artists = sorted(best_artists.items(), key=lambda pair: pair[1], reverse=True)
     candidate_artists = [str(name) for name, _ in sorted_artists]
 
@@ -444,6 +512,7 @@ __all__ = [
     "CatalogCandidates",
     "CatalogReleaseCandidate",
     "ReleasePersistenceService",
+    "compute_album_fingerprint",
     "compute_release_fingerprint",
     "embed_texts",
     "find_catalog_candidates",
