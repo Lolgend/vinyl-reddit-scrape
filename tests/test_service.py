@@ -1591,3 +1591,70 @@ class TestCliRunner:
 
         mock_worker.extract_batch.assert_called_once_with(sample_batch, batch_size=8)
         service.stop()
+
+
+class TestDiscogsEnrichmentWorkerIntegration:
+    """Tests for PollerService DiscogsEnrichmentWorker daemon thread and synchronous single-cycle integration."""
+
+    def test_poller_service_initializes_enrichment_trigger_and_defaults(self, session_factory):
+        service = PollerService(session_factory=session_factory)
+        assert hasattr(service, "_enrichment_trigger")
+        assert isinstance(service._enrichment_trigger, threading.Event)
+        assert hasattr(service, "enrichment_interval_seconds")
+        assert service.enrichment_interval_seconds == 60
+        service.stop()
+
+    def test_trigger_enrichment_sets_enrichment_trigger(self, session_factory):
+        service = PollerService(session_factory=session_factory)
+        assert not service._enrichment_trigger.is_set()
+        service.trigger_enrichment()
+        assert service._enrichment_trigger.is_set()
+        service.stop()
+
+    def test_poll_and_extract_cycle_calls_process_pending_enrichment(self, session_factory):
+        service = PollerService(session_factory=session_factory)
+        service.poll_new = MagicMock(return_value=MagicMock(inserted=1, updated=0))
+        service.poll_hot = MagicMock(return_value=MagicMock(inserted=0, updated=1))
+        service.process_unextracted_submissions = MagicMock(return_value=2)
+        service.process_pending_enrichment = MagicMock(return_value=3)
+
+        stats = service.poll_and_extract_cycle()
+
+        assert stats.extracted_count == 2
+        assert hasattr(stats, "enriched_count")
+        assert stats.enriched_count == 3
+        service.process_pending_enrichment.assert_called_once()
+        service.stop()
+
+    def test_run_starts_and_stops_enrichment_worker_thread(self, session_factory):
+        service = PollerService(session_factory=session_factory)
+        service.poll_new = MagicMock()
+        service.poll_hot = MagicMock()
+        service.process_unextracted_submissions = MagicMock(return_value=0)
+        service.process_pending_enrichment = MagicMock(return_value=0)
+
+        run_thread = threading.Thread(target=service.run, daemon=True)
+        run_thread.start()
+
+        # Allow service.run() to launch worker threads
+        import time
+        start_time = time.time()
+        enrichment_thread = None
+        while time.time() - start_time < 3.0:
+            for t in threading.enumerate():
+                if t.name == "DiscogsEnrichmentWorker":
+                    enrichment_thread = t
+                    break
+            if enrichment_thread is not None and enrichment_thread.is_alive():
+                break
+            time.sleep(0.05)
+
+        assert enrichment_thread is not None
+        assert enrichment_thread.is_alive()
+        assert enrichment_thread.daemon is True
+
+        service.stop()
+        run_thread.join(timeout=3.0)
+        enrichment_thread.join(timeout=3.0)
+        assert not enrichment_thread.is_alive()
+

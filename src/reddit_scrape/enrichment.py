@@ -35,9 +35,10 @@ from reddit_scrape.embeddings import (
     embed_texts,
 )
 from reddit_scrape.extraction import get_default_thinking_level
-from reddit_scrape.models import Album, AlbumArtist, Artist
+from reddit_scrape.models import Album, AlbumArtist, Artist, Release, SubmissionRelease
 from reddit_scrape.persistence import (
     compute_album_fingerprint,
+    compute_release_fingerprint,
     normalize_attribute,
 )
 
@@ -110,6 +111,25 @@ Rules:
 """
 
 
+SIBLING_RECONCILIATION_SYSTEM_PROMPT = """You are an expert discography classifier and catalog reconciliation agent.
+Your task is to evaluate sibling physical Release pressings belonging to the same canonical Album and identify duplicate entries that represent the exact same commercial pressing/variant expressed with different wording.
+
+Evaluation Rules:
+1. Identify Duplicate Pressings:
+   - Group rows that refer to the exact same physical release variant and retailer (e.g., 'Pink /500' vs 'Limited Pink Vinyl (500 copies)', 'Standard Black' vs 'Black Vinyl', or 'Target Exclusive Opaque Red' vs 'Target Red').
+   - Do NOT merge genuinely distinct pressings (e.g., 'Pink Vinyl /500' vs 'Clear Vinyl /100', '1LP Standard' vs '2LP Deluxe 45RPM', or different retailers like 'Rough Trade' vs 'Target').
+   - If in doubt, keep them separate. Only group items that are clearly identical commercial releases described with slightly different phrasing.
+
+2. Canonical Standardized Output:
+   - For each group of duplicate releases:
+     - Set `canonical_release_id` to the ID of the release to keep.
+     - Set `duplicate_release_ids` to the list of duplicate release IDs to merge into `canonical_release_id`.
+     - Set `standardized_variant` to the clean standardized variant description (e.g., 'Pink /500').
+     - Set `standardized_retailer` to the clean standardized retailer name (e.g., 'Deathwish Inc').
+   - If all siblings are distinct pressings, return `duplicate_groups = []`.
+"""
+
+
 class CandidateArbiterResult(BaseModel):
     """Structured LLM evaluation of Discogs search candidates."""
 
@@ -173,6 +193,47 @@ class WebReconciliationResult(BaseModel):
         default=None,
         description="Brief explanation of canonicalization decisions.",
     )
+
+
+class SiblingDuplicateGroup(BaseModel):
+    """A group of duplicate sibling release rows to merge into a single canonical release."""
+
+    canonical_release_id: str = Field(
+        description="The ID of the surviving canonical release row."
+    )
+    duplicate_release_ids: list[str] = Field(
+        description="The IDs of the duplicate release rows to merge into the canonical release."
+    )
+    standardized_variant: str | None = Field(
+        default=None,
+        description="Clean standardized variant description (e.g. 'Pink /500').",
+    )
+    standardized_retailer: str | None = Field(
+        default=None,
+        description="Clean standardized retailer name (e.g. 'Deathwish Inc').",
+    )
+
+
+class SiblingReconciliationResult(BaseModel):
+    """Structured LLM result identifying duplicate sibling release groups."""
+
+    duplicate_groups: list[SiblingDuplicateGroup] = Field(
+        default_factory=list,
+        description="List of duplicate groups to merge. Empty if all sibling releases are distinct.",
+    )
+    reasoning: str | None = Field(
+        default=None,
+        description="Brief explanation of sibling release grouping decisions.",
+    )
+
+
+@dataclass
+class SiblingReleaseInfo:
+    """Sibling release metadata passed to Phase 4 LLM reconciliation."""
+
+    id: uuid.UUID | str
+    variant: str | None = None
+    retailer_name: str | None = None
 
 
 @dataclass
@@ -800,6 +861,100 @@ def reconcile_web_search(
         return fallback
 
 
+def build_sibling_reconciliation_prompt(
+    combined_artist: str,
+    album_title: str,
+    siblings: Sequence[SiblingReleaseInfo | Any],
+) -> str:
+    """Build the LLM user prompt for sibling Release reconciliation."""
+    lines = [
+        f"Parent Canonical Album:\n- Combined Artist: {combined_artist}\n- Album Title: {album_title}\n",
+        "Sibling Physical Releases:",
+    ]
+    for s in siblings:
+        s_id = str(getattr(s, "id", ""))
+        variant = getattr(s, "variant", None) or "None"
+        retailer = getattr(s, "retailer_name", None) or "None"
+        lines.append(
+            f"- ID: {s_id}\n"
+            f"  Variant: {variant}\n"
+            f"  Retailer: {retailer}"
+        )
+    return "\n".join(lines)
+
+
+def create_sibling_reconciliation_agent(
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model_name: str | None = None,
+    thinking_level: str | None = None,
+    model: Any = None,
+) -> Agent[None, SiblingReconciliationResult]:
+    """Create a PydanticAI Agent configured for sibling release reconciliation."""
+    if model is not None:
+        return Agent(
+            model,
+            output_type=SiblingReconciliationResult,
+            system_prompt=SIBLING_RECONCILIATION_SYSTEM_PROMPT,
+        )
+
+    key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY")
+    if not key:
+        raise ValueError(
+            "DEEPSEEK_API_KEY or DEEPSEEK_KEY environment variable is required"
+        )
+    url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    model_str = model_name or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
+
+    level = thinking_level or os.getenv("LLM_THINKING_LEVEL")
+    if not level:
+        level = get_default_thinking_level(model_str)
+
+    model_settings: ModelSettings
+    if level.lower() == "none":
+        model_settings = {"thinking": False}
+    else:
+        model_settings = {"thinking": cast(Any, level.lower())}
+
+    provider = OpenAIProvider(base_url=url, api_key=key)
+    chat_model = OpenAIChatModel(model_str, provider=provider)
+
+    return Agent(
+        chat_model,
+        output_type=SiblingReconciliationResult,
+        system_prompt=SIBLING_RECONCILIATION_SYSTEM_PROMPT,
+        model_settings=model_settings,
+    )
+
+
+def reconcile_sibling_releases(
+    combined_artist: str,
+    album_title: str,
+    siblings: Sequence[SiblingReleaseInfo | Any],
+    sibling_agent: Agent[None, SiblingReconciliationResult] | None = None,
+) -> SiblingReconciliationResult:
+    """Pass sibling releases to LLM outside any DB session to detect duplicate (variant, retailer) pressings."""
+    if len(siblings) < 2:
+        return SiblingReconciliationResult(duplicate_groups=[])
+
+    agent = sibling_agent or create_sibling_reconciliation_agent()
+    prompt = build_sibling_reconciliation_prompt(
+        combined_artist=combined_artist,
+        album_title=album_title,
+        siblings=siblings,
+    )
+    try:
+        return cast(SiblingReconciliationResult, _run_agent_sync(agent, prompt))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Sibling release reconciliation agent failed for '%s - %s': %s",
+            combined_artist,
+            album_title,
+            exc,
+        )
+        return SiblingReconciliationResult(duplicate_groups=[], reasoning=str(exc))
+
+
 def arbitrate_work_candidates(
     combined_artist: str,
     title: str,
@@ -1207,6 +1362,7 @@ class CatalogEnrichmentService:
         arbiter_agent: Agent[None, CandidateArbiterResult] | None = None,
         disambiguation_agent: Agent[None, WorkReconciliationResult] | None = None,
         web_agent: Agent[None, WebReconciliationResult] | None = None,
+        sibling_agent: Agent[None, SiblingReconciliationResult] | None = None,
         deepseek_api_key: str | None = None,
         deepseek_base_url: str | None = None,
         deepseek_http_client: httpx.Client | None = None,
@@ -1216,6 +1372,7 @@ class CatalogEnrichmentService:
         self.arbiter_agent = arbiter_agent
         self.disambiguation_agent = disambiguation_agent
         self.web_agent = web_agent
+        self.sibling_agent = sibling_agent
         self.deepseek_api_key = deepseek_api_key
         self.deepseek_base_url = deepseek_base_url
         self.deepseek_http_client = deepseek_http_client
@@ -1498,34 +1655,204 @@ class CatalogEnrichmentService:
             if album is None:
                 raise ValueError(f"Album {enriched.album_id} not found for enrichment commit")
 
-            album.combined_artist = enriched.combined_artist
-            album.title = enriched.title
-            album.fingerprint = enriched.fingerprint
-            album.discogs_master_id = enriched.discogs_master_id
-            album.discogs_release_id = enriched.discogs_release_id
-            album.embedding = enriched.embedding
-            album.discogs_status = enriched.discogs_status
-            album.enrichment_attempts = 0
-            album.enrichment_error = None
-            album.last_enriched_at = func.now()
+            # Check if canonical update collides with an existing Album row
+            colliding_album_conds = [Album.fingerprint == enriched.fingerprint]
+            if enriched.discogs_master_id is not None:
+                colliding_album_conds.append(
+                    Album.discogs_master_id == enriched.discogs_master_id
+                )
+            if enriched.discogs_release_id is not None:
+                colliding_album_conds.append(
+                    Album.discogs_release_id == enriched.discogs_release_id
+                )
+
+            colliding_album = session.execute(
+                select(Album).where(
+                    Album.id != album.id,
+                    or_(*colliding_album_conds),
+                )
+            ).scalars().first()
+
+            if colliding_album is not None:
+                surviving_album = colliding_album
+                superseded_album = album
+
+                # 1. Re-parent album_artists from superseded_album to surviving_album
+                superseded_aa = session.execute(
+                    select(AlbumArtist).where(
+                        AlbumArtist.album_id == superseded_album.id
+                    )
+                ).scalars().all()
+                for aa in superseded_aa:
+                    aa_exists = session.execute(
+                        select(AlbumArtist).where(
+                            AlbumArtist.album_id == surviving_album.id,
+                            AlbumArtist.artist_id == aa.artist_id,
+                        )
+                    ).scalars().first()
+                    if aa_exists is None:
+                        session.add(
+                            AlbumArtist(
+                                album_id=surviving_album.id,
+                                artist_id=aa.artist_id,
+                            )
+                        )
+                    session.delete(aa)
+                session.flush()
+
+                # 2. Re-parent child Release rows from superseded_album to surviving_album
+                superseded_releases = session.execute(
+                    select(Release).where(Release.album_id == superseded_album.id)
+                ).scalars().all()
+
+                surviving_releases = session.execute(
+                    select(Release).where(Release.album_id == surviving_album.id)
+                ).scalars().all()
+                surviving_by_fp = {r.fingerprint: r for r in surviving_releases}
+
+                for rel in superseded_releases:
+                    new_fp = compute_release_fingerprint(
+                        surviving_album.id,
+                        cast("str | None", rel.variant),
+                        cast("str | None", rel.retailer_name),
+                    )
+                    if new_fp in surviving_by_fp:
+                        surviving_rel = surviving_by_fp[new_fp]
+                        # Re-link submission_releases
+                        sub_rels = session.execute(
+                            select(SubmissionRelease).where(
+                                SubmissionRelease.release_id == rel.id
+                            )
+                        ).scalars().all()
+                        for sr in sub_rels:
+                            sr_exists = session.execute(
+                                select(SubmissionRelease).where(
+                                    SubmissionRelease.submission_id == sr.submission_id,
+                                    SubmissionRelease.release_id == surviving_rel.id,
+                                )
+                            ).scalars().first()
+                            if sr_exists is None:
+                                session.add(
+                                    SubmissionRelease(
+                                        submission_id=sr.submission_id,
+                                        release_id=surviving_rel.id,
+                                    )
+                                )
+                            session.delete(sr)
+                        session.flush()
+                        session.delete(rel)
+                    else:
+                        rel.album_id = surviving_album.id
+                        rel.fingerprint = new_fp
+                        surviving_by_fp[new_fp] = rel
+                session.flush()
+
+                # 3. Delete superseded album
+                session.delete(superseded_album)
+                session.flush()
+
+                # 4. Update surviving album metadata
+                surviving_album.combined_artist = enriched.combined_artist
+                surviving_album.title = enriched.title
+                surviving_album.fingerprint = enriched.fingerprint
+                if enriched.discogs_master_id is not None:
+                    surviving_album.discogs_master_id = enriched.discogs_master_id
+                if enriched.discogs_release_id is not None:
+                    surviving_album.discogs_release_id = enriched.discogs_release_id
+                surviving_album.embedding = enriched.embedding
+                surviving_album.discogs_status = enriched.discogs_status
+                surviving_album.enrichment_attempts = 0
+                surviving_album.enrichment_error = None
+                surviving_album.last_enriched_at = func.now()
+
+                target_album = surviving_album
+            else:
+                album.combined_artist = enriched.combined_artist
+                album.title = enriched.title
+                album.fingerprint = enriched.fingerprint
+                album.discogs_master_id = enriched.discogs_master_id
+                album.discogs_release_id = enriched.discogs_release_id
+                album.embedding = enriched.embedding
+                album.discogs_status = enriched.discogs_status
+                album.enrichment_attempts = 0
+                album.enrichment_error = None
+                album.last_enriched_at = func.now()
+
+                target_album = album
 
             for art_data in enriched.artists:
                 if art_data.artist_id is not None:
                     artist = session.get(Artist, art_data.artist_id)
                     if artist is not None:
-                        artist.name = art_data.name
+                        # Check if updating this artist causes collision with another artist row
+                        colliding_conds = [Artist.name == art_data.name]
                         if art_data.discogs_artist_id is not None:
-                            artist.discogs_artist_id = art_data.discogs_artist_id
-                        artist.embedding = art_data.embedding
+                            colliding_conds.append(
+                                Artist.discogs_artist_id == art_data.discogs_artist_id
+                            )
+                        colliding_artist = session.execute(
+                            select(Artist).where(
+                                Artist.id != artist.id,
+                                or_(*colliding_conds),
+                            )
+                        ).scalars().first()
+
+                        if colliding_artist is not None:
+                            # Re-parent album_artists for this album to colliding_artist
+                            old_links = session.execute(
+                                select(AlbumArtist).where(
+                                    AlbumArtist.album_id == target_album.id,
+                                    AlbumArtist.artist_id == artist.id,
+                                )
+                            ).scalars().all()
+                            for link in old_links:
+                                link_exists = session.execute(
+                                    select(AlbumArtist).where(
+                                        AlbumArtist.album_id == target_album.id,
+                                        AlbumArtist.artist_id == colliding_artist.id,
+                                    )
+                                ).scalars().first()
+                                if link_exists is None:
+                                    session.add(
+                                        AlbumArtist(
+                                            album_id=target_album.id,
+                                            artist_id=colliding_artist.id,
+                                        )
+                                    )
+                                session.delete(link)
+                            session.flush()
+
+                            # Delete superseded artist if orphaned (no albums reference it)
+                            remaining_links = session.execute(
+                                select(AlbumArtist).where(
+                                    AlbumArtist.artist_id == artist.id
+                                )
+                            ).scalars().all()
+                            if not remaining_links:
+                                session.delete(artist)
+                                session.flush()
+
+                            # Update surviving artist
+                            colliding_artist.name = art_data.name
+                            if art_data.discogs_artist_id is not None:
+                                colliding_artist.discogs_artist_id = (
+                                    art_data.discogs_artist_id
+                                )
+                            colliding_artist.embedding = art_data.embedding
+                        else:
+                            artist.name = art_data.name
+                            if art_data.discogs_artist_id is not None:
+                                artist.discogs_artist_id = art_data.discogs_artist_id
+                            artist.embedding = art_data.embedding
                 else:
                     where_clauses = [Artist.name == art_data.name]
                     if art_data.discogs_artist_id is not None:
-                        where_clauses.append(Artist.discogs_artist_id == art_data.discogs_artist_id)
-                    existing_art = session.execute(
-                        select(Artist).where(
-                            where_clauses[0] if len(where_clauses) == 1 else (where_clauses[0] | where_clauses[1])
+                        where_clauses.append(
+                            Artist.discogs_artist_id == art_data.discogs_artist_id
                         )
-                    ).scalar_one_or_none()
+                    existing_art = session.execute(
+                        select(Artist).where(or_(*where_clauses))
+                    ).scalars().first()
                     if existing_art is None:
                         new_art = Artist(
                             name=art_data.name,
@@ -1544,17 +1871,19 @@ class CatalogEnrichmentService:
 
                     link_exists = session.execute(
                         select(AlbumArtist).where(
-                            AlbumArtist.album_id == album.id,
+                            AlbumArtist.album_id == target_album.id,
                             AlbumArtist.artist_id == target_art_id,
                         )
-                    ).scalar_one_or_none()
+                    ).scalars().first()
                     if link_exists is None:
-                        session.add(AlbumArtist(album_id=album.id, artist_id=target_art_id))
+                        session.add(
+                            AlbumArtist(album_id=target_album.id, artist_id=target_art_id)
+                        )
 
             session.commit()
-            session.refresh(album)
-            session.expunge(album)
-            return album
+            session.refresh(target_album)
+            session.expunge(target_album)
+            return target_album
 
     commit_enrichment = commit_matched_enrichment
 
@@ -1570,27 +1899,178 @@ class CatalogEnrichmentService:
             error=error,
         )
 
+    def fetch_sibling_releases(
+        self, album_id: uuid.UUID | str | Any
+    ) -> list[SiblingReleaseInfo]:
+        """Fetch child releases of an album in a short read session."""
+        uid = uuid.UUID(str(album_id)) if not isinstance(album_id, uuid.UUID) else album_id
+        with self.session_factory() as session:
+            stmt = select(Release).where(Release.album_id == uid).order_by(Release.created_at)
+            releases = session.execute(stmt).scalars().all()
+            return [
+                SiblingReleaseInfo(
+                    id=cast(uuid.UUID, r.id),
+                    variant=cast("str | None", r.variant),
+                    retailer_name=cast("str | None", r.retailer_name),
+                )
+                for r in releases
+            ]
+
+    def commit_sibling_reconciliation(
+        self,
+        album_id: uuid.UUID | str | Any,
+        duplicate_groups: Sequence[SiblingDuplicateGroup],
+    ) -> int:
+        """Write Tx 2: Merge duplicate sibling Release rows, re-link submission_releases, and delete duplicates."""
+        if not duplicate_groups:
+            return 0
+
+        uid = uuid.UUID(str(album_id)) if not isinstance(album_id, uuid.UUID) else album_id
+        deleted_count = 0
+
+        with self.session_factory() as session:
+            for group in duplicate_groups:
+                canon_uid = (
+                    uuid.UUID(str(group.canonical_release_id))
+                    if not isinstance(group.canonical_release_id, uuid.UUID)
+                    else group.canonical_release_id
+                )
+                canonical_rel = session.get(Release, canon_uid)
+                if canonical_rel is None:
+                    continue
+
+                if group.standardized_variant is not None:
+                    canonical_rel.variant = group.standardized_variant
+                if group.standardized_retailer is not None:
+                    canonical_rel.retailer_name = group.standardized_retailer
+                canonical_rel.fingerprint = compute_release_fingerprint(
+                    uid,
+                    cast("str | None", canonical_rel.variant),
+                    cast("str | None", canonical_rel.retailer_name),
+                )
+
+                for dup_id in group.duplicate_release_ids:
+                    dup_uid = (
+                        uuid.UUID(str(dup_id))
+                        if not isinstance(dup_id, uuid.UUID)
+                        else dup_id
+                    )
+                    dup_rel = session.get(Release, dup_uid)
+                    if dup_rel is None or dup_rel.id == canonical_rel.id:
+                        continue
+
+                    # Re-link submission_releases
+                    sub_rels = session.execute(
+                        select(SubmissionRelease).where(
+                            SubmissionRelease.release_id == dup_rel.id
+                        )
+                    ).scalars().all()
+                    for sr in sub_rels:
+                        sr_exists = session.execute(
+                            select(SubmissionRelease).where(
+                                SubmissionRelease.submission_id == sr.submission_id,
+                                SubmissionRelease.release_id == canonical_rel.id,
+                            )
+                        ).scalars().first()
+                        if sr_exists is None:
+                            session.add(
+                                SubmissionRelease(
+                                    submission_id=sr.submission_id,
+                                    release_id=canonical_rel.id,
+                                )
+                            )
+                        session.delete(sr)
+                    session.flush()
+                    session.delete(dup_rel)
+                    session.flush()
+                    deleted_count += 1
+
+            session.commit()
+        return deleted_count
+
     def enrich_album(
         self,
         album_id: uuid.UUID | str | Any,
         raise_on_error: bool = False,
     ) -> Album | None:
-        """Execute Phase 1, Phase 2, and Phase 3 detached enrichment for a single album."""
+        """Execute Phase 1, Phase 2, Phase 3, and Phase 4 detached enrichment for a single album."""
         pending = self.fetch_pending_album(album_id)
         if pending is None:
             return None
 
         try:
             enriched = self.execute_detached_enrichment(pending)
-            if enriched is not None:
-                return self.commit_matched_enrichment(enriched)
-            return None
+            if enriched is None:
+                return None
+
+            # Phase 3 (Short Write Tx 1)
+            surviving_album = self.commit_matched_enrichment(enriched)
+
+            # Phase 4 (Detached Sibling Release RAG Reconciliation + Short Write Tx 2)
+            siblings = self.fetch_sibling_releases(surviving_album.id)
+            if len(siblings) >= 2:
+                reconciled = reconcile_sibling_releases(
+                    combined_artist=str(surviving_album.combined_artist),
+                    album_title=str(surviving_album.title),
+                    siblings=siblings,
+                    sibling_agent=self.sibling_agent,
+                )
+                if reconciled.duplicate_groups:
+                    self.commit_sibling_reconciliation(
+                        surviving_album.id, reconciled.duplicate_groups
+                    )
+
+            return surviving_album
         except Exception as exc:
             logger.exception("Enrichment failed for album %s", album_id)
             self.record_failure(album_id, exc)
             if raise_on_error:
                 raise
             return None
+
+    def process_pending_enrichment(
+        self,
+        limit: int | None = None,
+        shutdown_event: Any = None,
+        now: datetime | None = None,
+    ) -> int:
+        """Process queued albums through the 4-phase enrichment pipeline until queue empty or limit reached."""
+        enriched_count = 0
+        while True:
+            if shutdown_event is not None and getattr(shutdown_event, "is_set", lambda: False)():
+                break
+            if limit is not None and enriched_count >= limit:
+                break
+
+            pending = self.fetch_next_queued_album(now=now)
+            if pending is None:
+                break
+
+            enriched_album = self.enrich_album(pending.id)
+            if enriched_album is not None and enriched_album.discogs_status in (
+                "matched",
+                "partial_matched",
+                "not_found",
+            ):
+                enriched_count += 1
+
+        return enriched_count
+
+
+def process_pending_enrichment(
+    session_factory: sessionmaker[Session] | Any,
+    discogs_client: DiscogsClient,
+    limit: int | None = None,
+    shutdown_event: Any = None,
+    **kwargs: Any,
+) -> int:
+    """Convenience helper to process pending albums for enrichment."""
+    service = CatalogEnrichmentService(
+        session_factory=session_factory,
+        discogs_client=discogs_client,
+        **kwargs,
+    )
+    return service.process_pending_enrichment(limit=limit, shutdown_event=shutdown_event)
 
 
 def record_enrichment_failure(
@@ -1618,6 +2098,7 @@ def enrich_album(
     arbiter_agent: Agent[None, CandidateArbiterResult] | None = None,
     disambiguation_agent: Agent[None, WorkReconciliationResult] | None = None,
     web_agent: Agent[None, WebReconciliationResult] | None = None,
+    sibling_agent: Agent[None, SiblingReconciliationResult] | None = None,
     deepseek_api_key: str | None = None,
     deepseek_base_url: str | None = None,
     deepseek_http_client: httpx.Client | None = None,
@@ -1630,6 +2111,7 @@ def enrich_album(
         arbiter_agent=arbiter_agent,
         disambiguation_agent=disambiguation_agent,
         web_agent=web_agent,
+        sibling_agent=sibling_agent,
         deepseek_api_key=deepseek_api_key,
         deepseek_base_url=deepseek_base_url,
         deepseek_http_client=deepseek_http_client,
@@ -1640,6 +2122,7 @@ def enrich_album(
 __all__ = [
     "CANDIDATE_ARBITER_SYSTEM_PROMPT",
     "HOMONYM_DISAMBIGUATION_SYSTEM_PROMPT",
+    "SIBLING_RECONCILIATION_SYSTEM_PROMPT",
     "WEB_RECONCILIATION_SYSTEM_PROMPT",
     "CandidateArbiterResult",
     "CanonicalArtistCredit",
@@ -1654,6 +2137,9 @@ __all__ = [
     "ResolvedArtistMatch",
     "ResolvedWorkMatch",
     "ScoredCandidate",
+    "SiblingDuplicateGroup",
+    "SiblingReconciliationResult",
+    "SiblingReleaseInfo",
     "WebReconciliationResult",
     "WebSearchHit",
     "WorkReconciliationResult",
@@ -1661,17 +2147,21 @@ __all__ = [
     "arbitrate_work_candidates",
     "build_artist_arbiter_prompt",
     "build_homonym_disambiguation_prompt",
+    "build_sibling_reconciliation_prompt",
     "build_web_reconciliation_prompt",
     "build_work_arbiter_prompt",
     "compute_cosine_similarity",
     "create_candidate_arbiter_agent",
     "create_homonym_disambiguation_agent",
+    "create_sibling_reconciliation_agent",
     "create_web_reconciliation_agent",
     "deduplicate_candidates",
     "enrich_album",
     "get_next_queued_album",
     "hydrate_work_detail",
+    "process_pending_enrichment",
     "reconcile_artist_homonyms",
+    "reconcile_sibling_releases",
     "reconcile_web_search",
     "reconstruct_combined_artist",
     "record_enrichment_failure",

@@ -18,6 +18,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from reddit_scrape.db import get_database_url, get_session_factory
+from reddit_scrape.discogs import DiscogsClient
+from reddit_scrape.enrichment import CatalogEnrichmentService
 from reddit_scrape.extraction import (
     ExtractionResult,
     ExtractionWorker,
@@ -214,6 +216,7 @@ class CycleStats:
     new_stats: IngestionStats
     hot_stats: IngestionStats
     extracted_count: int
+    enriched_count: int = 0
 
 
 class _AsyncRunner:
@@ -278,6 +281,15 @@ class PollerService:
         hot_limit: int = 50,
         thinking_level: str | None = None,
         llm_batch_size: int = 5,
+        enrichment_service: CatalogEnrichmentService | None = None,
+        discogs_client: DiscogsClient | None = None,
+        enrichment_interval_seconds: int = 60,
+        discogs_token: str | None = None,
+        discogs_consumer_key: str | None = None,
+        discogs_consumer_secret: str | None = None,
+        discogs_user_agent: str | None = None,
+        deepseek_api_key: str | None = None,
+        deepseek_base_url: str | None = None,
     ) -> None:
         self.session_factory = session_factory or get_session_factory()
         self.reddit_adapter = reddit_adapter or RedditSourceAdapter()
@@ -300,11 +312,43 @@ class PollerService:
         self.new_limit = new_limit
         self.hot_limit = hot_limit
 
+        self.enrichment_interval_seconds = enrichment_interval_seconds
         self._shutdown_event = threading.Event()
         self._extraction_trigger = threading.Event()
         self._extraction_lock = threading.Lock()
         self._extraction_thread: threading.Thread | None = None
+        self._enrichment_trigger = threading.Event()
+        self._enrichment_lock = threading.Lock()
+        self._enrichment_thread: threading.Thread | None = None
         self._async_runner = _AsyncRunner()
+        self.enrichment_service: CatalogEnrichmentService | None
+
+        if enrichment_service is not None:
+            self.enrichment_service = enrichment_service
+        elif discogs_client is not None:
+            self.enrichment_service = CatalogEnrichmentService(
+                session_factory=self.session_factory,
+                discogs_client=discogs_client,
+                deepseek_api_key=deepseek_api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY"),
+                deepseek_base_url=deepseek_base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            )
+        elif discogs_token or (discogs_consumer_key and discogs_consumer_secret):
+            raw_ua = discogs_user_agent
+            ua = str(raw_ua).strip() if raw_ua and str(raw_ua).strip() else "VinylReleasesScraper/0.1.0"
+            client = DiscogsClient(
+                token=discogs_token,
+                consumer_key=discogs_consumer_key,
+                consumer_secret=discogs_consumer_secret,
+                user_agent=ua,
+            )
+            self.enrichment_service = CatalogEnrichmentService(
+                session_factory=self.session_factory,
+                discogs_client=client,
+                deepseek_api_key=deepseek_api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY"),
+                deepseek_base_url=deepseek_base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            )
+        else:
+            self.enrichment_service = None
 
     def __del__(self) -> None:
         try:
@@ -317,6 +361,7 @@ class PollerService:
         """Signal the poller service to initiate graceful termination."""
         self._shutdown_event.set()
         self._extraction_trigger.set()
+        self._enrichment_trigger.set()
         if hasattr(self, "_async_runner"):
             self._async_runner.stop()
 
@@ -327,6 +372,10 @@ class PollerService:
     def trigger_extraction(self) -> None:
         """Signal the background extraction worker that unextracted submissions are ready."""
         self._extraction_trigger.set()
+
+    def trigger_enrichment(self) -> None:
+        """Signal the background enrichment worker that pending albums are ready."""
+        self._enrichment_trigger.set()
 
     def register_signal_handlers(self) -> None:
         """Register graceful shutdown handlers for SIGINT and SIGTERM."""
@@ -487,7 +536,19 @@ class PollerService:
                             exc,
                         )
 
+            if extracted_count > 0:
+                self.trigger_enrichment()
+
             return extracted_count
+
+    def process_pending_enrichment(self, limit: int | None = None) -> int:
+        """Query and enrich pending/retryable albums using CatalogEnrichmentService."""
+        if self.enrichment_service is None:
+            return 0
+        return self.enrichment_service.process_pending_enrichment(
+            limit=limit,
+            shutdown_event=self._shutdown_event,
+        )
 
     def poll_and_extract_cycle(
         self,
@@ -501,11 +562,15 @@ class PollerService:
         new_stats = self.poll_new(limit=n_limit)
         hot_stats = self.poll_hot(limit=h_limit)
         extracted_count = self.process_unextracted_submissions()
+        if extracted_count > 0:
+            self.trigger_enrichment()
+        enriched_count = self.process_pending_enrichment()
 
         return CycleStats(
             new_stats=new_stats,
             hot_stats=hot_stats,
             extracted_count=extracted_count,
+            enriched_count=enriched_count,
         )
 
     def run_once(
@@ -539,13 +604,36 @@ class PollerService:
                     exc,
                 )
 
+    def _enrichment_worker_loop(self) -> None:
+        """Background Discogs enrichment worker thread decoupled from ingestion and extraction."""
+        logger.info("Discogs enrichment background worker thread started.")
+        while not self._shutdown_event.is_set():
+            self._enrichment_trigger.wait(timeout=float(self.enrichment_interval_seconds))
+            self._enrichment_trigger.clear()
+            if self._shutdown_event.is_set():
+                break
+
+            try:
+                enriched = self.process_pending_enrichment()
+                if enriched > 0:
+                    logger.info(
+                        "Enriched %d album(s) with Discogs catalog in background",
+                        enriched,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Error processing pending enrichment in background: %s",
+                    exc,
+                )
+
     def run(self) -> None:
         """Start the continuous background ingestion poller with decoupled asynchronous extraction."""
         self.register_signal_handlers()
         logger.info(
-            "Starting PollerService (new_interval=%ss, hot_interval=%ss)",
+            "Starting PollerService (new_interval=%ss, hot_interval=%ss, enrichment_interval=%ss)",
             self.poll_interval_seconds,
             self.hot_poll_interval_seconds,
+            self.enrichment_interval_seconds,
         )
 
         # Start decoupled background extraction worker thread
@@ -555,6 +643,14 @@ class PollerService:
             daemon=True,
         )
         self._extraction_thread.start()
+
+        # Start decoupled background Discogs enrichment worker thread
+        self._enrichment_thread = threading.Thread(
+            target=self._enrichment_worker_loop,
+            name="DiscogsEnrichmentWorker",
+            daemon=True,
+        )
+        self._enrichment_thread.start()
 
         # Run initial discovery and tracking polls on startup
         try:
@@ -604,6 +700,8 @@ class PollerService:
             self.stop()
             if self._extraction_thread and self._extraction_thread.is_alive():
                 self._extraction_thread.join(timeout=5.0)
+            if self._enrichment_thread and self._enrichment_thread.is_alive():
+                self._enrichment_thread.join(timeout=5.0)
             logger.info("PollerService stopped cleanly.")
 
 
