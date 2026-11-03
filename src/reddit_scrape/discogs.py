@@ -125,6 +125,7 @@ class DiscogsClient:
         self.base_url = base_url.rstrip("/")
         self.rate_limit_floor_seconds = rate_limit_floor_seconds
         self.shutdown_event = shutdown_event
+        self._shutdown_event = shutdown_event
 
         has_token = bool(self.token)
         has_key_secret = bool(self.consumer_key and self.consumer_secret)

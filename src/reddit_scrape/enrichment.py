@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import httpx
 from dotenv import load_dotenv
@@ -21,10 +21,12 @@ from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
-from sqlalchemy import and_, case, func, literal, or_, select, text
+from sqlalchemy import and_, case, delete, func, literal, or_, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, sessionmaker
 
 from reddit_scrape.discogs import (
+    DiscogsAPIError,
     DiscogsArtistCredit,
     DiscogsClient,
     DiscogsSearchCandidate,
@@ -35,7 +37,14 @@ from reddit_scrape.embeddings import (
     embed_texts,
 )
 from reddit_scrape.extraction import get_default_thinking_level
-from reddit_scrape.models import Album, AlbumArtist, Artist, Release, SubmissionRelease
+from reddit_scrape.models import (
+    Album,
+    AlbumArtist,
+    Artist,
+    EnrichmentState,
+    Release,
+    SubmissionRelease,
+)
 from reddit_scrape.persistence import (
     compute_album_fingerprint,
     compute_release_fingerprint,
@@ -587,19 +596,24 @@ def build_artist_arbiter_prompt(
     return "\n".join(lines)
 
 
-def create_candidate_arbiter_agent(
+_AgentResultT = TypeVar("_AgentResultT")
+
+
+def _create_deepseek_agent(
+    output_type: type[_AgentResultT],
+    system_prompt: str,
     api_key: str | None = None,
     base_url: str | None = None,
     model_name: str | None = None,
     thinking_level: str | None = None,
     model: Any = None,
-) -> Agent[None, CandidateArbiterResult]:
-    """Create a PydanticAI Agent configured for candidate arbitration."""
+) -> Agent[None, _AgentResultT]:
+    """Shared factory for PydanticAI agents configured with DeepSeek chat model/provider/settings."""
     if model is not None:
         return Agent(
             model,
-            output_type=CandidateArbiterResult,
-            system_prompt=CANDIDATE_ARBITER_SYSTEM_PROMPT,
+            output_type=output_type,
+            system_prompt=system_prompt,
         )
 
     key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY")
@@ -625,9 +639,28 @@ def create_candidate_arbiter_agent(
 
     return Agent(
         chat_model,
+        output_type=output_type,
+        system_prompt=system_prompt,
+        model_settings=model_settings,
+    )
+
+
+def create_candidate_arbiter_agent(
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model_name: str | None = None,
+    thinking_level: str | None = None,
+    model: Any = None,
+) -> Agent[None, CandidateArbiterResult]:
+    """Create a PydanticAI Agent configured for candidate arbitration."""
+    return _create_deepseek_agent(
         output_type=CandidateArbiterResult,
         system_prompt=CANDIDATE_ARBITER_SYSTEM_PROMPT,
-        model_settings=model_settings,
+        api_key=api_key,
+        base_url=base_url,
+        model_name=model_name,
+        thinking_level=thinking_level,
+        model=model,
     )
 
 
@@ -703,39 +736,14 @@ def create_homonym_disambiguation_agent(
     model: Any = None,
 ) -> Agent[None, WorkReconciliationResult]:
     """Create a PydanticAI Agent configured for artist homonym disambiguation and billing reconstruction."""
-    if model is not None:
-        return Agent(
-            model,
-            output_type=WorkReconciliationResult,
-            system_prompt=HOMONYM_DISAMBIGUATION_SYSTEM_PROMPT,
-        )
-
-    key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY")
-    if not key:
-        raise ValueError(
-            "DEEPSEEK_API_KEY or DEEPSEEK_KEY environment variable is required"
-        )
-    url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    model_str = model_name or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
-
-    level = thinking_level or os.getenv("LLM_THINKING_LEVEL")
-    if not level:
-        level = get_default_thinking_level(model_str)
-
-    model_settings: ModelSettings
-    if level.lower() == "none":
-        model_settings = {"thinking": False}
-    else:
-        model_settings = {"thinking": cast(Any, level.lower())}
-
-    provider = OpenAIProvider(base_url=url, api_key=key)
-    chat_model = OpenAIChatModel(model_str, provider=provider)
-
-    return Agent(
-        chat_model,
+    return _create_deepseek_agent(
         output_type=WorkReconciliationResult,
         system_prompt=HOMONYM_DISAMBIGUATION_SYSTEM_PROMPT,
-        model_settings=model_settings,
+        api_key=api_key,
+        base_url=base_url,
+        model_name=model_name,
+        thinking_level=thinking_level,
+        model=model,
     )
 
 
@@ -788,39 +796,14 @@ def create_web_reconciliation_agent(
     model: Any = None,
 ) -> Agent[None, WebReconciliationResult]:
     """Create a PydanticAI Agent configured for web search reconciliation."""
-    if model is not None:
-        return Agent(
-            model,
-            output_type=WebReconciliationResult,
-            system_prompt=WEB_RECONCILIATION_SYSTEM_PROMPT,
-        )
-
-    key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY")
-    if not key:
-        raise ValueError(
-            "DEEPSEEK_API_KEY or DEEPSEEK_KEY environment variable is required"
-        )
-    url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    model_str = model_name or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
-
-    level = thinking_level or os.getenv("LLM_THINKING_LEVEL")
-    if not level:
-        level = get_default_thinking_level(model_str)
-
-    model_settings: ModelSettings
-    if level.lower() == "none":
-        model_settings = {"thinking": False}
-    else:
-        model_settings = {"thinking": cast(Any, level.lower())}
-
-    provider = OpenAIProvider(base_url=url, api_key=key)
-    chat_model = OpenAIChatModel(model_str, provider=provider)
-
-    return Agent(
-        chat_model,
+    return _create_deepseek_agent(
         output_type=WebReconciliationResult,
         system_prompt=WEB_RECONCILIATION_SYSTEM_PROMPT,
-        model_settings=model_settings,
+        api_key=api_key,
+        base_url=base_url,
+        model_name=model_name,
+        thinking_level=thinking_level,
+        model=model,
     )
 
 
@@ -829,14 +812,23 @@ def reconcile_web_search(
     album_title: str,
     hits: Sequence[WebSearchHit],
     web_agent: Agent[None, WebReconciliationResult] | None = None,
+    raw_artists: Sequence[str] | None = None,
 ) -> WebReconciliationResult:
     """Pass web search results through LLM to standardize canonical artist/album names.
 
     Gracefully falls back to extracted names if hits is empty or agent execution errors.
     """
+    fallback_artists = (
+        [a.strip() for a in raw_artists if a.strip()]
+        if raw_artists
+        else [combined_artist]
+    )
+    if not fallback_artists:
+        fallback_artists = [combined_artist]
+
     fallback = WebReconciliationResult(
         canonical_combined_artist=combined_artist,
-        canonical_artists=[combined_artist],
+        canonical_artists=fallback_artists,
         canonical_album_title=album_title,
         reasoning="Fallback to Pass 1 extracted names (0 search hits or error)",
     )
@@ -891,39 +883,14 @@ def create_sibling_reconciliation_agent(
     model: Any = None,
 ) -> Agent[None, SiblingReconciliationResult]:
     """Create a PydanticAI Agent configured for sibling release reconciliation."""
-    if model is not None:
-        return Agent(
-            model,
-            output_type=SiblingReconciliationResult,
-            system_prompt=SIBLING_RECONCILIATION_SYSTEM_PROMPT,
-        )
-
-    key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY")
-    if not key:
-        raise ValueError(
-            "DEEPSEEK_API_KEY or DEEPSEEK_KEY environment variable is required"
-        )
-    url = base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-    model_str = model_name or os.getenv("DEEPSEEK_MODEL") or "deepseek-chat"
-
-    level = thinking_level or os.getenv("LLM_THINKING_LEVEL")
-    if not level:
-        level = get_default_thinking_level(model_str)
-
-    model_settings: ModelSettings
-    if level.lower() == "none":
-        model_settings = {"thinking": False}
-    else:
-        model_settings = {"thinking": cast(Any, level.lower())}
-
-    provider = OpenAIProvider(base_url=url, api_key=key)
-    chat_model = OpenAIChatModel(model_str, provider=provider)
-
-    return Agent(
-        chat_model,
+    return _create_deepseek_agent(
         output_type=SiblingReconciliationResult,
         system_prompt=SIBLING_RECONCILIATION_SYSTEM_PROMPT,
-        model_settings=model_settings,
+        api_key=api_key,
+        base_url=base_url,
+        model_name=model_name,
+        thinking_level=thinking_level,
+        model=model,
     )
 
 
@@ -1251,19 +1218,33 @@ def hydrate_work_detail(
     Calls GET /releases/{resolved_release_id} when the release is unmastered.
     """
     if work_match.resolved_master_id is not None:
-        master = discogs_client.get_master(work_match.resolved_master_id)
-        resolved_rel_id = work_match.resolved_release_id
-        if resolved_rel_id is None and master.main_release is not None:
-            resolved_rel_id = master.main_release
-        return HydratedWorkDetail(
-            resolved_master_id=work_match.resolved_master_id,
-            resolved_release_id=resolved_rel_id,
-            title=master.title,
-            artists=master.artists,
-            year=master.year,
-            genres=master.genres,
-            styles=master.styles,
-        )
+        try:
+            master = discogs_client.get_master(work_match.resolved_master_id)
+            resolved_rel_id = work_match.resolved_release_id
+            if resolved_rel_id is None and master.main_release is not None:
+                resolved_rel_id = master.main_release
+            return HydratedWorkDetail(
+                resolved_master_id=work_match.resolved_master_id,
+                resolved_release_id=resolved_rel_id,
+                title=master.title,
+                artists=master.artists,
+                year=master.year,
+                genres=master.genres,
+                styles=master.styles,
+            )
+        except DiscogsAPIError:
+            if work_match.resolved_release_id is None:
+                raise
+            release = discogs_client.get_release(work_match.resolved_release_id)
+            return HydratedWorkDetail(
+                resolved_master_id=None,
+                resolved_release_id=work_match.resolved_release_id,
+                title=release.title,
+                artists=release.artists,
+                year=release.year,
+                genres=release.genres,
+                styles=release.styles,
+            )
 
     if work_match.resolved_release_id is not None:
         release = discogs_client.get_release(work_match.resolved_release_id)
@@ -1306,10 +1287,10 @@ def get_next_queued_album(
     """
     now_expr = literal(now) if now is not None else func.now()
 
-    p0_cond = Album.discogs_status == "pending"
+    pending_condition = Album.discogs_status == EnrichmentState.PENDING.value
 
-    p1_cond = and_(
-        Album.discogs_status == "failed",
+    due_failed_condition = and_(
+        Album.discogs_status == EnrichmentState.FAILED.value,
         Album.enrichment_attempts < 5,
         or_(
             Album.last_enriched_at.is_(None),
@@ -1322,8 +1303,8 @@ def get_next_queued_album(
         ),
     )
 
-    p2_cond = and_(
-        Album.discogs_status == "partial_matched",
+    due_partial_matched_condition = and_(
+        Album.discogs_status == EnrichmentState.PARTIAL_MATCHED.value,
         or_(
             Album.last_enriched_at.is_(None),
             Album.last_enriched_at <= now_expr - text("interval '7 days'"),
@@ -1332,15 +1313,21 @@ def get_next_queued_album(
     )
 
     priority_case = case(
-        (Album.discogs_status == "pending", 0),
-        (Album.discogs_status == "failed", 1),
-        (Album.discogs_status == "partial_matched", 2),
+        (Album.discogs_status == EnrichmentState.PENDING.value, 0),
+        (Album.discogs_status == EnrichmentState.FAILED.value, 1),
+        (Album.discogs_status == EnrichmentState.PARTIAL_MATCHED.value, 2),
         else_=9,
     )
 
     stmt = (
         select(Album)
-        .where(or_(p0_cond, p1_cond, p2_cond))
+        .where(
+            or_(
+                pending_condition,
+                due_failed_condition,
+                due_partial_matched_condition,
+            )
+        )
         .order_by(
             priority_case.asc(),
             Album.created_at.asc(),
@@ -1350,6 +1337,118 @@ def get_next_queued_album(
     )
 
     return session.execute(stmt).scalars().first()
+
+
+def _resolve_constituent_artists(
+    pending_artists: Sequence[PendingConstituentArtist],
+    canonical_artists: Sequence[CanonicalArtistCredit | str],
+    artist_embeddings: Sequence[list[float]],
+    cascade_artist_matches: dict[str, ResolvedArtistMatch] | None = None,
+    preserve_remaining_pending: bool = False,
+) -> list[EnrichedArtistData]:
+    """Resolve pending constituent artists against canonical artist credits or names."""
+    enriched_artists: list[EnrichedArtistData] = []
+    remaining_pending = list(pending_artists)
+    total_canonical = len(canonical_artists)
+
+    for idx, (canonical_artist, vec) in enumerate(
+        zip(canonical_artists, artist_embeddings)
+    ):
+        if isinstance(canonical_artist, CanonicalArtistCredit):
+            canonical_name = canonical_artist.name
+            discogs_id: int | None = canonical_artist.discogs_artist_id
+        else:
+            canonical_name = str(canonical_artist)
+            discogs_id = None
+
+        norm_canonical = normalize_attribute(canonical_name)
+        norm_canonical_clean = normalize_attribute(_clean_homonym_suffix(canonical_name))
+
+        # 1. Exact match on normalized name
+        matched_pending = next(
+            (
+                pending_artist
+                for pending_artist in remaining_pending
+                if normalize_attribute(pending_artist.name) == norm_canonical
+            ),
+            None,
+        )
+        # 2. Match after stripping homonym suffixes (n)
+        if matched_pending is None:
+            matched_pending = next(
+                (
+                    pending_artist
+                    for pending_artist in remaining_pending
+                    if normalize_attribute(_clean_homonym_suffix(pending_artist.name))
+                    == norm_canonical_clean
+                ),
+                None,
+            )
+        # 3. Match by position if remaining counts align
+        if (
+            matched_pending is None
+            and len(remaining_pending) == (total_canonical - idx)
+        ) or (
+            matched_pending is None
+            and len(remaining_pending) == 1
+        ):
+            matched_pending = remaining_pending[0]
+
+        if matched_pending is not None:
+            remaining_pending.remove(matched_pending)
+            matched_artist_id = matched_pending.id
+            if discogs_id is None:
+                discogs_id = matched_pending.discogs_artist_id
+            if (
+                discogs_id is None
+                and cascade_artist_matches
+                and matched_pending.name in cascade_artist_matches
+            ):
+                discogs_id = cascade_artist_matches[
+                    matched_pending.name
+                ].discogs_artist_id
+        else:
+            matched_artist_id = None
+            if (
+                discogs_id is None
+                and cascade_artist_matches
+                and canonical_name in cascade_artist_matches
+            ):
+                discogs_id = cascade_artist_matches[
+                    canonical_name
+                ].discogs_artist_id
+
+        enriched_artists.append(
+            EnrichedArtistData(
+                artist_id=matched_artist_id,
+                name=canonical_name,
+                discogs_artist_id=discogs_id,
+                embedding=vec,
+            )
+        )
+
+    if preserve_remaining_pending:
+        for pending_artist in remaining_pending:
+            pending_vec = embed_texts([compute_artist_text(pending_artist.name)])[0]
+            discogs_id = pending_artist.discogs_artist_id
+            if (
+                discogs_id is None
+                and cascade_artist_matches
+                and pending_artist.name in cascade_artist_matches
+            ):
+                discogs_id = cascade_artist_matches[
+                    pending_artist.name
+                ].discogs_artist_id
+            enriched_artists.append(
+                EnrichedArtistData(
+                    artist_id=pending_artist.id,
+                    name=pending_artist.name,
+                    discogs_artist_id=discogs_id,
+                    embedding=pending_vec,
+                )
+            )
+
+    return enriched_artists
 
 
 class CatalogEnrichmentService:
@@ -1477,47 +1576,13 @@ class CatalogEnrichmentService:
 
             canonical_fp = compute_album_fingerprint(canonical_combined, canonical_title)
 
-            enriched_artists: list[EnrichedArtistData] = []
-            remaining_pending = list(pending.artists)
-            total_canonical = len(canonical_artists)
-
-            for idx, (ca, vec) in enumerate(zip(canonical_artists, artist_vecs)):
-                norm_ca = normalize_attribute(ca.name)
-                norm_ca_clean = normalize_attribute(_clean_homonym_suffix(ca.name))
-
-                # 1. Exact match on normalized name
-                matched_pending = next(
-                    (p for p in remaining_pending if normalize_attribute(p.name) == norm_ca),
-                    None,
-                )
-                # 2. Match after stripping homonym suffixes (n)
-                if matched_pending is None:
-                    matched_pending = next(
-                        (
-                            p
-                            for p in remaining_pending
-                            if normalize_attribute(_clean_homonym_suffix(p.name)) == norm_ca_clean
-                        ),
-                        None,
-                    )
-                # 3. Match by position if remaining counts align
-                if matched_pending is None and len(remaining_pending) == (total_canonical - idx) or matched_pending is None and len(remaining_pending) == 1:
-                    matched_pending = remaining_pending[0]
-
-                if matched_pending is not None:
-                    remaining_pending.remove(matched_pending)
-                    p_id = matched_pending.id
-                else:
-                    p_id = None
-
-                enriched_artists.append(
-                    EnrichedArtistData(
-                        artist_id=p_id,
-                        name=ca.name,
-                        discogs_artist_id=ca.discogs_artist_id,
-                        embedding=vec,
-                    )
-                )
+            enriched_artists = _resolve_constituent_artists(
+                pending_artists=pending.artists,
+                canonical_artists=canonical_artists,
+                artist_embeddings=artist_vecs,
+                cascade_artist_matches=cascade_result.artist_matches,
+                preserve_remaining_pending=False,
+            )
 
             return EnrichedAlbumData(
                 album_id=pending.id,
@@ -1554,6 +1619,7 @@ class CatalogEnrichmentService:
             album_title=pending.title,
             hits=hits,
             web_agent=self.web_agent,
+            raw_artists=[a.name for a in pending.artists],
         )
 
         web_combined = web_reconciled.canonical_combined_artist
@@ -1571,69 +1637,13 @@ class CatalogEnrichmentService:
 
         web_fp = compute_album_fingerprint(web_combined, web_title)
 
-        web_enriched_artists: list[EnrichedArtistData] = []
-        remaining_pending = list(pending.artists)
-        total_canonical = len(web_artist_names)
-
-        for idx, (art_name, vec) in enumerate(zip(web_artist_names, web_artist_vecs)):
-            norm_ca = normalize_attribute(art_name)
-            norm_ca_clean = normalize_attribute(_clean_homonym_suffix(art_name))
-
-            matched_pending = next(
-                (p for p in remaining_pending if normalize_attribute(p.name) == norm_ca),
-                None,
-            )
-            if matched_pending is None:
-                matched_pending = next(
-                    (
-                        p
-                        for p in remaining_pending
-                        if normalize_attribute(_clean_homonym_suffix(p.name)) == norm_ca_clean
-                    ),
-                    None,
-                )
-            if (
-                matched_pending is None
-                and len(remaining_pending) == (total_canonical - idx)
-                or matched_pending is None
-                and len(remaining_pending) == 1
-            ):
-                matched_pending = remaining_pending[0]
-
-            if matched_pending is not None:
-                remaining_pending.remove(matched_pending)
-                p_id = matched_pending.id
-                discogs_id = matched_pending.discogs_artist_id
-                if discogs_id is None and matched_pending.name in cascade_result.artist_matches:
-                    discogs_id = cascade_result.artist_matches[matched_pending.name].discogs_artist_id
-            else:
-                p_id = None
-                discogs_id = None
-                if art_name in cascade_result.artist_matches:
-                    discogs_id = cascade_result.artist_matches[art_name].discogs_artist_id
-
-            web_enriched_artists.append(
-                EnrichedArtistData(
-                    artist_id=p_id,
-                    name=art_name,
-                    discogs_artist_id=discogs_id,
-                    embedding=vec,
-                )
-            )
-
-        for p in remaining_pending:
-            p_vec = embed_texts([compute_artist_text(p.name)])[0]
-            discogs_id = p.discogs_artist_id
-            if discogs_id is None and p.name in cascade_result.artist_matches:
-                discogs_id = cascade_result.artist_matches[p.name].discogs_artist_id
-            web_enriched_artists.append(
-                EnrichedArtistData(
-                    artist_id=p.id,
-                    name=p.name,
-                    discogs_artist_id=discogs_id,
-                    embedding=p_vec,
-                )
-            )
+        web_enriched_artists = _resolve_constituent_artists(
+            pending_artists=pending.artists,
+            canonical_artists=web_artist_names,
+            artist_embeddings=web_artist_vecs,
+            cascade_artist_matches=cascade_result.artist_matches,
+            preserve_remaining_pending=True,
+        )
 
         return EnrichedAlbumData(
             album_id=pending.id,
@@ -1798,39 +1808,33 @@ class CatalogEnrichmentService:
                         ).scalars().first()
 
                         if colliding_artist is not None:
-                            # Re-parent album_artists for this album to colliding_artist
+                            # Re-parent all AlbumArtist rows referencing artist.id across every album to colliding_artist.id
                             old_links = session.execute(
-                                select(AlbumArtist).where(
-                                    AlbumArtist.album_id == target_album.id,
-                                    AlbumArtist.artist_id == artist.id,
-                                )
-                            ).scalars().all()
-                            for link in old_links:
-                                link_exists = session.execute(
-                                    select(AlbumArtist).where(
-                                        AlbumArtist.album_id == target_album.id,
-                                        AlbumArtist.artist_id == colliding_artist.id,
-                                    )
-                                ).scalars().first()
-                                if link_exists is None:
-                                    session.add(
-                                        AlbumArtist(
-                                            album_id=target_album.id,
-                                            artist_id=colliding_artist.id,
-                                        )
-                                    )
-                                session.delete(link)
-                            session.flush()
-
-                            # Delete superseded artist if orphaned (no albums reference it)
-                            remaining_links = session.execute(
                                 select(AlbumArtist).where(
                                     AlbumArtist.artist_id == artist.id
                                 )
                             ).scalars().all()
-                            if not remaining_links:
-                                session.delete(artist)
-                                session.flush()
+                            for link in old_links:
+                                stmt = (
+                                    pg_insert(AlbumArtist)
+                                    .values(
+                                        album_id=link.album_id,
+                                        artist_id=colliding_artist.id,
+                                    )
+                                    .on_conflict_do_nothing()
+                                )
+                                session.execute(stmt)
+                            session.flush()
+
+                            session.execute(
+                                delete(AlbumArtist).where(
+                                    AlbumArtist.artist_id == artist.id
+                                )
+                            )
+                            session.flush()
+
+                            session.delete(artist)
+                            session.flush()
 
                             # Update surviving artist
                             colliding_artist.name = art_data.name

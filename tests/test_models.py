@@ -9,6 +9,7 @@ from reddit_scrape.models import (
     Album,
     AlbumArtist,
     Artist,
+    EnrichmentState,
     Release,
     Submission,
     SubmissionRelease,
@@ -144,3 +145,19 @@ class TestModelsIntegration:
             assert rel is not None
             assert rel.combined_artist == "Converge / Dropdead"
             assert rel.album_title == "Split"
+
+
+class TestEnrichmentStateEnum:
+    def test_enrichment_state_values(self) -> None:
+        assert EnrichmentState.PENDING == "pending"
+        assert EnrichmentState.MATCHED == "matched"
+        assert EnrichmentState.PARTIAL_MATCHED == "partial_matched"
+        assert EnrichmentState.NOT_FOUND == "not_found"
+        assert EnrichmentState.FAILED == "failed"
+        assert str(EnrichmentState.PENDING) == "pending"
+
+    def test_enrichment_state_exported_from_package(self) -> None:
+        import reddit_scrape
+
+        assert reddit_scrape.EnrichmentState is EnrichmentState
+        assert "EnrichmentState" in reddit_scrape.__all__

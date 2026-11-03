@@ -33,7 +33,7 @@ The retrieval and association of verified musical metadata (canonical titles, re
 _Avoid_: Scraping, tagging, metadata fetching
 
 **Enrichment State**:
-The persistent lifecycle state of an album or release record during external catalog resolution (`pending`, `matched`, `partial_matched`, `not_found`, `failed`).
+The persistent lifecycle state of an album or release record during external catalog resolution, persisted in the `albums.discogs_status` column (`pending`, `matched`, `partial_matched`, `not_found`, `failed`).
 _Avoid_: Sync status, verification flag, match flag
 
 **Artist**:
