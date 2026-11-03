@@ -916,6 +916,52 @@ class TestDetailHydration:
         assert detail.resolved_master_id == 12345
         assert detail.resolved_release_id == 8888
 
+    def test_hydrate_work_detail_master_error_falls_back_to_release(self) -> None:
+        from unittest.mock import MagicMock
+
+        from reddit_scrape.discogs import (
+            DiscogsAPIError,
+            DiscogsArtistCredit,
+            DiscogsClient,
+            DiscogsReleaseDetail,
+            DiscogsSearchCandidate,
+        )
+        from reddit_scrape.enrichment import (
+            ResolvedWorkMatch,
+            hydrate_work_detail,
+        )
+
+        mock_client = MagicMock(spec=DiscogsClient)
+        mock_client.get_master.side_effect = DiscogsAPIError("Master 12345 not found", status_code=404)
+        mock_client.get_release.return_value = DiscogsReleaseDetail(
+            id=8888,
+            title="Jane Doe",
+            master_id=None,
+            year=2001,
+            artists=[DiscogsArtistCredit(id=101, name="Converge", join=None)],
+            genres=["Rock"],
+            styles=["Hardcore"],
+        )
+
+        work_match = ResolvedWorkMatch(
+            tier=2,
+            candidate=DiscogsSearchCandidate(id=8888, type="release", title="Converge - Jane Doe (Vinyl)"),
+            resolved_master_id=12345,
+            resolved_release_id=8888,
+            cosine_similarity=0.95,
+            search_rank=1,
+        )
+
+        detail = hydrate_work_detail(discogs_client=mock_client, work_match=work_match)
+
+        assert detail.resolved_master_id is None
+        assert detail.resolved_release_id == 8888
+        assert detail.title == "Jane Doe"
+        assert len(detail.artists) == 1
+        assert detail.genres == ["Rock"]
+        mock_client.get_master.assert_called_once_with(12345)
+        mock_client.get_release.assert_called_once_with(8888)
+
 
 class TestHomonymDisambiguationAndBilling:
     """Tests for LLM artist homonym (n) disambiguation and billing reconstruction."""
@@ -1697,6 +1743,42 @@ class TestWebReconciliationAgent:
         assert result.canonical_album_title == "Bloodmoon"
         assert "Fallback" in (result.reasoning or "")
 
+    def test_reconcile_web_search_preserves_raw_artists_on_fallback(self) -> None:
+        # 1. Empty hits with raw_artists
+        result_empty = reconcile_web_search(
+            combined_artist="Converge / Dropdead",
+            album_title="Split",
+            hits=[],
+            web_agent=None,
+            raw_artists=["Converge", "Dropdead"],
+        )
+        assert result_empty.canonical_combined_artist == "Converge / Dropdead"
+        assert result_empty.canonical_artists == ["Converge", "Dropdead"]
+        assert result_empty.canonical_album_title == "Split"
+
+        # 2. Agent error with raw_artists
+        mock_agent = MagicMock()
+        mock_agent.run_sync.side_effect = RuntimeError("LLM failed")
+        result_err = reconcile_web_search(
+            combined_artist="Converge / Dropdead",
+            album_title="Split",
+            hits=[WebSearchHit(title="Split LP", url="https://example.com")],
+            web_agent=mock_agent,
+            raw_artists=["Converge", "Dropdead"],
+        )
+        assert result_err.canonical_combined_artist == "Converge / Dropdead"
+        assert result_err.canonical_artists == ["Converge", "Dropdead"]
+
+        # 3. Blank raw_artists falls back to [combined_artist]
+        result_blank = reconcile_web_search(
+            combined_artist="Converge / Dropdead",
+            album_title="Split",
+            hits=[],
+            web_agent=None,
+            raw_artists=["", "   "],
+        )
+        assert result_blank.canonical_artists == ["Converge / Dropdead"]
+
 
 class TestWebSearchEnrichmentStateMachine:
     """Tests for Line 3 Web Search fallback, state transitions ('partial_matched', 'not_found'), and embedding overwrites."""
@@ -1964,6 +2046,55 @@ class TestWebSearchEnrichmentStateMachine:
         assert enriched.combined_artist == "Unknown Indie Act"
         assert enriched.title == "Self Titled EP"
         assert len(enriched.embedding) == 384
+
+    def test_multi_artist_split_preserves_constituent_artists_on_web_search_fallback(
+        self, session_factory
+    ) -> None:
+        with session_factory() as session:
+            art1 = Artist(name="Converge", discogs_artist_id=None)
+            art2 = Artist(name="Dropdead", discogs_artist_id=None)
+            album = Album(
+                combined_artist="Converge / Dropdead",
+                title="Split",
+                fingerprint="fp_converge_dropdead_split",
+                discogs_status="pending",
+                embedding=[0.01] * 384,
+            )
+            session.add_all([art1, art2, album])
+            session.flush()
+            session.add(AlbumArtist(album_id=album.id, artist_id=art1.id))
+            session.add(AlbumArtist(album_id=album.id, artist_id=art2.id))
+            session.commit()
+            album_id = album.id
+            art1_id = art1.id
+            art2_id = art2.id
+
+        mock_discogs = MagicMock(spec=DiscogsClient)
+        mock_discogs.search.return_value = []
+
+        def failing_web_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="Internal Server Error")
+
+        web_client = httpx.Client(transport=httpx.MockTransport(failing_web_handler))
+
+        service = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=mock_discogs,
+            deepseek_http_client=web_client,
+        )
+
+        enriched = service.enrich_album(album_id)
+        assert enriched is not None
+        assert enriched.discogs_status == "not_found"
+
+        with session_factory() as session:
+            refreshed = session.get(Album, album_id)
+            assert refreshed is not None
+            links = session.execute(
+                select(AlbumArtist).where(AlbumArtist.album_id == album_id)
+            ).scalars().all()
+            assert len(links) == 2
+            assert {link.artist_id for link in links} == {art1_id, art2_id}
 
 
 class TestPriorityQueueSelector:
@@ -2371,12 +2502,13 @@ class TestArtistCollisionReparenting:
             assert len(links) == 1
             assert links[0].artist_id == surviving_id
 
-    def test_artist_collision_on_name_preserves_unorphaned_superseded_artist(
+    def test_artist_collision_reparents_all_albums_and_deletes_superseded_artist(
         self, session_factory
     ) -> None:
-        """When an artist collides on name but is still linked to another album,
+        """When an artist collides with an existing artist row,
 
-        re-parent only the enriched album and do NOT delete the superseded artist.
+        re-parent ALL album_artists rows across every album to the surviving canonical artist
+        and delete the superseded artist.
         """
         with session_factory() as session:
             art_surviving = Artist(
@@ -2445,9 +2577,9 @@ class TestArtistCollisionReparenting:
         assert res_album is not None
 
         with session_factory() as session:
-            # 1. Superseded artist still exists because alb2 still links to it!
+            # 1. Superseded artist is deleted even though alb2 was also linked to it
             old_art = session.get(Artist, superseded_id)
-            assert old_art is not None
+            assert old_art is None
 
             # 2. alb1's link is re-parented to surviving_id
             alb1_links = session.execute(
@@ -2456,12 +2588,12 @@ class TestArtistCollisionReparenting:
             assert len(alb1_links) == 1
             assert alb1_links[0].artist_id == surviving_id
 
-            # 3. alb2's link still points to superseded_id
+            # 3. alb2's link is ALSO re-parented to surviving_id
             alb2_links = session.execute(
                 select(AlbumArtist).where(AlbumArtist.album_id == alb2_id)
             ).scalars().all()
             assert len(alb2_links) == 1
-            assert alb2_links[0].artist_id == superseded_id
+            assert alb2_links[0].artist_id == surviving_id
 
 
 class TestAlbumCollisionReparenting:

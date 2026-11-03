@@ -1,4 +1,23 @@
+import sys
 import uuid
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        def __str__(self) -> str:
+            return str(self.value)
+
+
+class EnrichmentState(StrEnum):
+    PENDING = "pending"
+    MATCHED = "matched"
+    PARTIAL_MATCHED = "partial_matched"
+    NOT_FOUND = "not_found"
+    FAILED = "failed"
+
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (

@@ -1658,3 +1658,13 @@ class TestDiscogsEnrichmentWorkerIntegration:
         enrichment_thread.join(timeout=3.0)
         assert not enrichment_thread.is_alive()
 
+    def test_poller_service_wires_shutdown_event_into_discogs_client(self, session_factory):
+        service = PollerService(
+            session_factory=session_factory,
+            discogs_token="fake_token_123",
+        )
+        assert hasattr(service, "_discogs_client")
+        assert service._discogs_client is not None
+        assert service._discogs_client._shutdown_event is service._shutdown_event
+        service.stop()
+

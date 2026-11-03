@@ -321,11 +321,16 @@ class PollerService:
         self._enrichment_lock = threading.Lock()
         self._enrichment_thread: threading.Thread | None = None
         self._async_runner = _AsyncRunner()
+        self._discogs_client: DiscogsClient | None
         self.enrichment_service: CatalogEnrichmentService | None
 
         if enrichment_service is not None:
             self.enrichment_service = enrichment_service
+            self._discogs_client = discogs_client or getattr(
+                enrichment_service, "discogs_client", None
+            )
         elif discogs_client is not None:
+            self._discogs_client = discogs_client
             self.enrichment_service = CatalogEnrichmentService(
                 session_factory=self.session_factory,
                 discogs_client=discogs_client,
@@ -335,19 +340,21 @@ class PollerService:
         elif discogs_token or (discogs_consumer_key and discogs_consumer_secret):
             raw_ua = discogs_user_agent
             ua = str(raw_ua).strip() if raw_ua and str(raw_ua).strip() else "VinylReleasesScraper/0.1.0"
-            client = DiscogsClient(
+            self._discogs_client = DiscogsClient(
                 token=discogs_token,
                 consumer_key=discogs_consumer_key,
                 consumer_secret=discogs_consumer_secret,
                 user_agent=ua,
+                shutdown_event=self._shutdown_event,
             )
             self.enrichment_service = CatalogEnrichmentService(
                 session_factory=self.session_factory,
-                discogs_client=client,
+                discogs_client=self._discogs_client,
                 deepseek_api_key=deepseek_api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("DEEPSEEK_KEY"),
                 deepseek_base_url=deepseek_base_url or os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
             )
         else:
+            self._discogs_client = None
             self.enrichment_service = None
 
     def __del__(self) -> None:
