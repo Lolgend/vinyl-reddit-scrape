@@ -43,25 +43,25 @@ flowchart TD
         CatTable["artists, albums, album_artists,\nreleases & submission_releases\n(384-d HNSW + partial queue indexes)"]
     end
 
-    RN -->|Poll new| PNew
-    RH -->|Poll hot| PHot
-    PNew -->|Upsert submissions & log discoveries| SubTable
-    PHot -->|Update engagement & mutate flairs| SubTable
-    PNew -.->|Signal _extraction_trigger| ExtWorker
+    RN -->|"Poll new"| PNew
+    RH -->|"Poll hot"| PHot
+    PNew -->|"Upsert submissions & log discoveries"| SubTable
+    PHot -->|"Update engagement & mutate flairs"| SubTable
+    PNew -.->|"Signal _extraction_trigger"| ExtWorker
     ExtWorker --> Batcher --> Line1RAG
-    Line1RAG <-->|Cosine >= 0.50| CatTable
-    Line1RAG -->|Existing Catalog Reference| LLMExtract
-    LLMExtract -->|Success| PersistP1
-    LLMExtract -.->|Error or Omission| Fallback --> PersistP1
-    PersistP1 -->|Upsert 3-tier rows| CatTable
-    PersistP1 -.->|Signal _enrichment_trigger| EnrWorker
+    Line1RAG <-->|"Cosine >= 0.50"| CatTable
+    Line1RAG -->|"Existing Catalog Reference"| LLMExtract
+    LLMExtract -->|"Success"| PersistP1
+    LLMExtract -.->|"Error or Omission"| Fallback --> PersistP1
+    PersistP1 -->|"Upsert 3-tier rows"| CatTable
+    PersistP1 -.->|"Signal _enrichment_trigger"| EnrWorker
     EnrWorker --> Queue
-    Queue <-->|Phase 1 Short Read Tx| CatTable
+    Queue <-->|"Phase 1 Short Read Tx"| CatTable
     Queue --> Line2Cascade --> Arbiter
-    Arbiter -->|Work Match (Tiers 1-4)| Hydrate --> WriteTx1
-    Arbiter -->|Unmatched Work (partial_matched / not_found)| Line3Web --> WriteTx1
-    WriteTx1 -->|Commit canonical state & re-parent collisions| CatTable
-    WriteTx1 --> Phase4Sibling -->|Merge duplicate sibling Releases| CatTable
+    Arbiter -->|"Work Match (Tiers 1-4)"| Hydrate --> WriteTx1
+    Arbiter -->|"Unmatched Work (partial_matched / not_found)"| Line3Web --> WriteTx1
+    WriteTx1 -->|"Commit canonical state & re-parent collisions"| CatTable
+    WriteTx1 --> Phase4Sibling -->|"Merge duplicate sibling Releases"| CatTable
 ```
 
 ### Core Pipeline Flows
