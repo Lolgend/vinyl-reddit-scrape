@@ -102,6 +102,19 @@ class TestExtractionSchema:
         assert result.releases[0].album_title == "Romance"
         assert result.model_dump() == payload
 
+    def test_extracted_release_field_descriptions_for_clean_work_and_variant(self):
+        fields = ExtractedRelease.model_fields
+        album_desc = fields["album_title"].description or ""
+        variant_desc = fields["variant"].description or ""
+        assert "core canonical musical work title" in album_desc.lower()
+        assert "anniversary" in album_desc.lower()
+        assert "remaster" in album_desc.lower()
+        assert "strip" in album_desc.lower()
+
+        assert "anniversary" in variant_desc.lower()
+        assert "remaster" in variant_desc.lower()
+        assert "pressing" in variant_desc.lower()
+
 
 class TestBatchExtractionSchema:
     def test_batch_extracted_item_full(self):
@@ -1411,6 +1424,41 @@ class TestCatalogReferenceFormatting:
         assert "Canonical Releases:" in ref
         assert "- Combined Artist: Converge / Dropdead | Artists: Converge, Dropdead | Album Title: Split | Variant: None | Retailer: None" in ref
 
+    def test_format_catalog_reference_multiple_sibling_releases(self):
+        candidates = CatalogCandidates(
+            artists=["Converge", "Dropdead"],
+            releases=[
+                CatalogReleaseCandidate(
+                    id="rel_1",
+                    combined_artist="Converge / Dropdead",
+                    album_title="Split",
+                    artists=["Converge", "Dropdead"],
+                    variant='Clear 7"',
+                    retailer="Deathwish",
+                    album_id="album_split",
+                ),
+                CatalogReleaseCandidate(
+                    id="rel_2",
+                    combined_artist="Converge / Dropdead",
+                    album_title="Split",
+                    artists=["Converge", "Dropdead"],
+                    variant="Opaque Emerald LP",
+                    retailer="Deathwish",
+                    album_id="album_split",
+                ),
+            ],
+        )
+        ref = format_catalog_reference(candidates)
+        assert "Existing Catalog Reference:" in ref
+        assert "Canonical Artists:" in ref
+        assert "- Converge" in ref
+        assert "- Dropdead" in ref
+        assert "Canonical Releases:" in ref
+        assert '- Combined Artist: Converge / Dropdead | Artists: Converge, Dropdead | Album Title: Split | Variant: Clear 7" | Retailer: Deathwish' in ref
+        assert "- Combined Artist: Converge / Dropdead | Artists: Converge, Dropdead | Album Title: Split | Variant: Opaque Emerald LP | Retailer: Deathwish" in ref
+        assert candidates.releases[0].album_id == "album_split"
+        assert candidates.releases[1].album_id == "album_split"
+
     def test_build_extraction_prompt_omits_reference_when_no_candidates(self):
         prompt = build_extraction_prompt("Fontaines D.C. - Romance", candidates=None)
         assert "Existing Catalog Reference" not in prompt
@@ -1470,6 +1518,20 @@ class TestSystemPromptCanonicalAlignment:
         prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
         assert "different" in prompt_lower or "unrelated" in prompt_lower
 
+    def test_system_prompt_instructs_clean_work_title_and_variant_separation(self):
+        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        assert "core canonical musical work title" in prompt_lower
+        assert "strip" in prompt_lower
+        assert "anniversary" in prompt_lower
+        assert "remaster" in prompt_lower
+        assert "reissue" in prompt_lower
+        assert "deluxe" in prompt_lower
+        assert "expanded" in prompt_lower
+
+    def test_system_prompt_canonical_alignment_sibling_releases(self):
+        prompt_lower = EXTRACTION_SYSTEM_PROMPT.lower()
+        assert "sibling" in prompt_lower or "already-known" in prompt_lower
+
 
 class TestBatchSystemPromptCanonicalAlignment:
     def test_batch_system_prompt_includes_catalog_canonical_alignment(self):
@@ -1485,6 +1547,20 @@ class TestBatchSystemPromptCanonicalAlignment:
         assert "canonical" in prompt_lower
         assert "order" in prompt_lower or "consistent" in prompt_lower
         assert "batch" in prompt_lower
+
+    def test_batch_system_prompt_instructs_clean_work_title_and_variant_separation(self):
+        prompt_lower = BATCH_EXTRACTION_SYSTEM_PROMPT.lower()
+        assert "core canonical musical work title" in prompt_lower
+        assert "strip" in prompt_lower
+        assert "anniversary" in prompt_lower
+        assert "remaster" in prompt_lower
+        assert "reissue" in prompt_lower
+        assert "deluxe" in prompt_lower
+        assert "expanded" in prompt_lower
+
+    def test_batch_system_prompt_canonical_alignment_sibling_releases(self):
+        prompt_lower = BATCH_EXTRACTION_SYSTEM_PROMPT.lower()
+        assert "sibling" in prompt_lower or "already-known" in prompt_lower
 
 
 class TestCandidateRetrieverWiring:

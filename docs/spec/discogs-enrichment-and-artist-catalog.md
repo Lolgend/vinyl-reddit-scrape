@@ -53,8 +53,8 @@ flowchart TD
     Sub --> VecSearch --> LLMExtract --> PersistP1 --> WakeWorker
     WakeWorker -.-> Queue
     Queue --> Cascade --> Arbiter
-    Arbiter -->|Matched Master/Release| Hydrate --> CommitP2
-    Arbiter -->|Unmatched Album\n(partial_matched / not_found)| WebSearch --> CommitP2
+    Arbiter -->|"Matched Master/Release"| Hydrate --> CommitP2
+    Arbiter -->|"Unmatched Album (partial_matched / not_found)"| WebSearch --> CommitP2
     CommitP2 --> SiblingRAG
 ```
 

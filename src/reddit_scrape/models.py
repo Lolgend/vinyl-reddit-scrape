@@ -1,4 +1,23 @@
+import sys
 import uuid
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        def __str__(self) -> str:
+            return str(self.value)
+
+
+class EnrichmentState(StrEnum):
+    PENDING = "pending"
+    MATCHED = "matched"
+    PARTIAL_MATCHED = "partial_matched"
+    NOT_FOUND = "not_found"
+    FAILED = "failed"
+
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
@@ -16,6 +35,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
 
 from reddit_scrape.db import Base
 
@@ -77,29 +97,7 @@ class Artist(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=text("gen_random_uuid()"))
     name = Column(String(255), nullable=False, unique=True, index=True)
-    embedding = Column(Vector(384), nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-    __table_args__ = (
-        Index("idx_artists_name", name),
-        Index(
-            "idx_artists_embedding",
-            embedding,
-            postgresql_using="hnsw",
-            postgresql_ops={"embedding": "vector_cosine_ops"},
-        ),
-    )
-
-
-class Release(Base):
-    __tablename__ = "releases"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=text("gen_random_uuid()"))
-    combined_artist = Column(String(255), nullable=False, index=True)
-    album_title = Column(String(255), nullable=False, index=True)
-    variant = Column(Text, nullable=True)
-    retailer_name = Column(String(255), nullable=True)
-    fingerprint = Column(String(64), nullable=False, unique=True)
+    discogs_artist_id = Column(Integer, nullable=True, unique=True)
     embedding = Column(Vector(384), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(
@@ -110,11 +108,10 @@ class Release(Base):
     )
 
     __table_args__ = (
-        Index("idx_releases_combined_artist", combined_artist),
-        Index("idx_releases_album", album_title),
-        Index("idx_releases_fingerprint", fingerprint, unique=True),
+        Index("idx_artists_name", name),
+        Index("idx_artists_discogs_artist_id", discogs_artist_id, unique=True),
         Index(
-            "idx_releases_embedding",
+            "idx_artists_embedding",
             embedding,
             postgresql_using="hnsw",
             postgresql_ops={"embedding": "vector_cosine_ops"},
@@ -122,12 +119,56 @@ class Release(Base):
     )
 
 
-class ReleaseArtist(Base):
-    __tablename__ = "release_artists"
+class Album(Base):
+    __tablename__ = "albums"
 
-    release_id = Column(
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=text("gen_random_uuid()"))
+    combined_artist = Column(String(255), nullable=False)
+    title = Column(String(255), nullable=False)
+    fingerprint = Column(String(64), nullable=False, unique=True)
+    discogs_master_id = Column(Integer, nullable=True, unique=True)
+    discogs_release_id = Column(Integer, nullable=True, unique=True)
+    discogs_status = Column(String(32), nullable=False, default="pending", server_default=text("'pending'"))
+    enrichment_attempts = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    last_enriched_at = Column(DateTime(timezone=True), nullable=True)
+    enrichment_error = Column(Text, nullable=True)
+    embedding = Column(Vector(384), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("idx_albums_combined_artist", combined_artist),
+        Index("idx_albums_title", title),
+        Index("idx_albums_fingerprint", fingerprint, unique=True),
+        Index("idx_albums_discogs_master_id", discogs_master_id, unique=True),
+        Index("idx_albums_discogs_release_id", discogs_release_id, unique=True),
+        Index(
+            "idx_albums_embedding",
+            embedding,
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+        Index(
+            "idx_albums_enrichment_queue",
+            discogs_status,
+            last_enriched_at,
+            created_at,
+            postgresql_where=text("discogs_status IN ('pending', 'partial_matched', 'failed')"),
+        ),
+    )
+
+
+class AlbumArtist(Base):
+    __tablename__ = "album_artists"
+
+    album_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("releases.id", ondelete="CASCADE"),
+        ForeignKey("albums.id", ondelete="CASCADE"),
         primary_key=True,
     )
     artist_id = Column(
@@ -136,6 +177,50 @@ class ReleaseArtist(Base):
         primary_key=True,
     )
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# Legacy alias
+ReleaseArtist = AlbumArtist
+
+
+class Release(Base):
+    __tablename__ = "releases"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, server_default=text("gen_random_uuid()"))
+    album_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("albums.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    variant = Column(Text, nullable=True)
+    retailer_name = Column(String(255), nullable=True)
+    fingerprint = Column(String(64), nullable=False, unique=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    album = relationship("Album", lazy="joined")
+
+    @property
+    def combined_artist(self) -> str:
+        return self.album.combined_artist if self.album else ""
+
+    @property
+    def album_title(self) -> str:
+        return self.album.title if self.album else ""
+
+    @property
+    def embedding(self) -> list[float] | None:
+        return self.album.embedding if self.album else None
+
+    __table_args__ = (
+        Index("idx_releases_album_id", album_id),
+        Index("idx_releases_fingerprint", fingerprint, unique=True),
+    )
 
 
 class SubmissionRelease(Base):
@@ -152,3 +237,15 @@ class SubmissionRelease(Base):
         primary_key=True,
     )
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+__all__ = [
+    "Album",
+    "AlbumArtist",
+    "Artist",
+    "Release",
+    "ReleaseArtist",
+    "Submission",
+    "SubmissionRelease",
+    "SubmissionSnapshot",
+]

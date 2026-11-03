@@ -4,6 +4,7 @@ import argparse
 import logging
 import sys
 from collections.abc import Sequence
+from typing import Any
 
 from reddit_scrape.db import init_db
 from reddit_scrape.retention import get_default_retention_days, purge_snapshots
@@ -149,14 +150,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             else config.llm_batch_size
         )
 
-        service = PollerService(
-            poll_interval_seconds=new_interval,
-            hot_poll_interval_seconds=hot_interval,
-            new_limit=args.new_limit,
-            hot_limit=args.hot_limit,
-            thinking_level=thinking_level,
-            llm_batch_size=llm_batch_size,
-        )
+        poller_kwargs: dict[str, Any] = {
+            "poll_interval_seconds": new_interval,
+            "hot_poll_interval_seconds": hot_interval,
+            "new_limit": args.new_limit,
+            "hot_limit": args.hot_limit,
+            "thinking_level": thinking_level,
+            "llm_batch_size": llm_batch_size,
+        }
+        if config.discogs_token or (
+            config.discogs_consumer_key and config.discogs_consumer_secret
+        ):
+            poller_kwargs["discogs_token"] = config.discogs_token
+            poller_kwargs["discogs_consumer_key"] = config.discogs_consumer_key
+            poller_kwargs["discogs_consumer_secret"] = config.discogs_consumer_secret
+            poller_kwargs["discogs_user_agent"] = config.discogs_user_agent
+            poller_kwargs["enrichment_interval_seconds"] = (
+                config.enrichment_interval_seconds
+            )
+
+        service = PollerService(**poller_kwargs)
 
         if args.once:
             stats = service.run_once()
@@ -165,7 +178,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"new_updated={stats.new_stats.updated}, "
                 f"hot_inserted={stats.hot_stats.inserted}, "
                 f"hot_updated={stats.hot_stats.updated}, "
-                f"extracted={stats.extracted_count}"
+                f"extracted={stats.extracted_count}, "
+                f"enriched={stats.enriched_count}"
             )
             return 0
 

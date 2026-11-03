@@ -20,6 +20,16 @@ def get_embedding_model() -> TextEmbedding:
     return _model_instance
 
 
+def compute_album_text(combined_artist: str, album_title: str) -> str:
+    """Build the canonical text representation for album vector embedding.
+
+    Format: "{combined_artist} - {album_title}".
+    """
+    clean_artist = combined_artist.strip() if combined_artist else ""
+    clean_album = album_title.strip() if album_title else ""
+    return f"{clean_artist} - {clean_album}"
+
+
 def compute_release_text(
     combined_artist: str,
     album_title: str,
@@ -67,6 +77,7 @@ def embed_texts(texts: Sequence[str]) -> list[list[float]]:
 __all__ = [
     "DEFAULT_EMBEDDING_MODEL",
     "EMBEDDING_DIM",
+    "compute_album_text",
     "compute_artist_text",
     "compute_release_text",
     "embed_texts",

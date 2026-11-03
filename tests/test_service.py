@@ -20,9 +20,10 @@ from reddit_scrape.extraction import (
 )
 from reddit_scrape.ingestion import RawSubmission
 from reddit_scrape.models import (
+    Album,
+    AlbumArtist,
     Artist,
     Release,
-    ReleaseArtist,
     Submission,
     SubmissionRelease,
     SubmissionSnapshot,
@@ -48,12 +49,16 @@ def engine():
 
 
 @pytest.fixture(autouse=True)
-def clean_db(engine):
+def clean_db(request):
+    if request.cls and request.cls.__name__ == "TestEnvironmentValidation":
+        yield
+        return
+    engine = request.getfixturevalue("engine")
     with engine.begin() as conn:
         conn.execute(
             text(
                 "TRUNCATE TABLE submission_snapshots, submission_releases, "
-                "release_artists, releases, artists, submissions CASCADE;"
+                "releases, album_artists, albums, artists, submissions CASCADE;"
             )
         )
     yield
@@ -61,7 +66,7 @@ def clean_db(engine):
         conn.execute(
             text(
                 "TRUNCATE TABLE submission_snapshots, submission_releases, "
-                "release_artists, releases, artists, submissions CASCADE;"
+                "releases, album_artists, albums, artists, submissions CASCADE;"
             )
         )
 
@@ -71,16 +76,20 @@ def session_factory(engine):
     return sessionmaker(bind=engine)
 
 
+VALID_ENV = {
+    "REDDIT_CLIENT_ID": "mock_client_id",
+    "REDDIT_CLIENT_SECRET": "mock_client_secret",
+    "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+    "DEEPSEEK_API_KEY": "mock_deepseek_key",
+    "DISCOGS_TOKEN": "mock_discogs_token",
+}
+
+
 class TestEnvironmentValidation:
     """Test environment validation and configuration parsing."""
 
     def test_validate_environment_success(self):
-        env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_deepseek_key",
-        }
+        env = dict(VALID_ENV)
         config = validate_environment(env)
         assert isinstance(config, ServiceConfig)
         assert config.reddit_client_id == "mock_client_id"
@@ -90,6 +99,110 @@ class TestEnvironmentValidation:
         assert config.poll_interval_seconds == 300
         assert config.hot_poll_interval_seconds == 900
         assert config.reddit_user_agent == "python:vinyl-releases-scraper:v0.1.0"
+        assert config.discogs_token == "mock_discogs_token"
+        assert config.discogs_user_agent == "VinylReleasesScraper/0.1.0"
+        assert config.enrichment_interval_seconds == 60
+
+    def test_validate_environment_discogs_token_success(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_deepseek_key",
+            "DISCOGS_TOKEN": "test_token_123",
+        }
+        config = validate_environment(env)
+        assert config.discogs_token == "test_token_123"
+        assert config.discogs_consumer_key is None
+        assert config.discogs_consumer_secret is None
+        assert config.discogs_user_agent == "VinylReleasesScraper/0.1.0"
+        assert config.enrichment_interval_seconds == 60
+
+    def test_validate_environment_discogs_key_secret_success(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_deepseek_key",
+            "DISCOGS_CONSUMER_KEY": "test_consumer_key",
+            "DISCOGS_CONSUMER_SECRET": "test_consumer_secret",
+        }
+        config = validate_environment(env)
+        assert config.discogs_token is None
+        assert config.discogs_consumer_key == "test_consumer_key"
+        assert config.discogs_consumer_secret == "test_consumer_secret"
+        assert config.discogs_user_agent == "VinylReleasesScraper/0.1.0"
+        assert config.enrichment_interval_seconds == 60
+
+    def test_validate_environment_discogs_prefers_token_over_key_secret(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_deepseek_key",
+            "DISCOGS_TOKEN": "token_preferred",
+            "DISCOGS_CONSUMER_KEY": "key_secondary",
+            "DISCOGS_CONSUMER_SECRET": "secret_secondary",
+        }
+        config = validate_environment(env)
+        assert config.discogs_token == "token_preferred"
+        assert config.discogs_consumer_key == "key_secondary"
+        assert config.discogs_consumer_secret == "secret_secondary"
+
+    def test_validate_environment_missing_discogs_credentials(self):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_deepseek_key",
+        }
+        with pytest.raises(ValueError, match="Discogs credentials"):
+            validate_environment(env)
+
+    @pytest.mark.parametrize(
+        "partial_discogs_env",
+        [
+            {"DISCOGS_CONSUMER_KEY": "only_key"},
+            {"DISCOGS_CONSUMER_SECRET": "only_secret"},
+        ],
+    )
+    def test_validate_environment_partial_discogs_key_secret(self, partial_discogs_env):
+        env = {
+            "REDDIT_CLIENT_ID": "mock_client_id",
+            "REDDIT_CLIENT_SECRET": "mock_client_secret",
+            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
+            "DEEPSEEK_API_KEY": "mock_deepseek_key",
+            **partial_discogs_env,
+        }
+        with pytest.raises(ValueError, match="Discogs credentials"):
+            validate_environment(env)
+
+    def test_validate_environment_custom_discogs_user_agent(self):
+        env = {
+            **VALID_ENV,
+            "DISCOGS_USER_AGENT": "CustomUserAgent/2.0",
+        }
+        config = validate_environment(env)
+        assert config.discogs_user_agent == "CustomUserAgent/2.0"
+
+    def test_validate_environment_enrichment_interval_valid(self):
+        env = {
+            **VALID_ENV,
+            "ENRICHMENT_INTERVAL_SECONDS": "45",
+        }
+        config = validate_environment(env)
+        assert config.enrichment_interval_seconds == 45
+
+    @pytest.mark.parametrize("invalid_interval", ["0", "-5", "-100", "invalid", "12.5"])
+    def test_validate_environment_enrichment_interval_invalid(self, invalid_interval):
+        env = {
+            **VALID_ENV,
+            "ENRICHMENT_INTERVAL_SECONDS": invalid_interval,
+        }
+        with pytest.raises(
+            ValueError, match="ENRICHMENT_INTERVAL_SECONDS must be a positive integer"
+        ):
+            validate_environment(env)
 
     def test_validate_environment_deepseek_key_alias(self):
         env = {
@@ -97,16 +210,14 @@ class TestEnvironmentValidation:
             "REDDIT_CLIENT_SECRET": "mock_client_secret",
             "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
             "DEEPSEEK_KEY": "mock_deepseek_alias_key",
+            "DISCOGS_TOKEN": "mock_discogs_token",
         }
         config = validate_environment(env)
         assert config.deepseek_api_key == "mock_deepseek_alias_key"
 
     def test_validate_environment_custom_intervals(self):
         env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
+            **VALID_ENV,
             "POLL_INTERVAL_SECONDS": "60",
             "HOT_POLL_INTERVAL_SECONDS": "180",
         }
@@ -115,22 +226,14 @@ class TestEnvironmentValidation:
         assert config.hot_poll_interval_seconds == 180
 
     def test_validate_environment_thinking_level_default(self):
-        env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
-        }
+        env = dict(VALID_ENV)
         config = validate_environment(env)
         # Default for deepseek-chat is none
         assert config.llm_thinking_level == "none"
 
     def test_validate_environment_thinking_level_default_reasoning(self):
         env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
+            **VALID_ENV,
             "DEEPSEEK_MODEL": "deepseek-reasoner",
         }
         config = validate_environment(env)
@@ -153,10 +256,7 @@ class TestEnvironmentValidation:
     )
     def test_validate_environment_thinking_level_valid(self, level, expected):
         env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
+            **VALID_ENV,
             "LLM_THINKING_LEVEL": level,
         }
         config = validate_environment(env)
@@ -165,31 +265,20 @@ class TestEnvironmentValidation:
     @pytest.mark.parametrize("invalid_level", ["ultra", "off", "1", "false", "turbo"])
     def test_validate_environment_thinking_level_invalid(self, invalid_level):
         env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
+            **VALID_ENV,
             "LLM_THINKING_LEVEL": invalid_level,
         }
         with pytest.raises(ValueError, match="Invalid LLM_THINKING_LEVEL"):
             validate_environment(env)
 
     def test_validate_environment_llm_batch_size_default(self):
-        env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
-        }
+        env = dict(VALID_ENV)
         config = validate_environment(env)
         assert config.llm_batch_size == 5
 
     def test_validate_environment_llm_batch_size_custom(self):
         env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
+            **VALID_ENV,
             "LLM_BATCH_SIZE": "10",
         }
         config = validate_environment(env)
@@ -198,10 +287,7 @@ class TestEnvironmentValidation:
     @pytest.mark.parametrize("invalid_size", ["0", "-1", "-10", "abc"])
     def test_validate_environment_llm_batch_size_invalid(self, invalid_size):
         env = {
-            "REDDIT_CLIENT_ID": "mock_client_id",
-            "REDDIT_CLIENT_SECRET": "mock_client_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
+            **VALID_ENV,
             "LLM_BATCH_SIZE": invalid_size,
         }
         with pytest.raises(ValueError, match="LLM_BATCH_SIZE must be a positive integer"):
@@ -217,12 +303,7 @@ class TestEnvironmentValidation:
         ],
     )
     def test_validate_environment_missing_keys(self, missing_key):
-        env = {
-            "REDDIT_CLIENT_ID": "mock_id",
-            "REDDIT_CLIENT_SECRET": "mock_secret",
-            "DATABASE_URL": "postgresql://test:test@localhost:5432/testdb",
-            "DEEPSEEK_API_KEY": "mock_key",
-        }
+        env = dict(VALID_ENV)
         del env[missing_key]
         with pytest.raises(ValueError) as excinfo:
             validate_environment(env)
@@ -370,7 +451,7 @@ class TestPollerServiceEndToEnd:
 
             # Verify releases table
             releases = session.execute(
-                select(Release).order_by(Release.album_title.asc())
+                select(Release).join(Album).order_by(Album.title.asc())
             ).scalars().all()
             assert len(releases) == 2
             assert releases[0].album_title == "OK Computer"
@@ -391,7 +472,7 @@ class TestPollerServiceEndToEnd:
             # Verify release_artists join table
             split_rel = releases[1]
             ra_links = session.execute(
-                select(ReleaseArtist).where(ReleaseArtist.release_id == split_rel.id)
+                select(AlbumArtist).where(AlbumArtist.album_id == split_rel.album_id)
             ).scalars().all()
             assert len(ra_links) == 2
 
@@ -1109,10 +1190,17 @@ class TestMultiCycleCanonicalAlignmentIntegration:
             for s in all_subs:
                 assert s.is_extracted is True
 
+            all_albums = session.execute(select(Album)).scalars().all()
+            assert len(all_albums) == 1
+            canonical_album = all_albums[0]
+            assert canonical_album.combined_artist == "Converge / Dropdead"
+            assert canonical_album.title == 'Split 7"'
+
             all_releases = session.execute(select(Release)).scalars().all()
             assert len(all_releases) == 1
             canonical_release = all_releases[0]
             assert canonical_release.id == rel1.id
+            assert canonical_release.album_id == canonical_album.id
 
             all_artists = session.execute(select(Artist).order_by(Artist.name.asc())).scalars().all()
             assert len(all_artists) == 2
@@ -1235,13 +1323,20 @@ class TestMultiCycleCanonicalAlignmentIntegration:
         assert "- Dropdead" in c2_prompt
 
         # Verify PostgreSQL state:
-        # Distinct Release for the new variant, but reuses canonical Artists!
+        # Distinct Release for the new variant, but reuses canonical Artists and Album!
         with session_factory() as session:
+            all_albums = session.execute(select(Album)).scalars().all()
+            assert len(all_albums) == 1
+            canonical_album = all_albums[0]
+            assert canonical_album.combined_artist == "Converge / Dropdead"
+            assert canonical_album.title == 'Split 7"'
+
             all_releases = session.execute(
                 select(Release).order_by(Release.variant.asc())
             ).scalars().all()
             assert len(all_releases) == 2
             for r in all_releases:
+                assert r.album_id == canonical_album.id
                 assert r.combined_artist == "Converge / Dropdead"
                 assert r.album_title == 'Split 7"'
                 assert r.retailer_name == "Deathwish"
@@ -1267,6 +1362,154 @@ class TestMultiCycleCanonicalAlignmentIntegration:
             assert len(sr1) == 1
             assert len(sr2) == 1
             assert sr1[0].release_id != sr2[0].release_id
+
+        service.stop()
+
+    def test_multi_cycle_canonical_alignment_clean_work_title_and_sibling_release(
+        self, session_factory
+    ):
+        """End-to-end multi-cycle test verifying clean work title extraction, vector candidate
+        sibling release hydration, and canonical alignment without duplicate Album or Artist records.
+
+        - Cycle 1: Announce 'Converge - Jane Doe (20th Anniversary Remaster, Clear LP) [Deathwish]'
+          Extracts:
+            combined_artist='Converge', album_title='Jane Doe',
+            variant='20th Anniversary Remaster, Clear LP', retailer='Deathwish'
+        - Cycle 2: Announce 'Jane Doe - Converge (Red & Black Smoke LP) [Deathwish]' (reversed artist/album, new variant)
+          Extracts:
+            aligned canonical album_title='Jane Doe', combined_artist='Converge',
+            variant='Red & Black Smoke LP', retailer='Deathwish'
+        """
+        created_now = datetime.now(timezone.utc)
+        sub1 = RawSubmission(
+            id="c1_jane",
+            title="Converge - Jane Doe (20th Anniversary Remaster, Clear LP) [Deathwish]",
+            url="https://reddit.com/r/vinylreleases/c1_jane",
+            created_utc=created_now,
+            fullname="t3_c1_jane",
+        )
+        sub2 = RawSubmission(
+            id="c2_jane",
+            title="Jane Doe - Converge (Red & Black Smoke LP) [Deathwish]",
+            url="https://reddit.com/r/vinylreleases/c2_jane",
+            created_utc=created_now,
+            fullname="t3_c2_jane",
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_hot.return_value = []
+
+        captured_prompts: list[str] = []
+        mock_batch_agent = MagicMock()
+
+        async def fake_agent_run(prompt: str):
+            captured_prompts.append(prompt)
+            if "c1_jane" in prompt or "20th Anniversary Remaster" in prompt:
+                return MagicMock(
+                    output=BatchExtractionResult(
+                        items=[
+                            BatchExtractedItem(
+                                submission_id="t3_c1_jane",
+                                releases=[
+                                    ExtractedRelease(
+                                        artists=["Converge"],
+                                        combined_artist="Converge",
+                                        album_title="Jane Doe",
+                                        variant="20th Anniversary Remaster, Clear LP",
+                                        retailer="Deathwish",
+                                    )
+                                ],
+                            )
+                        ]
+                    )
+                )
+            else:
+                return MagicMock(
+                    output=BatchExtractionResult(
+                        items=[
+                            BatchExtractedItem(
+                                submission_id="t3_c2_jane",
+                                releases=[
+                                    ExtractedRelease(
+                                        artists=["Converge"],
+                                        combined_artist="Converge",
+                                        album_title="Jane Doe",
+                                        variant="Red & Black Smoke LP",
+                                        retailer="Deathwish",
+                                    )
+                                ],
+                            )
+                        ]
+                    )
+                )
+
+        mock_batch_agent.run = AsyncMock(side_effect=fake_agent_run)
+        persistence_svc = ReleasePersistenceService(session_factory)
+        worker = ExtractionWorker(
+            batch_agent=mock_batch_agent,
+            candidate_retriever=persistence_svc.find_candidates,
+        )
+
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=worker,
+            persistence_service=persistence_svc,
+        )
+
+        # --- Cycle 1 ---
+        mock_adapter.fetch_new.return_value = [sub1]
+        stats1 = service.poll_and_extract_cycle()
+        assert stats1.new_stats.inserted == 1
+        assert stats1.extracted_count == 1
+
+        # --- Cycle 2 ---
+        mock_adapter.fetch_new.return_value = [sub2]
+        stats2 = service.poll_and_extract_cycle()
+        assert stats2.new_stats.inserted == 1
+        assert stats2.extracted_count == 1
+        assert len(captured_prompts) == 2
+
+        # Verify Cycle 2 prompt received canonical Album and Cycle 1 sibling Release
+        c2_prompt = captured_prompts[1]
+        assert "Existing Catalog Reference:" in c2_prompt
+        assert "Canonical Artists:" in c2_prompt
+        assert "- Converge" in c2_prompt
+        assert "Canonical Releases:" in c2_prompt
+        assert "Combined Artist: Converge" in c2_prompt
+        assert "Album Title: Jane Doe" in c2_prompt
+        assert "Variant: 20th Anniversary Remaster, Clear LP" in c2_prompt
+        assert "Retailer: Deathwish" in c2_prompt
+
+        # Verify PostgreSQL database state:
+        # Exactly 1 Album, exactly 1 Artist, exactly 2 child Releases linked to the same Album!
+        with session_factory() as session:
+            all_albums = session.execute(select(Album)).scalars().all()
+            assert len(all_albums) == 1
+            canonical_album = all_albums[0]
+            assert canonical_album.title == "Jane Doe"
+            assert canonical_album.combined_artist == "Converge"
+
+            all_artists = session.execute(select(Artist)).scalars().all()
+            assert len(all_artists) == 1
+            assert all_artists[0].name == "Converge"
+
+            all_releases = session.execute(
+                select(Release).order_by(Release.variant.asc())
+            ).scalars().all()
+            assert len(all_releases) == 2
+            for r in all_releases:
+                assert r.album_id == canonical_album.id
+                assert r.combined_artist == "Converge"
+                assert r.album_title == "Jane Doe"
+                assert r.retailer_name == "Deathwish"
+
+            assert all_releases[0].variant == "20th Anniversary Remaster, Clear LP"
+            assert all_releases[1].variant == "Red & Black Smoke LP"
+
+            # Both submissions are marked extracted and linked via SubmissionRelease
+            sub_rels = session.execute(select(SubmissionRelease)).scalars().all()
+            assert len(sub_rels) == 2
 
         service.stop()
 
@@ -1348,3 +1591,80 @@ class TestCliRunner:
 
         mock_worker.extract_batch.assert_called_once_with(sample_batch, batch_size=8)
         service.stop()
+
+
+class TestDiscogsEnrichmentWorkerIntegration:
+    """Tests for PollerService DiscogsEnrichmentWorker daemon thread and synchronous single-cycle integration."""
+
+    def test_poller_service_initializes_enrichment_trigger_and_defaults(self, session_factory):
+        service = PollerService(session_factory=session_factory)
+        assert hasattr(service, "_enrichment_trigger")
+        assert isinstance(service._enrichment_trigger, threading.Event)
+        assert hasattr(service, "enrichment_interval_seconds")
+        assert service.enrichment_interval_seconds == 60
+        service.stop()
+
+    def test_trigger_enrichment_sets_enrichment_trigger(self, session_factory):
+        service = PollerService(session_factory=session_factory)
+        assert not service._enrichment_trigger.is_set()
+        service.trigger_enrichment()
+        assert service._enrichment_trigger.is_set()
+        service.stop()
+
+    def test_poll_and_extract_cycle_calls_process_pending_enrichment(self, session_factory):
+        service = PollerService(session_factory=session_factory)
+        service.poll_new = MagicMock(return_value=MagicMock(inserted=1, updated=0))
+        service.poll_hot = MagicMock(return_value=MagicMock(inserted=0, updated=1))
+        service.process_unextracted_submissions = MagicMock(return_value=2)
+        service.process_pending_enrichment = MagicMock(return_value=3)
+
+        stats = service.poll_and_extract_cycle()
+
+        assert stats.extracted_count == 2
+        assert hasattr(stats, "enriched_count")
+        assert stats.enriched_count == 3
+        service.process_pending_enrichment.assert_called_once()
+        service.stop()
+
+    def test_run_starts_and_stops_enrichment_worker_thread(self, session_factory):
+        service = PollerService(session_factory=session_factory)
+        service.poll_new = MagicMock()
+        service.poll_hot = MagicMock()
+        service.process_unextracted_submissions = MagicMock(return_value=0)
+        service.process_pending_enrichment = MagicMock(return_value=0)
+
+        run_thread = threading.Thread(target=service.run, daemon=True)
+        run_thread.start()
+
+        # Allow service.run() to launch worker threads
+        import time
+        start_time = time.time()
+        enrichment_thread = None
+        while time.time() - start_time < 3.0:
+            for t in threading.enumerate():
+                if t.name == "DiscogsEnrichmentWorker":
+                    enrichment_thread = t
+                    break
+            if enrichment_thread is not None and enrichment_thread.is_alive():
+                break
+            time.sleep(0.05)
+
+        assert enrichment_thread is not None
+        assert enrichment_thread.is_alive()
+        assert enrichment_thread.daemon is True
+
+        service.stop()
+        run_thread.join(timeout=3.0)
+        enrichment_thread.join(timeout=3.0)
+        assert not enrichment_thread.is_alive()
+
+    def test_poller_service_wires_shutdown_event_into_discogs_client(self, session_factory):
+        service = PollerService(
+            session_factory=session_factory,
+            discogs_token="fake_token_123",
+        )
+        assert hasattr(service, "_discogs_client")
+        assert service._discogs_client is not None
+        assert service._discogs_client._shutdown_event is service._shutdown_event
+        service.stop()
+

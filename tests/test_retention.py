@@ -10,9 +10,10 @@ from sqlalchemy.orm import sessionmaker
 from reddit_scrape.cli import main as cli_main
 from reddit_scrape.db import get_engine, init_db
 from reddit_scrape.models import (
+    Album,
+    AlbumArtist,
     Artist,
     Release,
-    ReleaseArtist,
     Submission,
     SubmissionRelease,
     SubmissionSnapshot,
@@ -37,14 +38,14 @@ def clean_db(engine):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE submission_releases, release_artists, releases, artists, submission_snapshots, submissions CASCADE;"
+                "TRUNCATE TABLE submission_snapshots, submission_releases, releases, album_artists, albums, artists, submissions CASCADE;"
             )
         )
     yield
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE submission_releases, release_artists, releases, artists, submission_snapshots, submissions CASCADE;"
+                "TRUNCATE TABLE submission_snapshots, submission_releases, releases, album_artists, albums, artists, submissions CASCADE;"
             )
         )
 
@@ -78,21 +79,28 @@ def test_purge_old_snapshots_keeps_recent(session_factory):
         )
         session.add(sub)
 
-        # Create associated artist, release, and join records
+        # Create associated artist, album, release, and join records
         artist = Artist(name="Daft Punk")
-        release = Release(
+        album = Album(
             combined_artist="Daft Punk",
-            album_title="Discovery",
+            title="Discovery",
+            fingerprint="fake_album_fp_retention_01",
+        )
+        session.add_all([artist, album])
+        session.flush()
+
+        release = Release(
+            album_id=album.id,
             variant="Gatefold 2LP",
             retailer_name="Standard",
             fingerprint="fake_fingerprint_retention_01",
         )
-        session.add_all([artist, release])
+        session.add(release)
         session.flush()
 
-        rel_artist = ReleaseArtist(release_id=release.id, artist_id=artist.id)
+        alb_artist = AlbumArtist(album_id=album.id, artist_id=artist.id)
         sub_rel = SubmissionRelease(submission_id=sub.id, release_id=release.id)
-        session.add_all([rel_artist, sub_rel])
+        session.add_all([alb_artist, sub_rel])
 
         # Add snapshots: 2 older than 30 days, 2 within 30 days
         snap_old1 = SubmissionSnapshot(
@@ -152,6 +160,8 @@ def test_purge_old_snapshots_keeps_recent(session_factory):
         # Check related entities remain intact
         art_count = session.execute(select(Artist)).scalars().all()
         assert len(art_count) == 1
+        alb_count = session.execute(select(Album)).scalars().all()
+        assert len(alb_count) == 1
         rel_count = session.execute(select(Release)).scalars().all()
         assert len(rel_count) == 1
         sub_rel_count = session.execute(select(SubmissionRelease)).scalars().all()
