@@ -168,6 +168,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             poller_kwargs["enrichment_interval_seconds"] = (
                 config.enrichment_interval_seconds
             )
+        if config.heartbeat_interval_seconds != 30:
+            poller_kwargs["heartbeat_interval_seconds"] = (
+                config.heartbeat_interval_seconds
+            )
 
         service = PollerService(**poller_kwargs)
 

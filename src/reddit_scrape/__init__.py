@@ -105,6 +105,9 @@ from reddit_scrape.models import (
     AlbumArtist,
     Artist,
     EnrichmentState,
+    PipelineProcessState,
+    PipelineProcessStatus,
+    PipelineRunMode,
     Release,
     ReleaseArtist,
     Submission,
@@ -133,6 +136,7 @@ from reddit_scrape.service import (
     ServiceConfig,
     validate_environment,
 )
+from reddit_scrape.telemetry import PipelineTelemetryRecorder
 
 __all__ = [  # noqa: RUF022
     # Database
@@ -147,6 +151,9 @@ __all__ = [  # noqa: RUF022
     "AlbumArtist",
     "Artist",
     "EnrichmentState",
+    "PipelineProcessState",
+    "PipelineProcessStatus",
+    "PipelineRunMode",
     "Release",
     "ReleaseArtist",
     "Submission",
@@ -258,6 +265,8 @@ __all__ = [  # noqa: RUF022
     "ServiceConfig",
     "VALID_THINKING_LEVELS",
     "validate_environment",
+    # Telemetry
+    "PipelineTelemetryRecorder",
 ]
 
 

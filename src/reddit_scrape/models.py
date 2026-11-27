@@ -19,6 +19,20 @@ class EnrichmentState(StrEnum):
     FAILED = "failed"
 
 
+class PipelineProcessState(StrEnum):
+    """Operational lifecycle state of the background Pipeline process."""
+
+    RUNNING = "running"
+    STOPPED = "stopped"
+
+
+class PipelineRunMode(StrEnum):
+    """Execution mode of a Pipeline process."""
+
+    CONTINUOUS = "continuous"
+    ONCE = "once"
+
+
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
@@ -239,10 +253,36 @@ class SubmissionRelease(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class PipelineProcessStatus(Base):
+    """Singleton operational status row for the active Pipeline worker process."""
+
+    __tablename__ = "pipeline_process_status"
+
+    process_name = Column(String(64), primary_key=True, default="default")
+    status = Column(String(32), nullable=False)
+    run_mode = Column(String(16), nullable=False)
+    host = Column(String(255), nullable=False)
+    pid = Column(Integer, nullable=False)
+    heartbeat_interval_seconds = Column(Integer, nullable=False, default=30)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    last_heartbeat_at = Column(DateTime(timezone=True), nullable=False)
+    stopped_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
 __all__ = [
     "Album",
     "AlbumArtist",
     "Artist",
+    "EnrichmentState",
+    "PipelineProcessState",
+    "PipelineProcessStatus",
+    "PipelineRunMode",
     "Release",
     "ReleaseArtist",
     "Submission",
