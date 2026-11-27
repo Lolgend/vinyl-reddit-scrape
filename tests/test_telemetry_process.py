@@ -7,14 +7,8 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
-from dotenv import load_dotenv
-from sqlalchemy import text
-from sqlalchemy.orm import sessionmaker
+from conftest import FakeClock, make_raw_submission, truncate_all_tables
 
-load_dotenv()
-
-from reddit_scrape.db import get_engine, init_db
-from reddit_scrape.ingestion import RawSubmission
 from reddit_scrape.models import (
     PipelineProcessState,
     PipelineProcessStatus,
@@ -25,56 +19,15 @@ from reddit_scrape.service import PollerService
 from reddit_scrape.telemetry import PipelineTelemetryRecorder
 
 
-@pytest.fixture(scope="session")
-def engine():
-    try:
-        eng = get_engine()
-        init_db(eng)
-        return eng
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Database unavailable: {exc}")
-
-
 @pytest.fixture(autouse=True)
 def clean_db(request):
     if request.cls and request.cls.__name__ == "TestPipelineTelemetryUnit":
         yield
         return
     engine = request.getfixturevalue("engine")
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
-                "submission_snapshots, submission_releases, releases, album_artists, albums, "
-                "artists, submissions CASCADE;"
-            )
-        )
+    truncate_all_tables(engine)
     yield
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
-                "submission_snapshots, submission_releases, releases, album_artists, albums, "
-                "artists, submissions CASCADE;"
-            )
-        )
-
-
-@pytest.fixture
-def session_factory(engine):
-    return sessionmaker(bind=engine)
-
-
-class _FakeClock:
-    def __init__(self, initial: datetime) -> None:
-        self.current = initial
-
-    def __call__(self) -> datetime:
-        return self.current
-
-    def advance(self, seconds: float) -> datetime:
-        self.current = self.current + timedelta(seconds=seconds)
-        return self.current
+    truncate_all_tables(engine)
 
 
 class TestPipelineTelemetryRecorder:
@@ -82,7 +35,7 @@ class TestPipelineTelemetryRecorder:
 
     def test_record_process_start_inserts_and_upserts_row(self, session_factory):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(
             session_factory,
             clock=clock,
@@ -140,7 +93,7 @@ class TestPipelineTelemetryRecorder:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(
             session_factory,
             clock=clock,
@@ -172,7 +125,7 @@ class TestPipelineTelemetryRecorder:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(
             session_factory,
             clock=clock,
@@ -199,6 +152,54 @@ class TestPipelineTelemetryRecorder:
             assert row.started_at == t0
             assert row.last_heartbeat_at == t1
             assert row.stopped_at == t1
+
+    def test_heartbeat_and_stop_remember_startup_run_mode_and_interval_on_insert_fallback(
+        self, session_factory
+    ):
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        clock = FakeClock(t0)
+        recorder = PipelineTelemetryRecorder(
+            session_factory,
+            clock=clock,
+            host="fallback-host",
+            pid=4343,
+        )
+
+        recorder.record_process_start(
+            run_mode=PipelineRunMode.ONCE,
+            heartbeat_interval_seconds=15,
+        )
+
+        # Delete the row so record_heartbeat exercises the INSERT branch
+        with session_factory() as session, session.begin():
+            existing = session.get(PipelineProcessStatus, "default")
+            assert existing is not None
+            session.delete(existing)
+
+        t1 = clock.advance(15)
+        recorder.record_heartbeat()
+        with session_factory() as session:
+            hb_row = session.get(PipelineProcessStatus, "default")
+        assert hb_row is not None
+        assert hb_row.run_mode == PipelineRunMode.ONCE
+        assert hb_row.heartbeat_interval_seconds == 15
+        assert hb_row.last_heartbeat_at == t1
+
+        # Delete again so record_process_stop exercises the INSERT branch
+        with session_factory() as session, session.begin():
+            existing = session.get(PipelineProcessStatus, "default")
+            assert existing is not None
+            session.delete(existing)
+
+        t2 = clock.advance(5)
+        recorder.record_process_stop()
+        with session_factory() as session:
+            stop_row = session.get(PipelineProcessStatus, "default")
+        assert stop_row is not None
+        assert stop_row.status == PipelineProcessState.STOPPED
+        assert stop_row.run_mode == PipelineRunMode.ONCE
+        assert stop_row.heartbeat_interval_seconds == 15
+        assert stop_row.stopped_at == t2
 
 class TestPipelineTelemetryUnit:
     """Unit tests for telemetry failure isolation without live DB."""
@@ -229,7 +230,7 @@ class TestPollerServiceProcessTelemetryIntegration:
 
     def test_poller_service_default_telemetry_recorder_and_clock(self, session_factory):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
 
         service = PollerService(
             session_factory=session_factory,
@@ -247,7 +248,7 @@ class TestPollerServiceProcessTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(
             session_factory,
             clock=clock,
@@ -346,7 +347,7 @@ class TestPollerServiceProcessTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(
             session_factory,
             clock=clock,
@@ -409,7 +410,7 @@ class TestPollerServiceProcessTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(
             session_factory,
             clock=clock,
@@ -460,12 +461,11 @@ class TestPollerServiceProcessTelemetryIntegration:
             pid=8888,
         )
 
-        sub = RawSubmission(
-            id="tel_fail_sub_1",
+        sub = make_raw_submission(
+            "tel_fail_sub_1",
             title="Resilient Artist - Resilient LP",
             url="https://reddit.com/r/vinylreleases/tel_fail_1",
             created_utc=datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
-            fullname="t3_tel_fail_sub_1",
         )
         mock_adapter = MagicMock()
         mock_adapter.fetch_new.return_value = [sub]

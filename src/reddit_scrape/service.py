@@ -636,7 +636,7 @@ class PollerService:
                     stmt = stmt.limit(batch_size)
                 candidates = session.execute(stmt).all()
 
-            if not candidates:
+            if not candidates or self._shutdown_event.is_set():
                 return _ExtractionDrainOutcome(
                     had_candidates=False,
                     extracted_count=0,
@@ -803,6 +803,9 @@ class PollerService:
                     outcome.extracted_count,
                 )
             return outcome.extracted_count
+
+        if self._shutdown_event.is_set():
+            return 0
 
         self.telemetry_recorder.record_loop_completion(
             PipelineLoopName.EXTRACTION_WORKER,
@@ -1038,10 +1041,15 @@ class PollerService:
                 enriched,
             )
         else:
+            duration_ms = max(
+                0, int((completed_at - started_at).total_seconds() * 1000)
+            )
             self.telemetry_recorder.refresh_loop_next_run(
                 PipelineLoopName.ENRICHMENT_WORKER,
                 next_run_at=next_run_at,
                 clear_error=True,
+                completed_at=completed_at,
+                duration_ms=duration_ms,
             )
         return int(enriched)
 
@@ -1063,10 +1071,11 @@ class PollerService:
         """Prune expired pipeline_runs rows defensively without blocking the pipeline."""
         try:
             retention_days = get_default_pipeline_run_retention_days()
+            has_custom_clock = (
+                self._clock is not None or self.telemetry_recorder.has_custom_clock
+            )
             cutoff = (
-                now - timedelta(days=retention_days)
-                if self._clock is not None
-                else None
+                now - timedelta(days=retention_days) if has_custom_clock else None
             )
             purge_pipeline_runs(
                 self.session_factory,

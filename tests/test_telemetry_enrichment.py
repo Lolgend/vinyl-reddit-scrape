@@ -4,20 +4,14 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 import uuid
-from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
-from dotenv import load_dotenv
-from sqlalchemy import select, text
-from sqlalchemy.orm import sessionmaker
+from conftest import FakeClock, get_loop_state, truncate_all_tables, wait_until
+from sqlalchemy import select
 
-load_dotenv()
-
-from reddit_scrape.db import get_engine, init_db
 from reddit_scrape.enrichment import CatalogEnrichmentService
 from reddit_scrape.models import (
     Album,
@@ -34,72 +28,15 @@ from reddit_scrape.service import PollerService
 from reddit_scrape.telemetry import PipelineTelemetryRecorder
 
 
-@pytest.fixture(scope="session")
-def engine():
-    try:
-        eng = get_engine()
-        init_db(eng)
-        return eng
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Database unavailable: {exc}")
-
-
 @pytest.fixture(autouse=True)
 def clean_db(request):
     if request.cls and request.cls.__name__ == "TestEnrichmentTelemetryUnit":
         yield
         return
     engine = request.getfixturevalue("engine")
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
-                "submission_snapshots, submission_releases, releases, album_artists, albums, "
-                "artists, submissions CASCADE;"
-            )
-        )
+    truncate_all_tables(engine)
     yield
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
-                "submission_snapshots, submission_releases, releases, album_artists, albums, "
-                "artists, submissions CASCADE;"
-            )
-        )
-
-
-@pytest.fixture
-def session_factory(engine):
-    return sessionmaker(bind=engine)
-
-
-class _FakeClock:
-    def __init__(self, initial: datetime) -> None:
-        self.current = initial
-
-    def __call__(self) -> datetime:
-        return self.current
-
-    def advance(self, seconds: float) -> datetime:
-        self.current = self.current + timedelta(seconds=seconds)
-        return self.current
-
-
-def _wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.02)
-    return predicate()
-
-
-def _get_loop_state(
-    session_factory, loop_name: PipelineLoopName
-) -> PipelineLoopState | None:
-    with session_factory() as session:
-        return session.get(PipelineLoopState, loop_name)
+    truncate_all_tables(engine)
 
 
 class TestTelemetryRecorderRefreshLoopNextRun:
@@ -109,7 +46,7 @@ class TestTelemetryRecorderRefreshLoopNextRun:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         recorder.seed_loop_states(
@@ -183,6 +120,26 @@ class TestTelemetryRecorderRefreshLoopNextRun:
         assert state_kept.next_run_at == next_wakeup_2
         assert state_kept.last_error == "kept error"
 
+        # Verify completed_at & duration_ms update without clobbering last_run_stats or adding runs
+        t_completed = clock.advance(5)
+        next_wakeup_3 = t_completed + timedelta(seconds=60)
+        recorder.refresh_loop_next_run(
+            PipelineLoopName.ENRICHMENT_WORKER,
+            next_run_at=next_wakeup_3,
+            clear_error=True,
+            completed_at=t_completed,
+            duration_ms=420,
+        )
+        with session_factory() as session:
+            state_comp = session.get(PipelineLoopState, PipelineLoopName.ENRICHMENT_WORKER)
+            runs_after = session.scalars(select(PipelineRun)).all()
+        assert state_comp is not None
+        assert state_comp.last_completed_at == t_completed
+        assert state_comp.last_duration_ms == 420
+        assert state_comp.last_run_stats == {"enriched": 3}
+        assert state_comp.last_error is None
+        assert runs_after == []
+
 
 class TestEnrichmentWorkerTelemetryIntegration:
     """PostgreSQL integration tests for Enrichment Queue telemetry in PollerService."""
@@ -191,7 +148,7 @@ class TestEnrichmentWorkerTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         mock_adapter = MagicMock()
@@ -211,10 +168,10 @@ class TestEnrichmentWorkerTelemetryIntegration:
         run_thread = threading.Thread(target=service.run, daemon=True)
         run_thread.start()
         try:
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     (
-                        r := _get_loop_state(
+                        r := get_loop_state(
                             session_factory, PipelineLoopName.TRACKING_POLL
                         )
                     )
@@ -265,7 +222,7 @@ class TestEnrichmentWorkerTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         mock_adapter = MagicMock()
@@ -287,10 +244,10 @@ class TestEnrichmentWorkerTelemetryIntegration:
         run_thread = threading.Thread(target=service.run, daemon=True)
         run_thread.start()
         try:
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     (
-                        r := _get_loop_state(
+                        r := get_loop_state(
                             session_factory, PipelineLoopName.ENRICHMENT_WORKER
                         )
                     )
@@ -299,10 +256,10 @@ class TestEnrichmentWorkerTelemetryIntegration:
                 )
             )
             # Wait for initial polls to finish so clock doesn't race
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     (
-                        r := _get_loop_state(
+                        r := get_loop_state(
                             session_factory, PipelineLoopName.TRACKING_POLL
                         )
                     )
@@ -322,10 +279,10 @@ class TestEnrichmentWorkerTelemetryIntegration:
             service.trigger_enrichment()
 
             expected_next_run = t_wakeup + timedelta(seconds=60)
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     (
-                        r := _get_loop_state(
+                        r := get_loop_state(
                             session_factory, PipelineLoopName.ENRICHMENT_WORKER
                         )
                     )
@@ -360,7 +317,7 @@ class TestEnrichmentWorkerTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(
             session_factory, clock=clock, host="enr-host", pid=4567
         )
@@ -411,10 +368,10 @@ class TestEnrichmentWorkerTelemetryIntegration:
         run_thread = threading.Thread(target=service.run, daemon=True)
         run_thread.start()
         try:
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     (
-                        r := _get_loop_state(
+                        r := get_loop_state(
                             session_factory, PipelineLoopName.TRACKING_POLL
                         )
                     )
@@ -426,10 +383,10 @@ class TestEnrichmentWorkerTelemetryIntegration:
             t_wakeup = clock.advance(10)
             service.trigger_enrichment()
 
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     (
-                        r := _get_loop_state(
+                        r := get_loop_state(
                             session_factory, PipelineLoopName.ENRICHMENT_WORKER
                         )
                     )
@@ -493,7 +450,7 @@ class TestEnrichmentWorkerTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         album_id = uuid.uuid4()
@@ -531,10 +488,10 @@ class TestEnrichmentWorkerTelemetryIntegration:
         run_thread = threading.Thread(target=service.run, daemon=True)
         run_thread.start()
         try:
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     (
-                        r := _get_loop_state(
+                        r := get_loop_state(
                             session_factory, PipelineLoopName.TRACKING_POLL
                         )
                     )
@@ -547,10 +504,10 @@ class TestEnrichmentWorkerTelemetryIntegration:
             service.trigger_enrichment()
 
             expected_next = t_wakeup + timedelta(seconds=60)
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     (
-                        r := _get_loop_state(
+                        r := get_loop_state(
                             session_factory, PipelineLoopName.ENRICHMENT_WORKER
                         )
                     )
@@ -580,11 +537,121 @@ class TestEnrichmentWorkerTelemetryIntegration:
             service.stop()
             run_thread.join(timeout=3.0)
 
+    def test_run_active_enrichment_zero_enriched_sets_completed_at_and_preserves_stats(
+        self, session_factory
+    ):
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        clock = FakeClock(t0)
+        recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
+
+        album_id = uuid.uuid4()
+        with session_factory() as session, session.begin():
+            session.add(
+                Album(
+                    id=album_id,
+                    combined_artist="Zero Enriched Artist",
+                    title="Zero Enriched Album",
+                    fingerprint=f"fp-{album_id}",
+                    discogs_status="pending",
+                )
+            )
+
+        def failing_search(*args, **kwargs):
+            clock.advance(2)
+            raise RuntimeError("discogs 502 bad gateway")
+
+        mock_discogs = MagicMock()
+        mock_discogs.search.side_effect = failing_search
+        real_enrichment = CatalogEnrichmentService(
+            session_factory=session_factory,
+            discogs_client=mock_discogs,
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_new.return_value = []
+        mock_adapter.fetch_hot.return_value = []
+
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=MagicMock(),
+            enrichment_service=real_enrichment,
+            enrichment_interval_seconds=60,
+            telemetry_recorder=recorder,
+            clock=clock,
+        )
+
+        run_thread = threading.Thread(target=service.run, daemon=True)
+        run_thread.start()
+        try:
+            assert wait_until(
+                lambda: (
+                    (
+                        r := get_loop_state(
+                            session_factory, PipelineLoopName.TRACKING_POLL
+                        )
+                    )
+                    is not None
+                    and r.last_completed_at is not None
+                )
+            )
+
+            # Seed prior completion metrics so we verify last_run_stats is preserved
+            t_prior_start = t0 - timedelta(minutes=2)
+            t_prior_end = t_prior_start + timedelta(seconds=1)
+            recorder.record_loop_completion(
+                PipelineLoopName.ENRICHMENT_WORKER,
+                status=PipelineLoopStatus.SLEEPING,
+                started_at=t_prior_start,
+                completed_at=t_prior_end,
+                stats={"enriched": 4},
+                next_run_at=t0 + timedelta(seconds=60),
+                record_run=False,
+            )
+
+            t_wakeup = clock.advance(10)
+            service.trigger_enrichment()
+
+            expected_completed = t_wakeup + timedelta(seconds=2)
+            expected_next = expected_completed + timedelta(seconds=60)
+            assert wait_until(
+                lambda: (
+                    (
+                        r := get_loop_state(
+                            session_factory, PipelineLoopName.ENRICHMENT_WORKER
+                        )
+                    )
+                    is not None
+                    and r.next_run_at == expected_next
+                )
+            )
+
+            with session_factory() as session:
+                enr = session.get(PipelineLoopState, PipelineLoopName.ENRICHMENT_WORKER)
+                enr_runs = session.scalars(
+                    select(PipelineRun).where(
+                        PipelineRun.loop_name == PipelineLoopName.ENRICHMENT_WORKER
+                    )
+                ).all()
+
+            assert enr is not None
+            assert enr.status == PipelineLoopStatus.SLEEPING
+            assert enr.last_started_at == t_wakeup
+            assert enr.last_completed_at == expected_completed
+            assert enr.last_completed_at >= enr.last_started_at
+            assert enr.last_duration_ms == 2000
+            assert enr.last_run_stats == {"enriched": 4}
+            assert enr.last_error is None
+            assert enr_runs == []
+        finally:
+            service.stop()
+            run_thread.join(timeout=3.0)
+
     def test_run_unhandled_enrichment_error_and_queue_check_error_recover_on_next_wakeup(
         self, session_factory, monkeypatch
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         album_id = uuid.uuid4()
@@ -631,10 +698,10 @@ class TestEnrichmentWorkerTelemetryIntegration:
         run_thread = threading.Thread(target=service.run, daemon=True)
         run_thread.start()
         try:
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     (
-                        r := _get_loop_state(
+                        r := get_loop_state(
                             session_factory, PipelineLoopName.TRACKING_POLL
                         )
                     )
@@ -647,10 +714,10 @@ class TestEnrichmentWorkerTelemetryIntegration:
             t_err_start = clock.advance(10)
             service.trigger_enrichment()
 
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     (
-                        r := _get_loop_state(
+                        r := get_loop_state(
                             session_factory, PipelineLoopName.ENRICHMENT_WORKER
                         )
                     )
@@ -687,10 +754,10 @@ class TestEnrichmentWorkerTelemetryIntegration:
             clock.advance(60)
             service.trigger_enrichment()
 
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     (
-                        r := _get_loop_state(
+                        r := get_loop_state(
                             session_factory, PipelineLoopName.ENRICHMENT_WORKER
                         )
                     )
@@ -707,10 +774,10 @@ class TestEnrichmentWorkerTelemetryIntegration:
             clock.advance(60)
             service.trigger_enrichment()
 
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     (
-                        r := _get_loop_state(
+                        r := get_loop_state(
                             session_factory, PipelineLoopName.ENRICHMENT_WORKER
                         )
                     )
@@ -743,7 +810,7 @@ class TestEnrichmentWorkerTelemetryIntegration:
 
     def test_run_once_enrichment_disabled_idle_active_and_error(self, session_factory):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         mock_adapter = MagicMock()
