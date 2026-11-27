@@ -215,3 +215,37 @@ class TestCliBatchSizeAndVerbosity:
         assert "extracted=4" in captured.out
         assert "enriched=5" in captured.out
 
+    @patch("reddit_scrape.cli.validate_environment")
+    @patch("reddit_scrape.cli.PollerService")
+    @patch("reddit_scrape.cli.init_db")
+    def test_cli_run_passes_custom_heartbeat_interval(
+        self, mock_init_db, mock_poller_cls, mock_validate_env
+    ):
+        mock_validate_env.return_value = ServiceConfig(
+            reddit_client_id="id",
+            reddit_client_secret="sec",
+            database_url="postgresql+psycopg://db",
+            deepseek_api_key="key",
+            llm_batch_size=5,
+            heartbeat_interval_seconds=45,
+        )
+        mock_service = MagicMock()
+        mock_service.run_once.return_value = CycleStats(
+            new_stats=MagicMock(inserted=0, updated=0),
+            hot_stats=MagicMock(inserted=0, updated=0),
+            extracted_count=0,
+        )
+        mock_poller_cls.return_value = mock_service
+
+        exit_code = main(["run", "--once"])
+        assert exit_code == 0
+        mock_poller_cls.assert_called_once_with(
+            poll_interval_seconds=300,
+            hot_poll_interval_seconds=900,
+            new_limit=50,
+            hot_limit=50,
+            thinking_level="none",
+            llm_batch_size=5,
+            heartbeat_interval_seconds=45,
+        )
+

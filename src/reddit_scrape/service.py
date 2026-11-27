@@ -9,8 +9,9 @@ import os
 import signal
 import threading
 import time
-from collections.abc import Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, cast
 
 from dotenv import load_dotenv
@@ -30,8 +31,9 @@ from reddit_scrape.ingestion import (
     RedditSourceAdapter,
     SubmissionIngester,
 )
-from reddit_scrape.models import Submission
+from reddit_scrape.models import PipelineRunMode, Submission
 from reddit_scrape.persistence import ReleasePersistenceService
+from reddit_scrape.telemetry import PipelineTelemetryRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +60,7 @@ class ServiceConfig:
     discogs_consumer_secret: str | None = None
     discogs_user_agent: str = "VinylReleasesScraper/0.1.0"
     enrichment_interval_seconds: int = 60
+    heartbeat_interval_seconds: int = 30
 
 
 def validate_environment(
@@ -125,16 +128,19 @@ def validate_environment(
     else:
         thinking_level = get_default_thinking_level(str(deepseek_model))
 
-    raw_batch_size = env.get("LLM_BATCH_SIZE")
-    if raw_batch_size is None or not str(raw_batch_size).strip():
-        llm_batch_size = 5
-    else:
+    def _parse_positive_int(key: str, default: int) -> int:
+        raw_val = env.get(key)
+        if raw_val is None or not str(raw_val).strip():
+            return default
         try:
-            llm_batch_size = int(str(raw_batch_size).strip())
+            parsed = int(str(raw_val).strip())
         except ValueError:
-            raise ValueError("LLM_BATCH_SIZE must be a positive integer")
-        if llm_batch_size <= 0:
-            raise ValueError("LLM_BATCH_SIZE must be a positive integer")
+            raise ValueError(f"{key} must be a positive integer")
+        if parsed <= 0:
+            raise ValueError(f"{key} must be a positive integer")
+        return parsed
+
+    llm_batch_size = _parse_positive_int("LLM_BATCH_SIZE", 5)
 
     # Discogs credentials validation
     raw_discogs_token = env.get("DISCOGS_TOKEN")
@@ -174,20 +180,12 @@ def validate_environment(
         else "VinylReleasesScraper/0.1.0"
     )
 
-    raw_enrichment_interval = env.get("ENRICHMENT_INTERVAL_SECONDS")
-    if raw_enrichment_interval is None or not str(raw_enrichment_interval).strip():
-        enrichment_interval_seconds = 60
-    else:
-        try:
-            enrichment_interval_seconds = int(str(raw_enrichment_interval).strip())
-        except ValueError:
-            raise ValueError(
-                "ENRICHMENT_INTERVAL_SECONDS must be a positive integer"
-            )
-        if enrichment_interval_seconds <= 0:
-            raise ValueError(
-                "ENRICHMENT_INTERVAL_SECONDS must be a positive integer"
-            )
+    enrichment_interval_seconds = _parse_positive_int(
+        "ENRICHMENT_INTERVAL_SECONDS", 60
+    )
+    heartbeat_interval_seconds = _parse_positive_int(
+        "PIPELINE_HEARTBEAT_INTERVAL_SECONDS", 30
+    )
 
     return ServiceConfig(
         reddit_client_id=str(reddit_client_id),
@@ -206,6 +204,7 @@ def validate_environment(
         discogs_consumer_secret=discogs_consumer_secret,
         discogs_user_agent=discogs_user_agent,
         enrichment_interval_seconds=enrichment_interval_seconds,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
     )
 
 
@@ -290,6 +289,9 @@ class PollerService:
         discogs_user_agent: str | None = None,
         deepseek_api_key: str | None = None,
         deepseek_base_url: str | None = None,
+        heartbeat_interval_seconds: int = 30,
+        telemetry_recorder: PipelineTelemetryRecorder | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.session_factory = session_factory or get_session_factory()
         self.reddit_adapter = reddit_adapter or RedditSourceAdapter()
@@ -313,6 +315,12 @@ class PollerService:
         self.hot_limit = hot_limit
 
         self.enrichment_interval_seconds = enrichment_interval_seconds
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._clock = clock
+        self.telemetry_recorder = telemetry_recorder or PipelineTelemetryRecorder(
+            self.session_factory,
+            clock=clock,
+        )
         self._shutdown_event = threading.Event()
         self._extraction_trigger = threading.Event()
         self._extraction_lock = threading.Lock()
@@ -320,6 +328,7 @@ class PollerService:
         self._enrichment_trigger = threading.Event()
         self._enrichment_lock = threading.Lock()
         self._enrichment_thread: threading.Thread | None = None
+        self._heartbeat_thread: threading.Thread | None = None
         self._async_runner = _AsyncRunner()
         self._discogs_client: DiscogsClient | None
         self.enrichment_service: CatalogEnrichmentService | None
@@ -375,6 +384,12 @@ class PollerService:
     def is_shutdown_requested(self) -> bool:
         """Return True if termination signal has been received."""
         return self._shutdown_event.is_set()
+
+    def _now(self) -> datetime:
+        """Return the current UTC timestamp from the injected clock or recorder."""
+        if self._clock is not None:
+            return self._clock()
+        return self.telemetry_recorder.now()
 
     def trigger_extraction(self) -> None:
         """Signal the background extraction worker that unextracted submissions are ready."""
@@ -586,7 +601,28 @@ class PollerService:
         hot_limit: int | None = None,
     ) -> CycleStats:
         """Run a single poll & extract cycle and return summary statistics."""
-        return self.poll_and_extract_cycle(new_limit=new_limit, hot_limit=hot_limit)
+        self.telemetry_recorder.record_process_start(
+            run_mode=PipelineRunMode.ONCE,
+            heartbeat_interval_seconds=self.heartbeat_interval_seconds,
+            started_at=self._now(),
+        )
+        try:
+            return self.poll_and_extract_cycle(
+                new_limit=new_limit, hot_limit=hot_limit
+            )
+        finally:
+            self.telemetry_recorder.record_process_stop(stopped_at=self._now())
+
+    def _heartbeat_loop(self) -> None:
+        """Background heartbeat thread refreshing pipeline process liveness."""
+        logger.debug("Pipeline heartbeat thread started.")
+        while not self._shutdown_event.wait(
+            timeout=float(self.heartbeat_interval_seconds)
+        ):
+            try:
+                self.telemetry_recorder.record_heartbeat(heartbeat_at=self._now())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Unexpected error in pipeline heartbeat loop: %s", exc)
 
     def _extraction_worker_loop(self) -> None:
         """Background extraction worker thread decoupled from ingestion polling."""
@@ -637,46 +673,61 @@ class PollerService:
         """Start the continuous background ingestion poller with decoupled asynchronous extraction."""
         self.register_signal_handlers()
         logger.info(
-            "Starting PollerService (new_interval=%ss, hot_interval=%ss, enrichment_interval=%ss)",
+            "Starting PollerService (new_interval=%ss, hot_interval=%ss, enrichment_interval=%ss, heartbeat_interval=%ss)",
             self.poll_interval_seconds,
             self.hot_poll_interval_seconds,
             self.enrichment_interval_seconds,
+            self.heartbeat_interval_seconds,
         )
 
-        # Start decoupled background extraction worker thread
-        self._extraction_thread = threading.Thread(
-            target=self._extraction_worker_loop,
-            name="ExtractionWorker",
-            daemon=True,
+        self.telemetry_recorder.record_process_start(
+            run_mode=PipelineRunMode.CONTINUOUS,
+            heartbeat_interval_seconds=self.heartbeat_interval_seconds,
+            started_at=self._now(),
         )
-        self._extraction_thread.start()
 
-        # Start decoupled background Discogs enrichment worker thread
-        self._enrichment_thread = threading.Thread(
-            target=self._enrichment_worker_loop,
-            name="DiscogsEnrichmentWorker",
-            daemon=True,
-        )
-        self._enrichment_thread.start()
-
-        # Run initial discovery and tracking polls on startup
         try:
-            logger.info("Executing initial discovery and tracking poll cycle...")
-            self.poll_new()
-            self.poll_hot()
-            self.trigger_extraction()
-            logger.info(
-                "Initial poll cycle completed. Poller active (next discovery poll in %ds, tracking poll in %ds).",
-                self.poll_interval_seconds,
-                self.hot_poll_interval_seconds,
+            # Start dedicated background pipeline heartbeat thread
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop,
+                name="PipelineHeartbeat",
+                daemon=True,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Error during initial poll cycle: %s", exc)
+            self._heartbeat_thread.start()
 
-        last_new_poll = time.time()
-        last_hot_poll = time.time()
+            # Start decoupled background extraction worker thread
+            self._extraction_thread = threading.Thread(
+                target=self._extraction_worker_loop,
+                name="ExtractionWorker",
+                daemon=True,
+            )
+            self._extraction_thread.start()
 
-        try:
+            # Start decoupled background Discogs enrichment worker thread
+            self._enrichment_thread = threading.Thread(
+                target=self._enrichment_worker_loop,
+                name="DiscogsEnrichmentWorker",
+                daemon=True,
+            )
+            self._enrichment_thread.start()
+
+            # Run initial discovery and tracking polls on startup
+            try:
+                logger.info("Executing initial discovery and tracking poll cycle...")
+                self.poll_new()
+                self.poll_hot()
+                self.trigger_extraction()
+                logger.info(
+                    "Initial poll cycle completed. Poller active (next discovery poll in %ds, tracking poll in %ds).",
+                    self.poll_interval_seconds,
+                    self.hot_poll_interval_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Error during initial poll cycle: %s", exc)
+
+            last_new_poll = time.time()
+            last_hot_poll = time.time()
+
             while not self._shutdown_event.is_set():
                 if self._shutdown_event.wait(timeout=1.0):
                     break
@@ -705,10 +756,13 @@ class PollerService:
             logger.info("KeyboardInterrupt received in run loop.")
         finally:
             self.stop()
+            if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+                self._heartbeat_thread.join(timeout=5.0)
             if self._extraction_thread and self._extraction_thread.is_alive():
                 self._extraction_thread.join(timeout=5.0)
             if self._enrichment_thread and self._enrichment_thread.is_alive():
                 self._enrichment_thread.join(timeout=5.0)
+            self.telemetry_recorder.record_process_stop(stopped_at=self._now())
             logger.info("PollerService stopped cleanly.")
 
 

@@ -203,3 +203,73 @@ class TestDatabaseSchemaAndInit:
 
             drop_all_mock.assert_called_once_with(mock_engine)
             create_all_mock.assert_called_once_with(mock_engine)
+
+
+class TestPipelineProcessTelemetrySchema:
+    def test_process_enums_values_and_exports(self):
+        import reddit_scrape
+        import reddit_scrape.models as models_mod
+        from reddit_scrape.models import PipelineProcessState, PipelineRunMode
+
+        assert PipelineProcessState.RUNNING == "running"
+        assert PipelineProcessState.STOPPED == "stopped"
+        assert str(PipelineProcessState.RUNNING) == "running"
+
+        assert PipelineRunMode.CONTINUOUS == "continuous"
+        assert PipelineRunMode.ONCE == "once"
+        assert str(PipelineRunMode.ONCE) == "once"
+
+        for name, obj in (
+            ("PipelineProcessState", PipelineProcessState),
+            ("PipelineRunMode", PipelineRunMode),
+        ):
+            assert name in models_mod.__all__
+            assert name in reddit_scrape.__all__
+            assert getattr(reddit_scrape, name) is obj
+
+    def test_pipeline_process_status_model_columns_and_exports(self):
+        from sqlalchemy import DateTime, Integer, String
+
+        import reddit_scrape
+        import reddit_scrape.models as models_mod
+        from reddit_scrape.models import PipelineProcessStatus
+
+        assert "PipelineProcessStatus" in models_mod.__all__
+        assert "PipelineProcessStatus" in reddit_scrape.__all__
+        assert reddit_scrape.PipelineProcessStatus is PipelineProcessStatus
+
+        table = PipelineProcessStatus.__table__
+        assert table.name == "pipeline_process_status"
+        assert "pipeline_process_status" in Base.metadata.tables
+
+        pk_cols = [c.name for c in table.primary_key.columns]
+        assert pk_cols == ["process_name"]
+
+        expected_columns = {
+            "process_name": (String, 64, False),
+            "status": (String, 32, False),
+            "run_mode": (String, 16, False),
+            "host": (String, 255, False),
+            "pid": (Integer, None, False),
+            "heartbeat_interval_seconds": (Integer, None, False),
+            "started_at": (DateTime, None, False),
+            "last_heartbeat_at": (DateTime, None, False),
+            "stopped_at": (DateTime, None, True),
+            "updated_at": (DateTime, None, False),
+        }
+        assert set(table.columns.keys()) == set(expected_columns.keys())
+
+        for col_name, (col_type, length, nullable) in expected_columns.items():
+            col = table.columns[col_name]
+            assert isinstance(col.type, col_type), f"{col_name} type mismatch"
+            if length is not None:
+                assert col.type.length == length, f"{col_name} length mismatch"
+            if col_type is DateTime:
+                assert col.type.timezone is True, f"{col_name} must be TIMESTAMPTZ"
+            assert col.nullable is nullable, f"{col_name} nullability mismatch"
+
+        assert table.columns["process_name"].default.arg == "default"
+        assert table.columns["heartbeat_interval_seconds"].default.arg == 30
+        assert table.columns["updated_at"].server_default is not None
+        assert table.columns["updated_at"].onupdate is not None
+
