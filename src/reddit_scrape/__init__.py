@@ -131,7 +131,9 @@ from reddit_scrape.persistence import (
     persist_extracted_releases,
 )
 from reddit_scrape.retention import (
+    get_default_pipeline_run_retention_days,
     get_default_retention_days,
+    purge_pipeline_runs,
     purge_snapshots,
 )
 from reddit_scrape.service import (
@@ -207,7 +209,9 @@ __all__ = [  # noqa: RUF022
     "normalize_attribute",
     "persist_extracted_releases",
     # Retention
+    "get_default_pipeline_run_retention_days",
     "get_default_retention_days",
+    "purge_pipeline_runs",
     "purge_snapshots",
     # Discogs
     "DEFAULT_DISCOGS_BASE_URL",

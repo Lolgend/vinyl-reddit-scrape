@@ -38,11 +38,16 @@ from reddit_scrape.models import (
     Submission,
 )
 from reddit_scrape.persistence import ReleasePersistenceService
+from reddit_scrape.retention import (
+    get_default_pipeline_run_retention_days,
+    purge_pipeline_runs,
+)
 from reddit_scrape.telemetry import PipelineTelemetryRecorder
 
 logger = logging.getLogger(__name__)
 
 VALID_THINKING_LEVELS = {"none", "minimal", "low", "medium", "high", "max"}
+PIPELINE_RUN_PRUNE_INTERVAL_SECONDS = 86400
 
 
 @dataclass
@@ -1054,6 +1059,23 @@ class PollerService:
                 raise_on_error=False,
             )
 
+    def _purge_expired_pipeline_runs(self, now: datetime) -> None:
+        """Prune expired pipeline_runs rows defensively without blocking the pipeline."""
+        try:
+            retention_days = get_default_pipeline_run_retention_days()
+            cutoff = (
+                now - timedelta(days=retention_days)
+                if self._clock is not None
+                else None
+            )
+            purge_pipeline_runs(
+                self.session_factory,
+                retention_days=retention_days,
+                cutoff=cutoff,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to purge expired pipeline runs: %s", exc)
+
     def run(self) -> None:
         """Start the continuous background ingestion poller with decoupled asynchronous extraction."""
         self.register_signal_handlers()
@@ -1098,6 +1120,9 @@ class PollerService:
                     daemon=True,
                 )
                 self._enrichment_thread.start()
+
+            last_run_purge = started_at
+            self._purge_expired_pipeline_runs(started_at)
 
             # Run initial discovery and tracking polls on startup
             logger.info("Executing initial discovery and tracking poll cycle...")
@@ -1156,6 +1181,12 @@ class PollerService:
                     )
                     if hot_stats is not None:
                         self.trigger_extraction()
+
+                if now >= last_run_purge + timedelta(
+                    seconds=PIPELINE_RUN_PRUNE_INTERVAL_SECONDS
+                ):
+                    last_run_purge = now
+                    self._purge_expired_pipeline_runs(now)
 
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt received in run loop.")

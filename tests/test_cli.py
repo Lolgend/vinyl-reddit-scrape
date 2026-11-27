@@ -249,3 +249,55 @@ class TestCliBatchSizeAndVerbosity:
             heartbeat_interval_seconds=45,
         )
 
+
+class TestCliPurgePipelineRuns:
+    """Tests for the purge-pipeline-runs CLI subcommand."""
+
+    def test_parser_purge_pipeline_runs_defaults_and_overrides(self):
+        parser = create_parser()
+        args_default = parser.parse_args(["purge-pipeline-runs"])
+        assert args_default.command == "purge-pipeline-runs"
+        assert args_default.days is None
+        assert args_default.batch_size == 5000
+
+        args_custom = parser.parse_args(
+            ["purge-pipeline-runs", "--days", "14", "--batch-size", "250"]
+        )
+        assert args_custom.days == 14
+        assert args_custom.batch_size == 250
+
+    @patch("reddit_scrape.cli.purge_pipeline_runs")
+    @patch("reddit_scrape.cli.get_default_pipeline_run_retention_days")
+    def test_cli_purge_pipeline_runs_uses_default_days_and_prints_summary(
+        self, mock_default_days, mock_purge_runs, capsys
+    ):
+        mock_default_days.return_value = 21
+        mock_purge_runs.return_value = 7
+
+        exit_code = main(["purge-pipeline-runs"])
+        assert exit_code == 0
+        mock_default_days.assert_called_once_with()
+        mock_purge_runs.assert_called_once_with(retention_days=21, batch_size=5000)
+        captured = capsys.readouterr()
+        assert (
+            captured.out.strip()
+            == "Successfully purged 7 pipeline runs older than 21 days."
+        )
+
+    @patch("reddit_scrape.cli.purge_pipeline_runs")
+    def test_cli_purge_pipeline_runs_passes_explicit_args(
+        self, mock_purge_runs, capsys
+    ):
+        mock_purge_runs.return_value = 3
+
+        exit_code = main(
+            ["purge-pipeline-runs", "--days", "10", "--batch-size", "100"]
+        )
+        assert exit_code == 0
+        mock_purge_runs.assert_called_once_with(retention_days=10, batch_size=100)
+        captured = capsys.readouterr()
+        assert (
+            captured.out.strip()
+            == "Successfully purged 3 pipeline runs older than 10 days."
+        )
+
