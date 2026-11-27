@@ -1652,7 +1652,10 @@ class TestDiscogsEnrichmentWorkerIntegration:
         service.stop()
 
     def test_run_starts_and_stops_enrichment_worker_thread(self, session_factory):
-        service = PollerService(session_factory=session_factory)
+        service = PollerService(
+            session_factory=session_factory,
+            enrichment_service=MagicMock(),
+        )
         service.poll_new = MagicMock()
         service.poll_hot = MagicMock()
         service.process_unextracted_submissions = MagicMock(return_value=0)
