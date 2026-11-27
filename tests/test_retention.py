@@ -13,6 +13,14 @@ from reddit_scrape.models import (
     Album,
     AlbumArtist,
     Artist,
+    PipelineLoopName,
+    PipelineLoopState,
+    PipelineLoopStatus,
+    PipelineProcessState,
+    PipelineProcessStatus,
+    PipelineRun,
+    PipelineRunMode,
+    PipelineRunStatus,
     Release,
     Submission,
     SubmissionRelease,
@@ -38,14 +46,18 @@ def clean_db(engine):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE submission_snapshots, submission_releases, releases, album_artists, albums, artists, submissions CASCADE;"
+                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
+                "submission_snapshots, submission_releases, releases, album_artists, albums, "
+                "artists, submissions CASCADE;"
             )
         )
     yield
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE submission_snapshots, submission_releases, releases, album_artists, albums, artists, submissions CASCADE;"
+                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
+                "submission_snapshots, submission_releases, releases, album_artists, albums, "
+                "artists, submissions CASCADE;"
             )
         )
 
@@ -381,3 +393,274 @@ def test_python_m_subprocess_execution():
     )
     assert result.returncode == 0
     assert "purged" in result.stdout.lower()
+
+
+def test_get_default_pipeline_run_retention_days_precedence_and_export(monkeypatch):
+    """Verify env fallback precedence (PIPELINE_RUN_RETENTION_DAYS -> SNAPSHOT_RETENTION_DAYS -> 30)
+    with invalid non-integer values ignored, and top-level package export.
+    """
+    import reddit_scrape
+    from reddit_scrape.retention import get_default_pipeline_run_retention_days
+
+    assert reddit_scrape.get_default_pipeline_run_retention_days is get_default_pipeline_run_retention_days
+    assert "get_default_pipeline_run_retention_days" in reddit_scrape.__all__
+
+    monkeypatch.delenv("PIPELINE_RUN_RETENTION_DAYS", raising=False)
+    monkeypatch.delenv("SNAPSHOT_RETENTION_DAYS", raising=False)
+    assert get_default_pipeline_run_retention_days() == 30
+
+    monkeypatch.setenv("SNAPSHOT_RETENTION_DAYS", "14")
+    assert get_default_pipeline_run_retention_days() == 14
+
+    monkeypatch.setenv("PIPELINE_RUN_RETENTION_DAYS", "7")
+    assert get_default_pipeline_run_retention_days() == 7
+
+    # Invalid PIPELINE_RUN_RETENTION_DAYS falls back cleanly to SNAPSHOT_RETENTION_DAYS
+    monkeypatch.setenv("PIPELINE_RUN_RETENTION_DAYS", "not-an-int")
+    assert get_default_pipeline_run_retention_days() == 14
+
+    # Both invalid fall back cleanly to 30
+    monkeypatch.setenv("SNAPSHOT_RETENTION_DAYS", "invalid")
+    assert get_default_pipeline_run_retention_days() == 30
+
+
+def test_purge_pipeline_runs_deletes_old_preserves_recent_and_state(session_factory):
+    """Verify purge_pipeline_runs deletes expired runs, preserves newer runs and
+    operational state tables, and is exported from top-level reddit_scrape.
+    """
+    import reddit_scrape
+    from reddit_scrape.retention import purge_pipeline_runs
+
+    assert reddit_scrape.purge_pipeline_runs is purge_pipeline_runs
+    assert "purge_pipeline_runs" in reddit_scrape.__all__
+
+    now = datetime.now(timezone.utc)
+
+    with session_factory() as session:
+        session.add(
+            PipelineProcessStatus(
+                process_name="default",
+                status=PipelineProcessState.RUNNING,
+                run_mode=PipelineRunMode.CONTINUOUS,
+                host="worker-1",
+                pid=1234,
+                heartbeat_interval_seconds=30,
+                started_at=now - timedelta(days=45),
+                last_heartbeat_at=now,
+            )
+        )
+        session.add(
+            PipelineLoopState(
+                loop_name=PipelineLoopName.DISCOVERY_POLL,
+                status=PipelineLoopStatus.SLEEPING,
+                interval_seconds=300,
+                last_started_at=now - timedelta(minutes=5),
+                last_completed_at=now - timedelta(minutes=5),
+                next_run_at=now + timedelta(minutes=5),
+            )
+        )
+        session.add_all(
+            [
+                PipelineRun(
+                    loop_name=PipelineLoopName.DISCOVERY_POLL,
+                    status=PipelineRunStatus.SUCCESS,
+                    started_at=now - timedelta(days=45),
+                    completed_at=now - timedelta(days=45) + timedelta(seconds=2),
+                    duration_ms=2000,
+                ),
+                PipelineRun(
+                    loop_name=PipelineLoopName.TRACKING_POLL,
+                    status=PipelineRunStatus.ERROR,
+                    started_at=now - timedelta(days=31),
+                    completed_at=now - timedelta(days=31) + timedelta(seconds=1),
+                    duration_ms=1000,
+                    error_message="temporary failure",
+                ),
+                PipelineRun(
+                    loop_name=PipelineLoopName.DISCOVERY_POLL,
+                    status=PipelineRunStatus.SUCCESS,
+                    started_at=now - timedelta(days=29),
+                    completed_at=now - timedelta(days=29) + timedelta(seconds=1),
+                    duration_ms=1000,
+                ),
+                PipelineRun(
+                    loop_name=PipelineLoopName.ENRICHMENT_WORKER,
+                    status=PipelineRunStatus.SUCCESS,
+                    started_at=now - timedelta(hours=2),
+                    completed_at=now - timedelta(hours=2) + timedelta(seconds=3),
+                    duration_ms=3000,
+                ),
+            ]
+        )
+        session.commit()
+
+    deleted = purge_pipeline_runs(session_factory, retention_days=30, batch_size=100)
+    assert deleted == 2
+
+    with session_factory() as session:
+        remaining = session.scalars(
+            select(PipelineRun).order_by(PipelineRun.started_at.asc())
+        ).all()
+        assert len(remaining) == 2
+        assert remaining[0].started_at == now - timedelta(days=29)
+        assert remaining[1].started_at == now - timedelta(hours=2)
+
+        proc = session.get(PipelineProcessStatus, "default")
+        assert proc is not None
+        assert proc.status == PipelineProcessState.RUNNING
+
+        loop_state = session.get(PipelineLoopState, PipelineLoopName.DISCOVERY_POLL)
+        assert loop_state is not None
+        assert loop_state.status == PipelineLoopStatus.SLEEPING
+
+
+def test_purge_pipeline_runs_chunked_batches_and_explicit_cutoff(session_factory):
+    """Verify multi-batch deletion ordered across batches, direct Session support, and cutoff override."""
+    from reddit_scrape.retention import purge_pipeline_runs
+
+    t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    cutoff = t0 - timedelta(days=30)
+
+    with session_factory() as session:
+        for i in range(5):
+            session.add(
+                PipelineRun(
+                    loop_name=PipelineLoopName.DISCOVERY_POLL,
+                    status=PipelineRunStatus.SUCCESS,
+                    started_at=cutoff - timedelta(days=1, hours=i),
+                    completed_at=cutoff - timedelta(days=1, hours=i) + timedelta(seconds=1),
+                    duration_ms=1000,
+                )
+            )
+        # Exactly at cutoff -> strictly `< cutoff` means NOT deleted
+        session.add(
+            PipelineRun(
+                loop_name=PipelineLoopName.DISCOVERY_POLL,
+                status=PipelineRunStatus.SUCCESS,
+                started_at=cutoff,
+                completed_at=cutoff + timedelta(seconds=1),
+                duration_ms=1000,
+            )
+        )
+        session.commit()
+
+        deleted = purge_pipeline_runs(
+            session,
+            retention_days=30,
+            batch_size=2,
+            cutoff=cutoff,
+        )
+        assert deleted == 5
+
+    with session_factory() as session:
+        remaining = session.scalars(select(PipelineRun)).all()
+        assert len(remaining) == 1
+        assert remaining[0].started_at == cutoff
+
+
+def test_purge_pipeline_runs_validation(session_factory):
+    """Verify input validation for invalid retention_days or batch_size."""
+    from reddit_scrape.retention import purge_pipeline_runs
+
+    with pytest.raises(ValueError, match="retention_days"):
+        purge_pipeline_runs(session_factory, retention_days=-1)
+
+    with pytest.raises(ValueError, match="batch_size"):
+        purge_pipeline_runs(session_factory, retention_days=30, batch_size=0)
+
+    with pytest.raises(ValueError, match="batch_size"):
+        purge_pipeline_runs(session_factory, retention_days=30, batch_size=-5)
+
+
+def test_cli_purge_pipeline_runs(session_factory, capsys):
+    """Verify CLI interface for purge-pipeline-runs subcommand with PostgreSQL."""
+    now = datetime.now(timezone.utc)
+
+    with session_factory() as session:
+        session.add_all(
+            [
+                PipelineRun(
+                    loop_name=PipelineLoopName.DISCOVERY_POLL,
+                    status=PipelineRunStatus.SUCCESS,
+                    started_at=now - timedelta(days=35),
+                    completed_at=now - timedelta(days=35) + timedelta(seconds=1),
+                    duration_ms=1000,
+                ),
+                PipelineRun(
+                    loop_name=PipelineLoopName.TRACKING_POLL,
+                    status=PipelineRunStatus.SUCCESS,
+                    started_at=now - timedelta(days=5),
+                    completed_at=now - timedelta(days=5) + timedelta(seconds=1),
+                    duration_ms=1000,
+                ),
+            ]
+        )
+        session.commit()
+
+    exit_code = cli_main(["purge-pipeline-runs", "--days", "30", "--batch-size", "10"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "Successfully purged 1 pipeline runs older than 30 days." in captured.out
+
+    with session_factory() as session:
+        remaining = session.scalars(select(PipelineRun)).all()
+        assert len(remaining) == 1
+        assert remaining[0].loop_name == PipelineLoopName.TRACKING_POLL
+
+
+def test_cli_purge_pipeline_runs_env_var(session_factory, monkeypatch, capsys):
+    """Verify purge-pipeline-runs CLI defaults to PIPELINE_RUN_RETENTION_DAYS when --days is omitted."""
+    now = datetime.now(timezone.utc)
+
+    with session_factory() as session:
+        session.add_all(
+            [
+                PipelineRun(
+                    loop_name=PipelineLoopName.DISCOVERY_POLL,
+                    status=PipelineRunStatus.SUCCESS,
+                    started_at=now - timedelta(days=20),
+                    completed_at=now - timedelta(days=20) + timedelta(seconds=1),
+                    duration_ms=1000,
+                ),
+                PipelineRun(
+                    loop_name=PipelineLoopName.TRACKING_POLL,
+                    status=PipelineRunStatus.SUCCESS,
+                    started_at=now - timedelta(days=5),
+                    completed_at=now - timedelta(days=5) + timedelta(seconds=1),
+                    duration_ms=1000,
+                ),
+            ]
+        )
+        session.commit()
+
+    monkeypatch.setenv("PIPELINE_RUN_RETENTION_DAYS", "15")
+
+    exit_code = cli_main(["purge-pipeline-runs"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "Successfully purged 1 pipeline runs older than 15 days." in captured.out
+
+    with session_factory() as session:
+        remaining = session.scalars(select(PipelineRun)).all()
+        assert len(remaining) == 1
+        assert remaining[0].loop_name == PipelineLoopName.TRACKING_POLL
+
+
+def test_python_m_subprocess_purge_pipeline_runs():
+    """Verify CLI runnable via python -m reddit_scrape purge-pipeline-runs --days 30."""
+    from pathlib import Path
+
+    src_dir = str(Path(__file__).resolve().parent.parent / "src")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = src_dir
+    env["PYTHONUTF8"] = "1"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "reddit_scrape", "purge-pipeline-runs", "--days", "30"],
+        capture_output=True,
+        check=False,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0
+    assert "pipeline runs" in result.stdout.lower()
