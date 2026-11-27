@@ -322,5 +322,34 @@ class PipelineTelemetryRecorder:
 
         self._run_write("record_loop_completion", _write)
 
+    def refresh_loop_next_run(
+        self,
+        loop_name: PipelineLoopName | str,
+        *,
+        next_run_at: datetime | None,
+        clear_error: bool = True,
+    ) -> None:
+        """Refresh a loop's sleeping status and next_run_at without creating a PipelineRun."""
+        loop_name_str = str(loop_name)
+        insert_values: dict[str, Any] = {
+            "loop_name": loop_name_str,
+            "status": str(PipelineLoopStatus.SLEEPING),
+            "interval_seconds": 0,
+            "next_run_at": next_run_at,
+        }
+        conflict_set: dict[str, Any] = {
+            "status": str(PipelineLoopStatus.SLEEPING),
+            "next_run_at": next_run_at,
+        }
+        if clear_error:
+            insert_values["last_error"] = None
+            conflict_set["last_error"] = None
+        self._run_write(
+            "refresh_loop_next_run",
+            lambda session: self._upsert_loop_state(
+                session, insert_values, conflict_set
+            ),
+        )
+
 
 __all__ = ["PipelineTelemetryRecorder"]
