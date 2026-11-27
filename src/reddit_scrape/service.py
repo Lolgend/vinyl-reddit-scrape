@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, cast
 
 from dotenv import load_dotenv
@@ -31,7 +31,12 @@ from reddit_scrape.ingestion import (
     RedditSourceAdapter,
     SubmissionIngester,
 )
-from reddit_scrape.models import PipelineRunMode, Submission
+from reddit_scrape.models import (
+    PipelineLoopName,
+    PipelineLoopStatus,
+    PipelineRunMode,
+    Submission,
+)
 from reddit_scrape.persistence import ReleasePersistenceService
 from reddit_scrape.telemetry import PipelineTelemetryRecorder
 
@@ -391,6 +396,80 @@ class PollerService:
             return self._clock()
         return self.telemetry_recorder.now()
 
+    def _seed_loop_states(self, *, is_continuous: bool, now: datetime) -> None:
+        """Seed all four Pipeline loop states with active intervals on startup."""
+        self.telemetry_recorder.seed_loop_states(
+            {
+                PipelineLoopName.DISCOVERY_POLL: self.poll_interval_seconds,
+                PipelineLoopName.TRACKING_POLL: self.hot_poll_interval_seconds,
+                PipelineLoopName.EXTRACTION_WORKER: 2,
+                PipelineLoopName.ENRICHMENT_WORKER: self.enrichment_interval_seconds,
+            },
+            enrichment_enabled=self.enrichment_service is not None,
+            is_continuous=is_continuous,
+            now=now,
+        )
+
+    def _execute_poll_with_telemetry(
+        self,
+        loop_name: PipelineLoopName,
+        poll_fn: Callable[[], IngestionStats],
+        *,
+        interval_seconds: int,
+        schedule_next: bool,
+        raise_on_error: bool,
+        error_log_message: str | None = None,
+    ) -> tuple[datetime, IngestionStats | None]:
+        """Execute a discovery or tracking poll with loop state and run telemetry."""
+        started_at = self._now()
+        self.telemetry_recorder.record_loop_start(loop_name, started_at=started_at)
+        try:
+            stats = poll_fn()
+        except Exception as exc:
+            completed_at = self._now()
+            next_run_at = (
+                completed_at + timedelta(seconds=interval_seconds)
+                if schedule_next
+                else None
+            )
+            self.telemetry_recorder.record_loop_completion(
+                loop_name,
+                status=PipelineLoopStatus.ERROR,
+                started_at=started_at,
+                completed_at=completed_at,
+                stats=None,
+                error_message=str(exc),
+                next_run_at=next_run_at,
+                record_run=True,
+            )
+            if raise_on_error:
+                raise
+            if error_log_message is not None:
+                logger.error("%s: %s", error_log_message, exc)
+            return completed_at, None
+
+        completed_at = self._now()
+        next_run_at = (
+            completed_at + timedelta(seconds=interval_seconds)
+            if schedule_next
+            else None
+        )
+        run_stats = {
+            "inserted": int(stats.inserted),
+            "updated": int(stats.updated),
+            "skipped": int(stats.skipped),
+        }
+        self.telemetry_recorder.record_loop_completion(
+            loop_name,
+            status=PipelineLoopStatus.SLEEPING,
+            started_at=started_at,
+            completed_at=completed_at,
+            stats=run_stats,
+            next_run_at=next_run_at,
+            record_run=True,
+        )
+        return completed_at, stats
+
     def trigger_extraction(self) -> None:
         """Signal the background extraction worker that unextracted submissions are ready."""
         self._extraction_trigger.set()
@@ -601,14 +680,44 @@ class PollerService:
         hot_limit: int | None = None,
     ) -> CycleStats:
         """Run a single poll & extract cycle and return summary statistics."""
+        started_at = self._now()
         self.telemetry_recorder.record_process_start(
             run_mode=PipelineRunMode.ONCE,
             heartbeat_interval_seconds=self.heartbeat_interval_seconds,
-            started_at=self._now(),
+            started_at=started_at,
         )
+        self._seed_loop_states(is_continuous=False, now=started_at)
         try:
-            return self.poll_and_extract_cycle(
-                new_limit=new_limit, hot_limit=hot_limit
+            n_limit = self.new_limit if new_limit is None else new_limit
+            h_limit = self.hot_limit if hot_limit is None else hot_limit
+
+            _, new_stats = self._execute_poll_with_telemetry(
+                PipelineLoopName.DISCOVERY_POLL,
+                lambda: self.poll_new(limit=n_limit),
+                interval_seconds=self.poll_interval_seconds,
+                schedule_next=False,
+                raise_on_error=True,
+            )
+            _, hot_stats = self._execute_poll_with_telemetry(
+                PipelineLoopName.TRACKING_POLL,
+                lambda: self.poll_hot(limit=h_limit),
+                interval_seconds=self.hot_poll_interval_seconds,
+                schedule_next=False,
+                raise_on_error=True,
+            )
+            assert new_stats is not None
+            assert hot_stats is not None
+
+            extracted_count = self.process_unextracted_submissions()
+            if extracted_count > 0:
+                self.trigger_enrichment()
+            enriched_count = self.process_pending_enrichment()
+
+            return CycleStats(
+                new_stats=new_stats,
+                hot_stats=hot_stats,
+                extracted_count=extracted_count,
+                enriched_count=enriched_count,
             )
         finally:
             self.telemetry_recorder.record_process_stop(stopped_at=self._now())
@@ -680,11 +789,13 @@ class PollerService:
             self.heartbeat_interval_seconds,
         )
 
+        started_at = self._now()
         self.telemetry_recorder.record_process_start(
             run_mode=PipelineRunMode.CONTINUOUS,
             heartbeat_interval_seconds=self.heartbeat_interval_seconds,
-            started_at=self._now(),
+            started_at=started_at,
         )
+        self._seed_loop_states(is_continuous=True, now=started_at)
 
         try:
             # Start dedicated background pipeline heartbeat thread
@@ -712,45 +823,62 @@ class PollerService:
             self._enrichment_thread.start()
 
             # Run initial discovery and tracking polls on startup
-            try:
-                logger.info("Executing initial discovery and tracking poll cycle...")
-                self.poll_new()
-                self.poll_hot()
+            logger.info("Executing initial discovery and tracking poll cycle...")
+            last_new_poll, new_stats = self._execute_poll_with_telemetry(
+                PipelineLoopName.DISCOVERY_POLL,
+                self.poll_new,
+                interval_seconds=self.poll_interval_seconds,
+                schedule_next=True,
+                raise_on_error=False,
+                error_log_message="Error during initial discovery poll (/new)",
+            )
+            last_hot_poll, hot_stats = self._execute_poll_with_telemetry(
+                PipelineLoopName.TRACKING_POLL,
+                self.poll_hot,
+                interval_seconds=self.hot_poll_interval_seconds,
+                schedule_next=True,
+                raise_on_error=False,
+                error_log_message="Error during initial tracking poll (/hot)",
+            )
+            if new_stats is not None or hot_stats is not None:
                 self.trigger_extraction()
-                logger.info(
-                    "Initial poll cycle completed. Poller active (next discovery poll in %ds, tracking poll in %ds).",
-                    self.poll_interval_seconds,
-                    self.hot_poll_interval_seconds,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Error during initial poll cycle: %s", exc)
-
-            last_new_poll = time.time()
-            last_hot_poll = time.time()
+            logger.info(
+                "Initial poll cycle completed. Poller active (next discovery poll in %ds, tracking poll in %ds).",
+                self.poll_interval_seconds,
+                self.hot_poll_interval_seconds,
+            )
 
             while not self._shutdown_event.is_set():
                 if self._shutdown_event.wait(timeout=1.0):
                     break
 
-                now = time.time()
+                now = self._now()
 
-                if now - last_new_poll >= self.poll_interval_seconds:
-                    try:
-                        logger.info("Executing discovery poll (/new)...")
-                        self.poll_new()
+                if now >= last_new_poll + timedelta(seconds=self.poll_interval_seconds):
+                    logger.info("Executing discovery poll (/new)...")
+                    last_new_poll, new_stats = self._execute_poll_with_telemetry(
+                        PipelineLoopName.DISCOVERY_POLL,
+                        self.poll_new,
+                        interval_seconds=self.poll_interval_seconds,
+                        schedule_next=True,
+                        raise_on_error=False,
+                        error_log_message="Error during discovery poll (/new)",
+                    )
+                    if new_stats is not None:
                         self.trigger_extraction()
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error("Error during discovery poll (/new): %s", exc)
-                    last_new_poll = time.time()
 
-                if now - last_hot_poll >= self.hot_poll_interval_seconds:
-                    try:
-                        logger.info("Executing tracking poll (/hot)...")
-                        self.poll_hot()
+                if now >= last_hot_poll + timedelta(seconds=self.hot_poll_interval_seconds):
+                    logger.info("Executing tracking poll (/hot)...")
+                    last_hot_poll, hot_stats = self._execute_poll_with_telemetry(
+                        PipelineLoopName.TRACKING_POLL,
+                        self.poll_hot,
+                        interval_seconds=self.hot_poll_interval_seconds,
+                        schedule_next=True,
+                        raise_on_error=False,
+                        error_log_message="Error during tracking poll (/hot)",
+                    )
+                    if hot_stats is not None:
                         self.trigger_extraction()
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error("Error during tracking poll (/hot): %s", exc)
-                    last_hot_poll = time.time()
 
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt received in run loop.")

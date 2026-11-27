@@ -273,3 +273,156 @@ class TestPipelineProcessTelemetrySchema:
         assert table.columns["updated_at"].server_default is not None
         assert table.columns["updated_at"].onupdate is not None
 
+
+class TestPipelineLoopAndRunSchema:
+    def test_loop_and_run_enums_values_and_exports(self):
+        import reddit_scrape
+        import reddit_scrape.models as models_mod
+        from reddit_scrape.models import (
+            PipelineLoopName,
+            PipelineLoopStatus,
+            PipelineRunStatus,
+        )
+
+        assert PipelineLoopName.DISCOVERY_POLL == "discovery_poll"
+        assert PipelineLoopName.TRACKING_POLL == "tracking_poll"
+        assert PipelineLoopName.EXTRACTION_WORKER == "extraction_worker"
+        assert PipelineLoopName.ENRICHMENT_WORKER == "enrichment_worker"
+        assert str(PipelineLoopName.DISCOVERY_POLL) == "discovery_poll"
+
+        assert PipelineLoopStatus.RUNNING == "running"
+        assert PipelineLoopStatus.SLEEPING == "sleeping"
+        assert PipelineLoopStatus.ERROR == "error"
+        assert PipelineLoopStatus.STOPPED == "stopped"
+        assert PipelineLoopStatus.DISABLED == "disabled"
+        assert str(PipelineLoopStatus.SLEEPING) == "sleeping"
+
+        assert PipelineRunStatus.SUCCESS == "success"
+        assert PipelineRunStatus.ERROR == "error"
+        assert str(PipelineRunStatus.ERROR) == "error"
+
+        for name, obj in (
+            ("PipelineLoopName", PipelineLoopName),
+            ("PipelineLoopStatus", PipelineLoopStatus),
+            ("PipelineRunStatus", PipelineRunStatus),
+        ):
+            assert name in models_mod.__all__
+            assert name in reddit_scrape.__all__
+            assert getattr(reddit_scrape, name) is obj
+
+    def test_pipeline_loop_state_model_columns_and_exports(self):
+        from sqlalchemy import DateTime, Integer, String, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+
+        import reddit_scrape
+        import reddit_scrape.models as models_mod
+        from reddit_scrape.models import PipelineLoopState
+
+        assert "PipelineLoopState" in models_mod.__all__
+        assert "PipelineLoopState" in reddit_scrape.__all__
+        assert reddit_scrape.PipelineLoopState is PipelineLoopState
+
+        table = PipelineLoopState.__table__
+        assert table.name == "pipeline_loop_states"
+        assert "pipeline_loop_states" in Base.metadata.tables
+
+        pk_cols = [c.name for c in table.primary_key.columns]
+        assert pk_cols == ["loop_name"]
+
+        expected_columns = {
+            "loop_name": (String, 32, False),
+            "status": (String, 32, False),
+            "interval_seconds": (Integer, None, False),
+            "last_started_at": (DateTime, None, True),
+            "last_completed_at": (DateTime, None, True),
+            "next_run_at": (DateTime, None, True),
+            "last_duration_ms": (Integer, None, True),
+            "last_run_stats": (JSONB, None, True),
+            "last_error": (Text, None, True),
+            "updated_at": (DateTime, None, False),
+        }
+        assert set(table.columns.keys()) == set(expected_columns.keys())
+
+        for col_name, (col_type, length, nullable) in expected_columns.items():
+            col = table.columns[col_name]
+            assert isinstance(col.type, col_type), f"{col_name} type mismatch"
+            if length is not None:
+                assert col.type.length == length, f"{col_name} length mismatch"
+            if col_type is DateTime:
+                assert col.type.timezone is True, f"{col_name} must be TIMESTAMPTZ"
+            assert col.nullable is nullable, f"{col_name} nullability mismatch"
+
+        assert table.columns["updated_at"].server_default is not None
+        assert table.columns["updated_at"].onupdate is not None
+
+    def test_pipeline_run_model_columns_indexes_and_exports(self):
+        from sqlalchemy import BigInteger, DateTime, Integer, String, Text
+        from sqlalchemy.dialects.postgresql import JSONB
+        from sqlalchemy.sql.elements import UnaryExpression
+
+        import reddit_scrape
+        import reddit_scrape.models as models_mod
+        from reddit_scrape.models import PipelineRun
+
+        assert "PipelineRun" in models_mod.__all__
+        assert "PipelineRun" in reddit_scrape.__all__
+        assert reddit_scrape.PipelineRun is PipelineRun
+
+        table = PipelineRun.__table__
+        assert table.name == "pipeline_runs"
+        assert "pipeline_runs" in Base.metadata.tables
+
+        pk_cols = [c.name for c in table.primary_key.columns]
+        assert pk_cols == ["id"]
+        assert table.columns["id"].autoincrement is True
+
+        expected_columns = {
+            "id": (BigInteger, None, False),
+            "loop_name": (String, 32, False),
+            "status": (String, 16, False),
+            "started_at": (DateTime, None, False),
+            "completed_at": (DateTime, None, False),
+            "duration_ms": (Integer, None, False),
+            "stats": (JSONB, None, True),
+            "error_message": (Text, None, True),
+            "host": (String, 255, True),
+            "pid": (Integer, None, True),
+        }
+        assert set(table.columns.keys()) == set(expected_columns.keys())
+
+        for col_name, (col_type, length, nullable) in expected_columns.items():
+            col = table.columns[col_name]
+            assert isinstance(col.type, col_type), f"{col_name} type mismatch"
+            if length is not None:
+                assert col.type.length == length, f"{col_name} length mismatch"
+            if col_type is DateTime:
+                assert col.type.timezone is True, f"{col_name} must be TIMESTAMPTZ"
+            assert col.nullable is nullable, f"{col_name} nullability mismatch"
+
+        indexes = {idx.name: idx for idx in table.indexes}
+        assert "idx_pipeline_runs_started_at" in indexes
+        assert "idx_pipeline_runs_loop_started" in indexes
+        assert "idx_pipeline_runs_status_started" in indexes
+
+        def _expr_names_and_desc(idx):
+            parts = []
+            for expr in idx.expressions:
+                if isinstance(expr, UnaryExpression):
+                    parts.append((expr.element.name, "DESC"))
+                else:
+                    parts.append((expr.name, "ASC"))
+            return parts
+
+        assert _expr_names_and_desc(indexes["idx_pipeline_runs_started_at"]) == [
+            ("started_at", "DESC"),
+        ]
+        assert _expr_names_and_desc(indexes["idx_pipeline_runs_loop_started"]) == [
+            ("loop_name", "ASC"),
+            ("started_at", "DESC"),
+        ]
+        assert _expr_names_and_desc(indexes["idx_pipeline_runs_status_started"]) == [
+            ("status", "ASC"),
+            ("started_at", "DESC"),
+        ]
+
+

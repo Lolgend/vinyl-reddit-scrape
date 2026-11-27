@@ -33,6 +33,32 @@ class PipelineRunMode(StrEnum):
     ONCE = "once"
 
 
+class PipelineLoopName(StrEnum):
+    """Canonical identifier for a background Pipeline loop."""
+
+    DISCOVERY_POLL = "discovery_poll"
+    TRACKING_POLL = "tracking_poll"
+    EXTRACTION_WORKER = "extraction_worker"
+    ENRICHMENT_WORKER = "enrichment_worker"
+
+
+class PipelineLoopStatus(StrEnum):
+    """Operational state of an individual Pipeline loop."""
+
+    RUNNING = "running"
+    SLEEPING = "sleeping"
+    ERROR = "error"
+    STOPPED = "stopped"
+    DISABLED = "disabled"
+
+
+class PipelineRunStatus(StrEnum):
+    """Terminal outcome status of a PipelineRun record."""
+
+    SUCCESS = "success"
+    ERROR = "error"
+
+
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     BigInteger,
@@ -48,7 +74,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship
 
 from reddit_scrape.db import Base
@@ -275,14 +301,64 @@ class PipelineProcessStatus(Base):
     )
 
 
+class PipelineLoopState(Base):
+    """Latest operational state and schedule countdown for each Pipeline loop."""
+
+    __tablename__ = "pipeline_loop_states"
+
+    loop_name = Column(String(32), primary_key=True)
+    status = Column(String(32), nullable=False)
+    interval_seconds = Column(Integer, nullable=False)
+    last_started_at = Column(DateTime(timezone=True), nullable=True)
+    last_completed_at = Column(DateTime(timezone=True), nullable=True)
+    next_run_at = Column(DateTime(timezone=True), nullable=True)
+    last_duration_ms = Column(Integer, nullable=True)
+    last_run_stats = Column(JSONB, nullable=True)
+    last_error = Column(Text, nullable=True)
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class PipelineRun(Base):
+    """Historical execution log entry for a Pipeline loop cycle."""
+
+    __tablename__ = "pipeline_runs"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    loop_name = Column(String(32), nullable=False)
+    status = Column(String(16), nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=False)
+    duration_ms = Column(Integer, nullable=False)
+    stats = Column(JSONB, nullable=True)
+    error_message = Column(Text, nullable=True)
+    host = Column(String(255), nullable=True)
+    pid = Column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index("idx_pipeline_runs_started_at", started_at.desc()),
+        Index("idx_pipeline_runs_loop_started", loop_name, started_at.desc()),
+        Index("idx_pipeline_runs_status_started", status, started_at.desc()),
+    )
+
+
 __all__ = [
     "Album",
     "AlbumArtist",
     "Artist",
     "EnrichmentState",
+    "PipelineLoopName",
+    "PipelineLoopState",
+    "PipelineLoopStatus",
     "PipelineProcessState",
     "PipelineProcessStatus",
+    "PipelineRun",
     "PipelineRunMode",
+    "PipelineRunStatus",
     "Release",
     "ReleaseArtist",
     "Submission",

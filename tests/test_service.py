@@ -57,7 +57,8 @@ def clean_db(request):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE pipeline_process_status, submission_snapshots, submission_releases, "
+                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
+                "submission_snapshots, submission_releases, "
                 "releases, album_artists, albums, artists, submissions CASCADE;"
             )
         )
@@ -65,7 +66,8 @@ def clean_db(request):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE pipeline_process_status, submission_snapshots, submission_releases, "
+                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
+                "submission_snapshots, submission_releases, "
                 "releases, album_artists, albums, artists, submissions CASCADE;"
             )
         )
