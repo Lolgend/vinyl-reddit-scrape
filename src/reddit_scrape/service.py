@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from reddit_scrape.db import get_database_url, get_session_factory
 from reddit_scrape.discogs import DiscogsClient
-from reddit_scrape.enrichment import CatalogEnrichmentService
+from reddit_scrape.enrichment import CatalogEnrichmentService, get_next_queued_album
 from reddit_scrape.extraction import (
     ExtractionResult,
     ExtractionWorker,
@@ -711,7 +711,14 @@ class PollerService:
             extracted_count = self.process_unextracted_submissions()
             if extracted_count > 0:
                 self.trigger_enrichment()
-            enriched_count = self.process_pending_enrichment()
+            enriched_count = (
+                self._execute_enrichment_with_telemetry(
+                    schedule_next=False,
+                    raise_on_error=True,
+                )
+                if self.enrichment_service is not None
+                else 0
+            )
 
             return CycleStats(
                 new_stats=new_stats,
@@ -756,6 +763,111 @@ class PollerService:
                     exc,
                 )
 
+    def _enrichment_next_run_at(
+        self, base: datetime, schedule_next: bool
+    ) -> datetime | None:
+        """Compute the next enrichment run timestamp when scheduling is enabled."""
+        if not schedule_next:
+            return None
+        return base + timedelta(seconds=self.enrichment_interval_seconds)
+
+    def _record_enrichment_error(
+        self,
+        started_at: datetime,
+        exc: Exception,
+        *,
+        schedule_next: bool,
+        log_prefix: str,
+    ) -> None:
+        """Record an unhandled enrichment error on loop state and run history."""
+        completed_at = self._now()
+        self.telemetry_recorder.record_loop_completion(
+            PipelineLoopName.ENRICHMENT_WORKER,
+            status=PipelineLoopStatus.ERROR,
+            started_at=started_at,
+            completed_at=completed_at,
+            stats=None,
+            error_message=str(exc),
+            next_run_at=self._enrichment_next_run_at(completed_at, schedule_next),
+            record_run=True,
+        )
+        logger.error("%s: %s", log_prefix, exc)
+
+    def _execute_enrichment_with_telemetry(
+        self,
+        *,
+        schedule_next: bool,
+        raise_on_error: bool,
+    ) -> int:
+        """Check enrichment queue and run pending enrichment with loop telemetry."""
+        check_started_at = self._now()
+        try:
+            with self.session_factory() as session:
+                has_work = (
+                    get_next_queued_album(session, now=check_started_at) is not None
+                )
+        except Exception as exc:
+            self._record_enrichment_error(
+                check_started_at,
+                exc,
+                schedule_next=schedule_next,
+                log_prefix="Error checking enrichment queue",
+            )
+            if raise_on_error:
+                raise
+            return 0
+
+        if not has_work:
+            now_ts = self._now()
+            self.telemetry_recorder.refresh_loop_next_run(
+                PipelineLoopName.ENRICHMENT_WORKER,
+                next_run_at=self._enrichment_next_run_at(now_ts, schedule_next),
+                clear_error=True,
+            )
+            return 0
+
+        started_at = self._now()
+        self.telemetry_recorder.record_loop_start(
+            PipelineLoopName.ENRICHMENT_WORKER,
+            started_at=started_at,
+        )
+        try:
+            enriched = self.process_pending_enrichment()
+        except Exception as exc:
+            self._record_enrichment_error(
+                started_at,
+                exc,
+                schedule_next=schedule_next,
+                log_prefix="Error processing pending enrichment in background",
+            )
+            if raise_on_error:
+                raise
+            return 0
+
+        completed_at = self._now()
+        next_run_at = self._enrichment_next_run_at(completed_at, schedule_next)
+        if enriched > 0:
+            self.telemetry_recorder.record_loop_completion(
+                PipelineLoopName.ENRICHMENT_WORKER,
+                status=PipelineLoopStatus.SLEEPING,
+                started_at=started_at,
+                completed_at=completed_at,
+                stats={"enriched": int(enriched)},
+                next_run_at=next_run_at,
+                record_run=True,
+            )
+            logger.info(
+                "Enriched %d album(s) with Discogs catalog in background",
+                enriched,
+            )
+        else:
+            self.telemetry_recorder.refresh_loop_next_run(
+                PipelineLoopName.ENRICHMENT_WORKER,
+                next_run_at=next_run_at,
+                clear_error=True,
+            )
+        return int(enriched)
+
     def _enrichment_worker_loop(self) -> None:
         """Background Discogs enrichment worker thread decoupled from ingestion and extraction."""
         logger.info("Discogs enrichment background worker thread started.")
@@ -765,18 +877,10 @@ class PollerService:
             if self._shutdown_event.is_set():
                 break
 
-            try:
-                enriched = self.process_pending_enrichment()
-                if enriched > 0:
-                    logger.info(
-                        "Enriched %d album(s) with Discogs catalog in background",
-                        enriched,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "Error processing pending enrichment in background: %s",
-                    exc,
-                )
+            self._execute_enrichment_with_telemetry(
+                schedule_next=True,
+                raise_on_error=False,
+            )
 
     def run(self) -> None:
         """Start the continuous background ingestion poller with decoupled asynchronous extraction."""
@@ -814,13 +918,14 @@ class PollerService:
             )
             self._extraction_thread.start()
 
-            # Start decoupled background Discogs enrichment worker thread
-            self._enrichment_thread = threading.Thread(
-                target=self._enrichment_worker_loop,
-                name="DiscogsEnrichmentWorker",
-                daemon=True,
-            )
-            self._enrichment_thread.start()
+            # Start decoupled background Discogs enrichment worker thread when enabled
+            if self.enrichment_service is not None:
+                self._enrichment_thread = threading.Thread(
+                    target=self._enrichment_worker_loop,
+                    name="DiscogsEnrichmentWorker",
+                    daemon=True,
+                )
+                self._enrichment_thread.start()
 
             # Run initial discovery and tracking polls on startup
             logger.info("Executing initial discovery and tracking poll cycle...")
