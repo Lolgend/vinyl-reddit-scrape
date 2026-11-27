@@ -105,6 +105,14 @@ from reddit_scrape.models import (
     AlbumArtist,
     Artist,
     EnrichmentState,
+    PipelineLoopName,
+    PipelineLoopState,
+    PipelineLoopStatus,
+    PipelineProcessState,
+    PipelineProcessStatus,
+    PipelineRun,
+    PipelineRunMode,
+    PipelineRunStatus,
     Release,
     ReleaseArtist,
     Submission,
@@ -123,7 +131,9 @@ from reddit_scrape.persistence import (
     persist_extracted_releases,
 )
 from reddit_scrape.retention import (
+    get_default_pipeline_run_retention_days,
     get_default_retention_days,
+    purge_pipeline_runs,
     purge_snapshots,
 )
 from reddit_scrape.service import (
@@ -133,6 +143,7 @@ from reddit_scrape.service import (
     ServiceConfig,
     validate_environment,
 )
+from reddit_scrape.telemetry import PipelineTelemetryRecorder
 
 __all__ = [  # noqa: RUF022
     # Database
@@ -147,6 +158,14 @@ __all__ = [  # noqa: RUF022
     "AlbumArtist",
     "Artist",
     "EnrichmentState",
+    "PipelineLoopName",
+    "PipelineLoopState",
+    "PipelineLoopStatus",
+    "PipelineProcessState",
+    "PipelineProcessStatus",
+    "PipelineRun",
+    "PipelineRunMode",
+    "PipelineRunStatus",
     "Release",
     "ReleaseArtist",
     "Submission",
@@ -190,7 +209,9 @@ __all__ = [  # noqa: RUF022
     "normalize_attribute",
     "persist_extracted_releases",
     # Retention
+    "get_default_pipeline_run_retention_days",
     "get_default_retention_days",
+    "purge_pipeline_runs",
     "purge_snapshots",
     # Discogs
     "DEFAULT_DISCOGS_BASE_URL",
@@ -258,6 +279,8 @@ __all__ = [  # noqa: RUF022
     "ServiceConfig",
     "VALID_THINKING_LEVELS",
     "validate_environment",
+    # Telemetry
+    "PipelineTelemetryRecorder",
 ]
 
 

@@ -215,3 +215,89 @@ class TestCliBatchSizeAndVerbosity:
         assert "extracted=4" in captured.out
         assert "enriched=5" in captured.out
 
+    @patch("reddit_scrape.cli.validate_environment")
+    @patch("reddit_scrape.cli.PollerService")
+    @patch("reddit_scrape.cli.init_db")
+    def test_cli_run_passes_custom_heartbeat_interval(
+        self, mock_init_db, mock_poller_cls, mock_validate_env
+    ):
+        mock_validate_env.return_value = ServiceConfig(
+            reddit_client_id="id",
+            reddit_client_secret="sec",
+            database_url="postgresql+psycopg://db",
+            deepseek_api_key="key",
+            llm_batch_size=5,
+            heartbeat_interval_seconds=45,
+        )
+        mock_service = MagicMock()
+        mock_service.run_once.return_value = CycleStats(
+            new_stats=MagicMock(inserted=0, updated=0),
+            hot_stats=MagicMock(inserted=0, updated=0),
+            extracted_count=0,
+        )
+        mock_poller_cls.return_value = mock_service
+
+        exit_code = main(["run", "--once"])
+        assert exit_code == 0
+        mock_poller_cls.assert_called_once_with(
+            poll_interval_seconds=300,
+            hot_poll_interval_seconds=900,
+            new_limit=50,
+            hot_limit=50,
+            thinking_level="none",
+            llm_batch_size=5,
+            heartbeat_interval_seconds=45,
+        )
+
+
+class TestCliPurgePipelineRuns:
+    """Tests for the purge-pipeline-runs CLI subcommand."""
+
+    def test_parser_purge_pipeline_runs_defaults_and_overrides(self):
+        parser = create_parser()
+        args_default = parser.parse_args(["purge-pipeline-runs"])
+        assert args_default.command == "purge-pipeline-runs"
+        assert args_default.days is None
+        assert args_default.batch_size == 5000
+
+        args_custom = parser.parse_args(
+            ["purge-pipeline-runs", "--days", "14", "--batch-size", "250"]
+        )
+        assert args_custom.days == 14
+        assert args_custom.batch_size == 250
+
+    @patch("reddit_scrape.cli.purge_pipeline_runs")
+    @patch("reddit_scrape.cli.get_default_pipeline_run_retention_days")
+    def test_cli_purge_pipeline_runs_uses_default_days_and_prints_summary(
+        self, mock_default_days, mock_purge_runs, capsys
+    ):
+        mock_default_days.return_value = 21
+        mock_purge_runs.return_value = 7
+
+        exit_code = main(["purge-pipeline-runs"])
+        assert exit_code == 0
+        mock_default_days.assert_called_once_with()
+        mock_purge_runs.assert_called_once_with(retention_days=21, batch_size=5000)
+        captured = capsys.readouterr()
+        assert (
+            captured.out.strip()
+            == "Successfully purged 7 pipeline runs older than 21 days."
+        )
+
+    @patch("reddit_scrape.cli.purge_pipeline_runs")
+    def test_cli_purge_pipeline_runs_passes_explicit_args(
+        self, mock_purge_runs, capsys
+    ):
+        mock_purge_runs.return_value = 3
+
+        exit_code = main(
+            ["purge-pipeline-runs", "--days", "10", "--batch-size", "100"]
+        )
+        assert exit_code == 0
+        mock_purge_runs.assert_called_once_with(retention_days=10, batch_size=100)
+        captured = capsys.readouterr()
+        assert (
+            captured.out.strip()
+            == "Successfully purged 3 pipeline runs older than 10 days."
+        )
+

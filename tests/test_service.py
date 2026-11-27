@@ -57,7 +57,8 @@ def clean_db(request):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE submission_snapshots, submission_releases, "
+                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
+                "submission_snapshots, submission_releases, "
                 "releases, album_artists, albums, artists, submissions CASCADE;"
             )
         )
@@ -65,7 +66,8 @@ def clean_db(request):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE submission_snapshots, submission_releases, "
+                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
+                "submission_snapshots, submission_releases, "
                 "releases, album_artists, albums, artists, submissions CASCADE;"
             )
         )
@@ -102,6 +104,7 @@ class TestEnvironmentValidation:
         assert config.discogs_token == "mock_discogs_token"
         assert config.discogs_user_agent == "VinylReleasesScraper/0.1.0"
         assert config.enrichment_interval_seconds == 60
+        assert config.heartbeat_interval_seconds == 30
 
     def test_validate_environment_discogs_token_success(self):
         env = {
@@ -117,6 +120,7 @@ class TestEnvironmentValidation:
         assert config.discogs_consumer_secret is None
         assert config.discogs_user_agent == "VinylReleasesScraper/0.1.0"
         assert config.enrichment_interval_seconds == 60
+        assert config.heartbeat_interval_seconds == 30
 
     def test_validate_environment_discogs_key_secret_success(self):
         env = {
@@ -133,6 +137,7 @@ class TestEnvironmentValidation:
         assert config.discogs_consumer_secret == "test_consumer_secret"
         assert config.discogs_user_agent == "VinylReleasesScraper/0.1.0"
         assert config.enrichment_interval_seconds == 60
+        assert config.heartbeat_interval_seconds == 30
 
     def test_validate_environment_discogs_prefers_token_over_key_secret(self):
         env = {
@@ -201,6 +206,26 @@ class TestEnvironmentValidation:
         }
         with pytest.raises(
             ValueError, match="ENRICHMENT_INTERVAL_SECONDS must be a positive integer"
+        ):
+            validate_environment(env)
+
+    def test_validate_environment_heartbeat_interval_valid(self):
+        env = {
+            **VALID_ENV,
+            "PIPELINE_HEARTBEAT_INTERVAL_SECONDS": "15",
+        }
+        config = validate_environment(env)
+        assert config.heartbeat_interval_seconds == 15
+
+    @pytest.mark.parametrize("invalid_interval", ["0", "-1", "-30", "invalid", "10.5"])
+    def test_validate_environment_heartbeat_interval_invalid(self, invalid_interval):
+        env = {
+            **VALID_ENV,
+            "PIPELINE_HEARTBEAT_INTERVAL_SECONDS": invalid_interval,
+        }
+        with pytest.raises(
+            ValueError,
+            match="PIPELINE_HEARTBEAT_INTERVAL_SECONDS must be a positive integer",
         ):
             validate_environment(env)
 
@@ -1627,7 +1652,10 @@ class TestDiscogsEnrichmentWorkerIntegration:
         service.stop()
 
     def test_run_starts_and_stops_enrichment_worker_thread(self, session_factory):
-        service = PollerService(session_factory=session_factory)
+        service = PollerService(
+            session_factory=session_factory,
+            enrichment_service=MagicMock(),
+        )
         service.poll_new = MagicMock()
         service.poll_hot = MagicMock()
         service.process_unextracted_submissions = MagicMock(return_value=0)

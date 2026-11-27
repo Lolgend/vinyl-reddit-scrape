@@ -1,5 +1,7 @@
 """Command-line interface for the Reddit scrape pipeline."""
 
+from __future__ import annotations
+
 import argparse
 import logging
 import sys
@@ -7,7 +9,12 @@ from collections.abc import Sequence
 from typing import Any
 
 from reddit_scrape.db import init_db
-from reddit_scrape.retention import get_default_retention_days, purge_snapshots
+from reddit_scrape.retention import (
+    get_default_pipeline_run_retention_days,
+    get_default_retention_days,
+    purge_pipeline_runs,
+    purge_snapshots,
+)
 from reddit_scrape.service import PollerService, validate_environment
 
 
@@ -23,6 +30,28 @@ def configure_logging(verbose: bool = False, log_level: str | None = None) -> No
         )
 
 
+def _add_purge_subparser(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+    name: str,
+    help_text: str,
+    days_help: str,
+) -> None:
+    """Register a retention purge subcommand with shared --days and --batch-size flags."""
+    purge_parser = subparsers.add_parser(name, help=help_text)
+    purge_parser.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help=days_help,
+    )
+    purge_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=5000,
+        help="Batch size for chunked deletion (default: 5000)",
+    )
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create the top-level argument parser with subcommands."""
     parser = argparse.ArgumentParser(
@@ -31,21 +60,20 @@ def create_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    purge_parser = subparsers.add_parser(
+    _add_purge_subparser(
+        subparsers,
         "purge-snapshots",
-        help="Purge historical submission snapshots older than retention threshold",
+        help_text="Purge historical submission snapshots older than retention threshold",
+        days_help="Retention threshold in days (default: SNAPSHOT_RETENTION_DAYS or 30)",
     )
-    purge_parser.add_argument(
-        "--days",
-        type=int,
-        default=None,
-        help="Retention threshold in days (default: SNAPSHOT_RETENTION_DAYS or 30)",
-    )
-    purge_parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=5000,
-        help="Batch size for chunked deletion (default: 5000)",
+    _add_purge_subparser(
+        subparsers,
+        "purge-pipeline-runs",
+        help_text="Purge historical pipeline runs older than retention threshold",
+        days_help=(
+            "Retention threshold in days "
+            "(default: PIPELINE_RUN_RETENTION_DAYS, SNAPSHOT_RETENTION_DAYS, or 30)"
+        ),
     )
 
     run_parser = subparsers.add_parser(
@@ -122,6 +150,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Successfully purged {deleted} snapshots older than {days} days.")
         return 0
 
+    if args.command == "purge-pipeline-runs":
+        days = (
+            args.days
+            if args.days is not None
+            else get_default_pipeline_run_retention_days()
+        )
+        deleted = purge_pipeline_runs(retention_days=days, batch_size=args.batch_size)
+        print(f"Successfully purged {deleted} pipeline runs older than {days} days.")
+        return 0
+
     if args.command == "run":
         configure_logging(verbose=args.verbose, log_level=args.log_level)
 
@@ -167,6 +205,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             poller_kwargs["discogs_user_agent"] = config.discogs_user_agent
             poller_kwargs["enrichment_interval_seconds"] = (
                 config.enrichment_interval_seconds
+            )
+        if config.heartbeat_interval_seconds != 30:
+            poller_kwargs["heartbeat_interval_seconds"] = (
+                config.heartbeat_interval_seconds
             )
 
         service = PollerService(**poller_kwargs)

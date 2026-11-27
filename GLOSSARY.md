@@ -59,3 +59,33 @@ _Avoid_: Popularity speed, vote rate, hype momentum
 **Hype Index**:
 A normalized composite score that balances engagement velocity with freshness decay over time.
 _Avoid_: Trending score, rank score, hotness
+
+## Pipeline Operations
+
+**Pipeline**:
+The end-to-end automated background workflow that discovers community **Submission**s, extracts structured catalog entities, and reconciles external discography metadata.
+_Avoid_: Ingestion pipeline, scraper loop
+
+**Discovery Poll**:
+A periodic fetch of newly posted community announcements to discover unrecorded **Submission**s and capture initial **Submission Snapshot** observations.
+_Avoid_: New loop, scrape job
+
+**Tracking Poll**:
+A periodic fetch of active community **Submission**s to refresh engagement metrics, flairs, and point-in-time **Submission Snapshot** observations.
+_Avoid_: Hot loop, refresh job
+
+**Extraction Queue**:
+Release-eligible **Submission**s waiting to be parsed into **Album**, **Release**, and **Artist** catalog records.
+_Avoid_: Parse queue, LLM backlog
+
+**Enrichment Queue**:
+Catalog **Album** records waiting for or retrying external **Catalog Enrichment**.
+_Avoid_: Discogs backlog, matching queue
+
+**Pipeline Heartbeat**:
+A periodic liveness signal emitted by a running **Pipeline** process to distinguish an active or sleeping worker from a crashed or stopped one.
+_Avoid_: Ping, keepalive
+
+**Pipeline Run**:
+An individual execution of a **Pipeline** loop recording its start and completion timestamps, outcome, throughput counts, and any failure details.
+_Avoid_: Job log, cycle history, batch record

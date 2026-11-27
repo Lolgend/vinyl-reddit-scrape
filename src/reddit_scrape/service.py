@@ -9,8 +9,9 @@ import os
 import signal
 import threading
 import time
-from collections.abc import Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, cast
 
 from dotenv import load_dotenv
@@ -19,7 +20,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from reddit_scrape.db import get_database_url, get_session_factory
 from reddit_scrape.discogs import DiscogsClient
-from reddit_scrape.enrichment import CatalogEnrichmentService
+from reddit_scrape.enrichment import CatalogEnrichmentService, get_next_queued_album
 from reddit_scrape.extraction import (
     ExtractionResult,
     ExtractionWorker,
@@ -30,12 +31,23 @@ from reddit_scrape.ingestion import (
     RedditSourceAdapter,
     SubmissionIngester,
 )
-from reddit_scrape.models import Submission
+from reddit_scrape.models import (
+    PipelineLoopName,
+    PipelineLoopStatus,
+    PipelineRunMode,
+    Submission,
+)
 from reddit_scrape.persistence import ReleasePersistenceService
+from reddit_scrape.retention import (
+    get_default_pipeline_run_retention_days,
+    purge_pipeline_runs,
+)
+from reddit_scrape.telemetry import PipelineTelemetryRecorder
 
 logger = logging.getLogger(__name__)
 
 VALID_THINKING_LEVELS = {"none", "minimal", "low", "medium", "high", "max"}
+PIPELINE_RUN_PRUNE_INTERVAL_SECONDS = 86400
 
 
 @dataclass
@@ -58,6 +70,7 @@ class ServiceConfig:
     discogs_consumer_secret: str | None = None
     discogs_user_agent: str = "VinylReleasesScraper/0.1.0"
     enrichment_interval_seconds: int = 60
+    heartbeat_interval_seconds: int = 30
 
 
 def validate_environment(
@@ -125,16 +138,19 @@ def validate_environment(
     else:
         thinking_level = get_default_thinking_level(str(deepseek_model))
 
-    raw_batch_size = env.get("LLM_BATCH_SIZE")
-    if raw_batch_size is None or not str(raw_batch_size).strip():
-        llm_batch_size = 5
-    else:
+    def _parse_positive_int(key: str, default: int) -> int:
+        raw_val = env.get(key)
+        if raw_val is None or not str(raw_val).strip():
+            return default
         try:
-            llm_batch_size = int(str(raw_batch_size).strip())
+            parsed = int(str(raw_val).strip())
         except ValueError:
-            raise ValueError("LLM_BATCH_SIZE must be a positive integer")
-        if llm_batch_size <= 0:
-            raise ValueError("LLM_BATCH_SIZE must be a positive integer")
+            raise ValueError(f"{key} must be a positive integer")
+        if parsed <= 0:
+            raise ValueError(f"{key} must be a positive integer")
+        return parsed
+
+    llm_batch_size = _parse_positive_int("LLM_BATCH_SIZE", 5)
 
     # Discogs credentials validation
     raw_discogs_token = env.get("DISCOGS_TOKEN")
@@ -174,20 +190,12 @@ def validate_environment(
         else "VinylReleasesScraper/0.1.0"
     )
 
-    raw_enrichment_interval = env.get("ENRICHMENT_INTERVAL_SECONDS")
-    if raw_enrichment_interval is None or not str(raw_enrichment_interval).strip():
-        enrichment_interval_seconds = 60
-    else:
-        try:
-            enrichment_interval_seconds = int(str(raw_enrichment_interval).strip())
-        except ValueError:
-            raise ValueError(
-                "ENRICHMENT_INTERVAL_SECONDS must be a positive integer"
-            )
-        if enrichment_interval_seconds <= 0:
-            raise ValueError(
-                "ENRICHMENT_INTERVAL_SECONDS must be a positive integer"
-            )
+    enrichment_interval_seconds = _parse_positive_int(
+        "ENRICHMENT_INTERVAL_SECONDS", 60
+    )
+    heartbeat_interval_seconds = _parse_positive_int(
+        "PIPELINE_HEARTBEAT_INTERVAL_SECONDS", 30
+    )
 
     return ServiceConfig(
         reddit_client_id=str(reddit_client_id),
@@ -206,6 +214,7 @@ def validate_environment(
         discogs_consumer_secret=discogs_consumer_secret,
         discogs_user_agent=discogs_user_agent,
         enrichment_interval_seconds=enrichment_interval_seconds,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
     )
 
 
@@ -217,6 +226,28 @@ class CycleStats:
     hot_stats: IngestionStats
     extracted_count: int
     enriched_count: int = 0
+
+
+@dataclass
+class _ExtractionDrainOutcome:
+    """Outcome of draining pending unextracted release-eligible submissions."""
+
+    had_candidates: bool
+    extracted_count: int
+    errors: list[str]
+
+
+def _format_extraction_error_summary(
+    errors: list[str], *, max_length: int = 500
+) -> str:
+    """Format a concise error summary from one or more extraction errors."""
+    if len(errors) == 1:
+        summary = errors[0]
+    else:
+        summary = f"{len(errors)} error(s); first: {errors[0]}"
+    if len(summary) > max_length:
+        return f"{summary[: max_length - 3]}..."
+    return summary
 
 
 class _AsyncRunner:
@@ -290,6 +321,9 @@ class PollerService:
         discogs_user_agent: str | None = None,
         deepseek_api_key: str | None = None,
         deepseek_base_url: str | None = None,
+        heartbeat_interval_seconds: int = 30,
+        telemetry_recorder: PipelineTelemetryRecorder | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.session_factory = session_factory or get_session_factory()
         self.reddit_adapter = reddit_adapter or RedditSourceAdapter()
@@ -313,13 +347,22 @@ class PollerService:
         self.hot_limit = hot_limit
 
         self.enrichment_interval_seconds = enrichment_interval_seconds
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._clock = clock
+        self.telemetry_recorder = telemetry_recorder or PipelineTelemetryRecorder(
+            self.session_factory,
+            clock=clock,
+        )
         self._shutdown_event = threading.Event()
         self._extraction_trigger = threading.Event()
         self._extraction_lock = threading.Lock()
+        self._extraction_backoff_lock = threading.Lock()
+        self._extraction_backoff_seconds: int = 0
         self._extraction_thread: threading.Thread | None = None
         self._enrichment_trigger = threading.Event()
         self._enrichment_lock = threading.Lock()
         self._enrichment_thread: threading.Thread | None = None
+        self._heartbeat_thread: threading.Thread | None = None
         self._async_runner = _AsyncRunner()
         self._discogs_client: DiscogsClient | None
         self.enrichment_service: CatalogEnrichmentService | None
@@ -376,9 +419,111 @@ class PollerService:
         """Return True if termination signal has been received."""
         return self._shutdown_event.is_set()
 
+    def _now(self) -> datetime:
+        """Return the current UTC timestamp from the injected clock or recorder."""
+        if self._clock is not None:
+            return self._clock()
+        return self.telemetry_recorder.now()
+
+    def _seed_loop_states(self, *, is_continuous: bool, now: datetime) -> None:
+        """Seed all four Pipeline loop states with active intervals on startup."""
+        self.telemetry_recorder.seed_loop_states(
+            {
+                PipelineLoopName.DISCOVERY_POLL: self.poll_interval_seconds,
+                PipelineLoopName.TRACKING_POLL: self.hot_poll_interval_seconds,
+                PipelineLoopName.EXTRACTION_WORKER: 2,
+                PipelineLoopName.ENRICHMENT_WORKER: self.enrichment_interval_seconds,
+            },
+            enrichment_enabled=self.enrichment_service is not None,
+            is_continuous=is_continuous,
+            now=now,
+        )
+
+    def _execute_poll_with_telemetry(
+        self,
+        loop_name: PipelineLoopName,
+        poll_fn: Callable[[], IngestionStats],
+        *,
+        interval_seconds: int,
+        schedule_next: bool,
+        raise_on_error: bool,
+        error_log_message: str | None = None,
+    ) -> tuple[datetime, IngestionStats | None]:
+        """Execute a discovery or tracking poll with loop state and run telemetry."""
+        started_at = self._now()
+        self.telemetry_recorder.record_loop_start(loop_name, started_at=started_at)
+        try:
+            stats = poll_fn()
+        except Exception as exc:
+            completed_at = self._now()
+            next_run_at = (
+                completed_at + timedelta(seconds=interval_seconds)
+                if schedule_next
+                else None
+            )
+            self.telemetry_recorder.record_loop_completion(
+                loop_name,
+                status=PipelineLoopStatus.ERROR,
+                started_at=started_at,
+                completed_at=completed_at,
+                stats=None,
+                error_message=str(exc),
+                next_run_at=next_run_at,
+                record_run=True,
+            )
+            if raise_on_error:
+                raise
+            if error_log_message is not None:
+                logger.error("%s: %s", error_log_message, exc)
+            return completed_at, None
+
+        completed_at = self._now()
+        next_run_at = (
+            completed_at + timedelta(seconds=interval_seconds)
+            if schedule_next
+            else None
+        )
+        run_stats = {
+            "inserted": int(stats.inserted),
+            "updated": int(stats.updated),
+            "skipped": int(stats.skipped),
+        }
+        self.telemetry_recorder.record_loop_completion(
+            loop_name,
+            status=PipelineLoopStatus.SLEEPING,
+            started_at=started_at,
+            completed_at=completed_at,
+            stats=run_stats,
+            next_run_at=next_run_at,
+            record_run=True,
+        )
+        return completed_at, stats
+
     def trigger_extraction(self) -> None:
         """Signal the background extraction worker that unextracted submissions are ready."""
+        self._reset_extraction_backoff()
         self._extraction_trigger.set()
+
+    def _reset_extraction_backoff(self) -> None:
+        with self._extraction_backoff_lock:
+            self._extraction_backoff_seconds = 0
+
+    def _advance_extraction_backoff(self) -> int:
+        with self._extraction_backoff_lock:
+            self._extraction_backoff_seconds = (
+                10
+                if self._extraction_backoff_seconds == 0
+                else min(300, self._extraction_backoff_seconds * 2)
+            )
+            return self._extraction_backoff_seconds
+
+    def _get_extraction_wait_seconds(self) -> float:
+        with self._extraction_backoff_lock:
+            return (
+                float(self._extraction_backoff_seconds)
+                if self._extraction_backoff_seconds > 0
+                else 2.0
+            )
 
     def trigger_enrichment(self) -> None:
         """Signal the background enrichment worker that pending albums are ready."""
@@ -470,10 +615,13 @@ class PollerService:
                 )
         return self.ingester.ingest_submissions(items)
 
-    def process_unextracted_submissions(
-        self, batch_size: int | None = None
-    ) -> int:
-        """Query and process unextracted submissions through extraction and persistence."""
+    def _drain_unextracted_submissions(
+        self,
+        batch_size: int | None = None,
+        *,
+        on_candidates_found: Callable[[], None] | None = None,
+    ) -> _ExtractionDrainOutcome:
+        """Query and drain unextracted submissions, capturing batch/submission errors."""
         with self._extraction_lock:
             with self.session_factory() as session:
                 stmt = (
@@ -488,8 +636,15 @@ class PollerService:
                     stmt = stmt.limit(batch_size)
                 candidates = session.execute(stmt).all()
 
-            if not candidates:
-                return 0
+            if not candidates or self._shutdown_event.is_set():
+                return _ExtractionDrainOutcome(
+                    had_candidates=False,
+                    extracted_count=0,
+                    errors=[],
+                )
+
+            if on_candidates_found is not None:
+                on_candidates_found()
 
             partition_size = max(1, self.llm_batch_size)
             batches = [
@@ -498,6 +653,7 @@ class PollerService:
             ]
 
             extracted_count = 0
+            errors: list[str] = []
             for batch in batches:
                 if self._shutdown_event.is_set():
                     logger.info("Shutdown requested, pausing extraction queue.")
@@ -512,6 +668,9 @@ class PollerService:
                         "Batch extraction failed for batch of %d submissions: %s",
                         len(batch),
                         exc,
+                    )
+                    errors.append(
+                        f"Batch extraction failed for batch of {len(batch)} submissions: {exc}"
                     )
                     continue
 
@@ -530,6 +689,9 @@ class PollerService:
                                 "No extraction result found for submission %s",
                                 sub_id,
                             )
+                            errors.append(
+                                f"No extraction result found for submission {sub_id}"
+                            )
                             continue
                         self.persistence_service.persist(
                             submission_id=sub_id,
@@ -542,11 +704,127 @@ class PollerService:
                             sub_id,
                             exc,
                         )
+                        errors.append(
+                            f"Failed extraction or persistence for submission {sub_id}: {exc}"
+                        )
 
             if extracted_count > 0:
                 self.trigger_enrichment()
 
-            return extracted_count
+            return _ExtractionDrainOutcome(
+                had_candidates=True,
+                extracted_count=extracted_count,
+                errors=errors,
+            )
+
+    def _execute_extraction_with_telemetry(
+        self,
+        *,
+        schedule_backoff: bool,
+        raise_on_error: bool,
+    ) -> int:
+        """Drain extraction queue and record loop/run telemetry when candidates exist."""
+        started_at = self._now()
+
+        def _on_candidates_found() -> None:
+            nonlocal started_at
+            started_at = self._now()
+            self.telemetry_recorder.record_loop_start(
+                PipelineLoopName.EXTRACTION_WORKER,
+                started_at=started_at,
+            )
+
+        try:
+            outcome = self._drain_unextracted_submissions(
+                on_candidates_found=_on_candidates_found
+            )
+        except Exception as exc:
+            completed_at = self._now()
+            next_run_at: datetime | None = None
+            if schedule_backoff:
+                backoff_seconds = self._advance_extraction_backoff()
+                next_run_at = completed_at + timedelta(seconds=backoff_seconds)
+            self.telemetry_recorder.record_loop_completion(
+                PipelineLoopName.EXTRACTION_WORKER,
+                status=PipelineLoopStatus.ERROR,
+                started_at=started_at,
+                completed_at=completed_at,
+                stats=None,
+                error_message=str(exc),
+                next_run_at=next_run_at,
+                record_run=True,
+            )
+            if raise_on_error:
+                raise
+            logger.error(
+                "Error processing unextracted submissions in background: %s",
+                exc,
+            )
+            return 0
+
+        if not outcome.had_candidates:
+            return 0
+
+        completed_at = self._now()
+        if outcome.errors:
+            summary = _format_extraction_error_summary(outcome.errors)
+            next_run_at = None
+            if outcome.extracted_count > 0:
+                self._reset_extraction_backoff()
+            elif schedule_backoff:
+                backoff_seconds = self._advance_extraction_backoff()
+                next_run_at = completed_at + timedelta(seconds=backoff_seconds)
+            self.telemetry_recorder.record_loop_completion(
+                PipelineLoopName.EXTRACTION_WORKER,
+                status=PipelineLoopStatus.ERROR,
+                started_at=started_at,
+                completed_at=completed_at,
+                stats={"extracted": outcome.extracted_count},
+                error_message=summary,
+                next_run_at=next_run_at,
+                record_run=True,
+            )
+            return outcome.extracted_count
+
+        if outcome.extracted_count > 0:
+            self._reset_extraction_backoff()
+            self.telemetry_recorder.record_loop_completion(
+                PipelineLoopName.EXTRACTION_WORKER,
+                status=PipelineLoopStatus.SLEEPING,
+                started_at=started_at,
+                completed_at=completed_at,
+                stats={"extracted": outcome.extracted_count},
+                next_run_at=None,
+                record_run=True,
+            )
+            if schedule_backoff:
+                logger.info(
+                    "Extracted and persisted %d release submissions in background",
+                    outcome.extracted_count,
+                )
+            return outcome.extracted_count
+
+        if self._shutdown_event.is_set():
+            return 0
+
+        self.telemetry_recorder.record_loop_completion(
+            PipelineLoopName.EXTRACTION_WORKER,
+            status=PipelineLoopStatus.SLEEPING,
+            started_at=started_at,
+            completed_at=completed_at,
+            stats={"extracted": 0},
+            next_run_at=None,
+            record_run=False,
+        )
+        return 0
+
+    def process_unextracted_submissions(
+        self, batch_size: int | None = None
+    ) -> int:
+        """Query and process unextracted submissions through extraction and persistence."""
+        return self._drain_unextracted_submissions(
+            batch_size=batch_size
+        ).extracted_count
 
     def process_pending_enrichment(self, limit: int | None = None) -> int:
         """Query and enrich pending/retryable albums using CatalogEnrichmentService."""
@@ -586,30 +864,194 @@ class PollerService:
         hot_limit: int | None = None,
     ) -> CycleStats:
         """Run a single poll & extract cycle and return summary statistics."""
-        return self.poll_and_extract_cycle(new_limit=new_limit, hot_limit=hot_limit)
+        started_at = self._now()
+        self.telemetry_recorder.record_process_start(
+            run_mode=PipelineRunMode.ONCE,
+            heartbeat_interval_seconds=self.heartbeat_interval_seconds,
+            started_at=started_at,
+        )
+        self._seed_loop_states(is_continuous=False, now=started_at)
+        try:
+            n_limit = self.new_limit if new_limit is None else new_limit
+            h_limit = self.hot_limit if hot_limit is None else hot_limit
+
+            _, new_stats = self._execute_poll_with_telemetry(
+                PipelineLoopName.DISCOVERY_POLL,
+                lambda: self.poll_new(limit=n_limit),
+                interval_seconds=self.poll_interval_seconds,
+                schedule_next=False,
+                raise_on_error=True,
+            )
+            _, hot_stats = self._execute_poll_with_telemetry(
+                PipelineLoopName.TRACKING_POLL,
+                lambda: self.poll_hot(limit=h_limit),
+                interval_seconds=self.hot_poll_interval_seconds,
+                schedule_next=False,
+                raise_on_error=True,
+            )
+            assert new_stats is not None
+            assert hot_stats is not None
+
+            extracted_count = self._execute_extraction_with_telemetry(
+                schedule_backoff=False,
+                raise_on_error=True,
+            )
+            if extracted_count > 0:
+                self.trigger_enrichment()
+            enriched_count = (
+                self._execute_enrichment_with_telemetry(
+                    schedule_next=False,
+                    raise_on_error=True,
+                )
+                if self.enrichment_service is not None
+                else 0
+            )
+
+            return CycleStats(
+                new_stats=new_stats,
+                hot_stats=hot_stats,
+                extracted_count=extracted_count,
+                enriched_count=enriched_count,
+            )
+        finally:
+            self.telemetry_recorder.record_process_stop(stopped_at=self._now())
+
+    def _heartbeat_loop(self) -> None:
+        """Background heartbeat thread refreshing pipeline process liveness."""
+        logger.debug("Pipeline heartbeat thread started.")
+        while not self._shutdown_event.wait(
+            timeout=float(self.heartbeat_interval_seconds)
+        ):
+            try:
+                self.telemetry_recorder.record_heartbeat(heartbeat_at=self._now())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Unexpected error in pipeline heartbeat loop: %s", exc)
 
     def _extraction_worker_loop(self) -> None:
         """Background extraction worker thread decoupled from ingestion polling."""
         logger.info("Extraction background worker thread started.")
         while not self._shutdown_event.is_set():
             # Wait for signal or periodic timeout to check unextracted queue
-            self._extraction_trigger.wait(timeout=2.0)
+            wait_seconds = self._get_extraction_wait_seconds()
+            self._extraction_trigger.wait(timeout=wait_seconds)
             self._extraction_trigger.clear()
             if self._shutdown_event.is_set():
                 break
 
-            try:
-                extracted = self.process_unextracted_submissions()
-                if extracted > 0:
-                    logger.info(
-                        "Extracted and persisted %d release submissions in background",
-                        extracted,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "Error processing unextracted submissions in background: %s",
-                    exc,
+            self._execute_extraction_with_telemetry(
+                schedule_backoff=True,
+                raise_on_error=False,
+            )
+
+    def _enrichment_next_run_at(
+        self, base: datetime, schedule_next: bool
+    ) -> datetime | None:
+        """Compute the next enrichment run timestamp when scheduling is enabled."""
+        if not schedule_next:
+            return None
+        return base + timedelta(seconds=self.enrichment_interval_seconds)
+
+    def _record_enrichment_error(
+        self,
+        started_at: datetime,
+        exc: Exception,
+        *,
+        schedule_next: bool,
+        log_prefix: str,
+    ) -> None:
+        """Record an unhandled enrichment error on loop state and run history."""
+        completed_at = self._now()
+        self.telemetry_recorder.record_loop_completion(
+            PipelineLoopName.ENRICHMENT_WORKER,
+            status=PipelineLoopStatus.ERROR,
+            started_at=started_at,
+            completed_at=completed_at,
+            stats=None,
+            error_message=str(exc),
+            next_run_at=self._enrichment_next_run_at(completed_at, schedule_next),
+            record_run=True,
+        )
+        logger.error("%s: %s", log_prefix, exc)
+
+    def _execute_enrichment_with_telemetry(
+        self,
+        *,
+        schedule_next: bool,
+        raise_on_error: bool,
+    ) -> int:
+        """Check enrichment queue and run pending enrichment with loop telemetry."""
+        check_started_at = self._now()
+        try:
+            with self.session_factory() as session:
+                has_work = (
+                    get_next_queued_album(session, now=check_started_at) is not None
                 )
+        except Exception as exc:
+            self._record_enrichment_error(
+                check_started_at,
+                exc,
+                schedule_next=schedule_next,
+                log_prefix="Error checking enrichment queue",
+            )
+            if raise_on_error:
+                raise
+            return 0
+
+        if not has_work:
+            now_ts = self._now()
+            self.telemetry_recorder.refresh_loop_next_run(
+                PipelineLoopName.ENRICHMENT_WORKER,
+                next_run_at=self._enrichment_next_run_at(now_ts, schedule_next),
+                clear_error=True,
+            )
+            return 0
+
+        started_at = self._now()
+        self.telemetry_recorder.record_loop_start(
+            PipelineLoopName.ENRICHMENT_WORKER,
+            started_at=started_at,
+        )
+        try:
+            enriched = self.process_pending_enrichment()
+        except Exception as exc:
+            self._record_enrichment_error(
+                started_at,
+                exc,
+                schedule_next=schedule_next,
+                log_prefix="Error processing pending enrichment in background",
+            )
+            if raise_on_error:
+                raise
+            return 0
+
+        completed_at = self._now()
+        next_run_at = self._enrichment_next_run_at(completed_at, schedule_next)
+        if enriched > 0:
+            self.telemetry_recorder.record_loop_completion(
+                PipelineLoopName.ENRICHMENT_WORKER,
+                status=PipelineLoopStatus.SLEEPING,
+                started_at=started_at,
+                completed_at=completed_at,
+                stats={"enriched": int(enriched)},
+                next_run_at=next_run_at,
+                record_run=True,
+            )
+            logger.info(
+                "Enriched %d album(s) with Discogs catalog in background",
+                enriched,
+            )
+        else:
+            duration_ms = max(
+                0, int((completed_at - started_at).total_seconds() * 1000)
+            )
+            self.telemetry_recorder.refresh_loop_next_run(
+                PipelineLoopName.ENRICHMENT_WORKER,
+                next_run_at=next_run_at,
+                clear_error=True,
+                completed_at=completed_at,
+                duration_ms=duration_ms,
+            )
+        return int(enriched)
 
     def _enrichment_worker_loop(self) -> None:
         """Background Discogs enrichment worker thread decoupled from ingestion and extraction."""
@@ -620,95 +1062,152 @@ class PollerService:
             if self._shutdown_event.is_set():
                 break
 
-            try:
-                enriched = self.process_pending_enrichment()
-                if enriched > 0:
-                    logger.info(
-                        "Enriched %d album(s) with Discogs catalog in background",
-                        enriched,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "Error processing pending enrichment in background: %s",
-                    exc,
-                )
+            self._execute_enrichment_with_telemetry(
+                schedule_next=True,
+                raise_on_error=False,
+            )
+
+    def _purge_expired_pipeline_runs(self, now: datetime) -> None:
+        """Prune expired pipeline_runs rows defensively without blocking the pipeline."""
+        try:
+            retention_days = get_default_pipeline_run_retention_days()
+            has_custom_clock = (
+                self._clock is not None or self.telemetry_recorder.has_custom_clock
+            )
+            cutoff = (
+                now - timedelta(days=retention_days) if has_custom_clock else None
+            )
+            purge_pipeline_runs(
+                self.session_factory,
+                retention_days=retention_days,
+                cutoff=cutoff,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to purge expired pipeline runs: %s", exc)
 
     def run(self) -> None:
         """Start the continuous background ingestion poller with decoupled asynchronous extraction."""
         self.register_signal_handlers()
         logger.info(
-            "Starting PollerService (new_interval=%ss, hot_interval=%ss, enrichment_interval=%ss)",
+            "Starting PollerService (new_interval=%ss, hot_interval=%ss, enrichment_interval=%ss, heartbeat_interval=%ss)",
             self.poll_interval_seconds,
             self.hot_poll_interval_seconds,
             self.enrichment_interval_seconds,
+            self.heartbeat_interval_seconds,
         )
 
-        # Start decoupled background extraction worker thread
-        self._extraction_thread = threading.Thread(
-            target=self._extraction_worker_loop,
-            name="ExtractionWorker",
-            daemon=True,
+        started_at = self._now()
+        self.telemetry_recorder.record_process_start(
+            run_mode=PipelineRunMode.CONTINUOUS,
+            heartbeat_interval_seconds=self.heartbeat_interval_seconds,
+            started_at=started_at,
         )
-        self._extraction_thread.start()
+        self._seed_loop_states(is_continuous=True, now=started_at)
 
-        # Start decoupled background Discogs enrichment worker thread
-        self._enrichment_thread = threading.Thread(
-            target=self._enrichment_worker_loop,
-            name="DiscogsEnrichmentWorker",
-            daemon=True,
-        )
-        self._enrichment_thread.start()
-
-        # Run initial discovery and tracking polls on startup
         try:
+            # Start dedicated background pipeline heartbeat thread
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop,
+                name="PipelineHeartbeat",
+                daemon=True,
+            )
+            self._heartbeat_thread.start()
+
+            # Start decoupled background extraction worker thread
+            self._extraction_thread = threading.Thread(
+                target=self._extraction_worker_loop,
+                name="ExtractionWorker",
+                daemon=True,
+            )
+            self._extraction_thread.start()
+
+            # Start decoupled background Discogs enrichment worker thread when enabled
+            if self.enrichment_service is not None:
+                self._enrichment_thread = threading.Thread(
+                    target=self._enrichment_worker_loop,
+                    name="DiscogsEnrichmentWorker",
+                    daemon=True,
+                )
+                self._enrichment_thread.start()
+
+            last_run_purge = started_at
+            self._purge_expired_pipeline_runs(started_at)
+
+            # Run initial discovery and tracking polls on startup
             logger.info("Executing initial discovery and tracking poll cycle...")
-            self.poll_new()
-            self.poll_hot()
-            self.trigger_extraction()
+            last_new_poll, new_stats = self._execute_poll_with_telemetry(
+                PipelineLoopName.DISCOVERY_POLL,
+                self.poll_new,
+                interval_seconds=self.poll_interval_seconds,
+                schedule_next=True,
+                raise_on_error=False,
+                error_log_message="Error during initial discovery poll (/new)",
+            )
+            last_hot_poll, hot_stats = self._execute_poll_with_telemetry(
+                PipelineLoopName.TRACKING_POLL,
+                self.poll_hot,
+                interval_seconds=self.hot_poll_interval_seconds,
+                schedule_next=True,
+                raise_on_error=False,
+                error_log_message="Error during initial tracking poll (/hot)",
+            )
+            if new_stats is not None or hot_stats is not None:
+                self.trigger_extraction()
             logger.info(
                 "Initial poll cycle completed. Poller active (next discovery poll in %ds, tracking poll in %ds).",
                 self.poll_interval_seconds,
                 self.hot_poll_interval_seconds,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Error during initial poll cycle: %s", exc)
 
-        last_new_poll = time.time()
-        last_hot_poll = time.time()
-
-        try:
             while not self._shutdown_event.is_set():
                 if self._shutdown_event.wait(timeout=1.0):
                     break
 
-                now = time.time()
+                now = self._now()
 
-                if now - last_new_poll >= self.poll_interval_seconds:
-                    try:
-                        logger.info("Executing discovery poll (/new)...")
-                        self.poll_new()
+                if now >= last_new_poll + timedelta(seconds=self.poll_interval_seconds):
+                    logger.info("Executing discovery poll (/new)...")
+                    last_new_poll, new_stats = self._execute_poll_with_telemetry(
+                        PipelineLoopName.DISCOVERY_POLL,
+                        self.poll_new,
+                        interval_seconds=self.poll_interval_seconds,
+                        schedule_next=True,
+                        raise_on_error=False,
+                        error_log_message="Error during discovery poll (/new)",
+                    )
+                    if new_stats is not None:
                         self.trigger_extraction()
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error("Error during discovery poll (/new): %s", exc)
-                    last_new_poll = time.time()
 
-                if now - last_hot_poll >= self.hot_poll_interval_seconds:
-                    try:
-                        logger.info("Executing tracking poll (/hot)...")
-                        self.poll_hot()
+                if now >= last_hot_poll + timedelta(seconds=self.hot_poll_interval_seconds):
+                    logger.info("Executing tracking poll (/hot)...")
+                    last_hot_poll, hot_stats = self._execute_poll_with_telemetry(
+                        PipelineLoopName.TRACKING_POLL,
+                        self.poll_hot,
+                        interval_seconds=self.hot_poll_interval_seconds,
+                        schedule_next=True,
+                        raise_on_error=False,
+                        error_log_message="Error during tracking poll (/hot)",
+                    )
+                    if hot_stats is not None:
                         self.trigger_extraction()
-                    except Exception as exc:  # noqa: BLE001
-                        logger.error("Error during tracking poll (/hot): %s", exc)
-                    last_hot_poll = time.time()
+
+                if now >= last_run_purge + timedelta(
+                    seconds=PIPELINE_RUN_PRUNE_INTERVAL_SECONDS
+                ):
+                    last_run_purge = now
+                    self._purge_expired_pipeline_runs(now)
 
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt received in run loop.")
         finally:
             self.stop()
+            if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+                self._heartbeat_thread.join(timeout=5.0)
             if self._extraction_thread and self._extraction_thread.is_alive():
                 self._extraction_thread.join(timeout=5.0)
             if self._enrichment_thread and self._enrichment_thread.is_alive():
                 self._enrichment_thread.join(timeout=5.0)
+            self.telemetry_recorder.record_process_stop(stopped_at=self._now())
             logger.info("PollerService stopped cleanly.")
 
 
