@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 load_dotenv()
 
 from reddit_scrape.db import get_engine, init_db
+from reddit_scrape.extraction import ExtractionResult
 from reddit_scrape.ingestion import RawSubmission
 from reddit_scrape.models import (
     PipelineLoopName,
@@ -402,10 +403,15 @@ class TestPollerServicePollTelemetryIntegration:
         mock_adapter.fetch_new.side_effect = fake_fetch_new
         mock_adapter.fetch_hot.side_effect = fake_fetch_hot
 
+        mock_worker = MagicMock()
+        mock_worker.extract_batch.side_effect = lambda batch, batch_size=5: {
+            sub_id: ExtractionResult(releases=[]) for sub_id, _, _ in batch
+        }
+
         service = PollerService(
             session_factory=session_factory,
             reddit_adapter=mock_adapter,
-            extraction_worker=MagicMock(),
+            extraction_worker=mock_worker,
             poll_interval_seconds=60,
             hot_poll_interval_seconds=300,
             enrichment_interval_seconds=45,
@@ -424,6 +430,9 @@ class TestPollerServicePollTelemetryIntegration:
                     is not None
                     and s.status == PipelineLoopStatus.SLEEPING
                     and s.last_completed_at is not None
+                    and (e := _get_loop_state(session_factory, PipelineLoopName.EXTRACTION_WORKER))
+                    is not None
+                    and e.status == PipelineLoopStatus.SLEEPING
                 )
             ), "Initial polls did not complete"
 
@@ -433,7 +442,16 @@ class TestPollerServicePollTelemetryIntegration:
                     for row in session.scalars(select(PipelineLoopState)).all()
                 }
                 runs = session.scalars(
-                    select(PipelineRun).order_by(PipelineRun.id.asc())
+                    select(PipelineRun)
+                    .where(
+                        PipelineRun.loop_name.in_(
+                            [
+                                PipelineLoopName.DISCOVERY_POLL,
+                                PipelineLoopName.TRACKING_POLL,
+                            ]
+                        )
+                    )
+                    .order_by(PipelineRun.id.asc())
                 ).all()
 
             assert observed_during_new["call_1"] == (
@@ -501,7 +519,16 @@ class TestPollerServicePollTelemetryIntegration:
             with session_factory() as session:
                 disc2 = session.get(PipelineLoopState, PipelineLoopName.DISCOVERY_POLL)
                 runs2 = session.scalars(
-                    select(PipelineRun).order_by(PipelineRun.id.asc())
+                    select(PipelineRun)
+                    .where(
+                        PipelineRun.loop_name.in_(
+                            [
+                                PipelineLoopName.DISCOVERY_POLL,
+                                PipelineLoopName.TRACKING_POLL,
+                            ]
+                        )
+                    )
+                    .order_by(PipelineRun.id.asc())
                 ).all()
             assert disc2 is not None
             assert disc2.last_started_at == expected_sched_start
@@ -678,7 +705,16 @@ class TestPollerServicePollTelemetryIntegration:
             with session_factory() as session:
                 disc_rec = session.get(PipelineLoopState, PipelineLoopName.DISCOVERY_POLL)
                 runs_after = session.scalars(
-                    select(PipelineRun).order_by(PipelineRun.id.asc())
+                    select(PipelineRun)
+                    .where(
+                        PipelineRun.loop_name.in_(
+                            [
+                                PipelineLoopName.DISCOVERY_POLL,
+                                PipelineLoopName.TRACKING_POLL,
+                            ]
+                        )
+                    )
+                    .order_by(PipelineRun.id.asc())
                 ).all()
             assert disc_rec is not None
             assert disc_rec.status == PipelineLoopStatus.SLEEPING
@@ -737,10 +773,15 @@ class TestPollerServicePollTelemetryIntegration:
         mock_adapter.fetch_new.side_effect = fake_fetch_new
         mock_adapter.fetch_hot.side_effect = fake_fetch_hot
 
+        mock_worker = MagicMock()
+        mock_worker.extract_batch.side_effect = lambda batch, batch_size=5: {
+            sub_id: ExtractionResult(releases=[]) for sub_id, _, _ in batch
+        }
+
         service = PollerService(
             session_factory=session_factory,
             reddit_adapter=mock_adapter,
-            extraction_worker=MagicMock(),
+            extraction_worker=mock_worker,
             poll_interval_seconds=300,
             hot_poll_interval_seconds=900,
             telemetry_recorder=recorder,
@@ -761,7 +802,16 @@ class TestPollerServicePollTelemetryIntegration:
                 for row in session.scalars(select(PipelineLoopState)).all()
             }
             runs = session.scalars(
-                select(PipelineRun).order_by(PipelineRun.id.asc())
+                select(PipelineRun)
+                .where(
+                    PipelineRun.loop_name.in_(
+                        [
+                            PipelineLoopName.DISCOVERY_POLL,
+                            PipelineLoopName.TRACKING_POLL,
+                        ]
+                    )
+                )
+                .order_by(PipelineRun.id.asc())
             ).all()
 
         assert proc is not None

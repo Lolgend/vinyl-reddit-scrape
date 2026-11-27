@@ -223,6 +223,28 @@ class CycleStats:
     enriched_count: int = 0
 
 
+@dataclass
+class _ExtractionDrainOutcome:
+    """Outcome of draining pending unextracted release-eligible submissions."""
+
+    had_candidates: bool
+    extracted_count: int
+    errors: list[str]
+
+
+def _format_extraction_error_summary(
+    errors: list[str], *, max_length: int = 500
+) -> str:
+    """Format a concise error summary from one or more extraction errors."""
+    if len(errors) == 1:
+        summary = errors[0]
+    else:
+        summary = f"{len(errors)} error(s); first: {errors[0]}"
+    if len(summary) > max_length:
+        return f"{summary[: max_length - 3]}..."
+    return summary
+
+
 class _AsyncRunner:
     """Manages a persistent background event loop to execute coroutines safely across threads."""
 
@@ -329,6 +351,8 @@ class PollerService:
         self._shutdown_event = threading.Event()
         self._extraction_trigger = threading.Event()
         self._extraction_lock = threading.Lock()
+        self._extraction_backoff_lock = threading.Lock()
+        self._extraction_backoff_seconds: int = 0
         self._extraction_thread: threading.Thread | None = None
         self._enrichment_trigger = threading.Event()
         self._enrichment_lock = threading.Lock()
@@ -472,7 +496,29 @@ class PollerService:
 
     def trigger_extraction(self) -> None:
         """Signal the background extraction worker that unextracted submissions are ready."""
+        self._reset_extraction_backoff()
         self._extraction_trigger.set()
+
+    def _reset_extraction_backoff(self) -> None:
+        with self._extraction_backoff_lock:
+            self._extraction_backoff_seconds = 0
+
+    def _advance_extraction_backoff(self) -> int:
+        with self._extraction_backoff_lock:
+            self._extraction_backoff_seconds = (
+                10
+                if self._extraction_backoff_seconds == 0
+                else min(300, self._extraction_backoff_seconds * 2)
+            )
+            return self._extraction_backoff_seconds
+
+    def _get_extraction_wait_seconds(self) -> float:
+        with self._extraction_backoff_lock:
+            return (
+                float(self._extraction_backoff_seconds)
+                if self._extraction_backoff_seconds > 0
+                else 2.0
+            )
 
     def trigger_enrichment(self) -> None:
         """Signal the background enrichment worker that pending albums are ready."""
@@ -564,10 +610,13 @@ class PollerService:
                 )
         return self.ingester.ingest_submissions(items)
 
-    def process_unextracted_submissions(
-        self, batch_size: int | None = None
-    ) -> int:
-        """Query and process unextracted submissions through extraction and persistence."""
+    def _drain_unextracted_submissions(
+        self,
+        batch_size: int | None = None,
+        *,
+        on_candidates_found: Callable[[], None] | None = None,
+    ) -> _ExtractionDrainOutcome:
+        """Query and drain unextracted submissions, capturing batch/submission errors."""
         with self._extraction_lock:
             with self.session_factory() as session:
                 stmt = (
@@ -583,7 +632,14 @@ class PollerService:
                 candidates = session.execute(stmt).all()
 
             if not candidates:
-                return 0
+                return _ExtractionDrainOutcome(
+                    had_candidates=False,
+                    extracted_count=0,
+                    errors=[],
+                )
+
+            if on_candidates_found is not None:
+                on_candidates_found()
 
             partition_size = max(1, self.llm_batch_size)
             batches = [
@@ -592,6 +648,7 @@ class PollerService:
             ]
 
             extracted_count = 0
+            errors: list[str] = []
             for batch in batches:
                 if self._shutdown_event.is_set():
                     logger.info("Shutdown requested, pausing extraction queue.")
@@ -606,6 +663,9 @@ class PollerService:
                         "Batch extraction failed for batch of %d submissions: %s",
                         len(batch),
                         exc,
+                    )
+                    errors.append(
+                        f"Batch extraction failed for batch of {len(batch)} submissions: {exc}"
                     )
                     continue
 
@@ -624,6 +684,9 @@ class PollerService:
                                 "No extraction result found for submission %s",
                                 sub_id,
                             )
+                            errors.append(
+                                f"No extraction result found for submission {sub_id}"
+                            )
                             continue
                         self.persistence_service.persist(
                             submission_id=sub_id,
@@ -636,11 +699,124 @@ class PollerService:
                             sub_id,
                             exc,
                         )
+                        errors.append(
+                            f"Failed extraction or persistence for submission {sub_id}: {exc}"
+                        )
 
             if extracted_count > 0:
                 self.trigger_enrichment()
 
-            return extracted_count
+            return _ExtractionDrainOutcome(
+                had_candidates=True,
+                extracted_count=extracted_count,
+                errors=errors,
+            )
+
+    def _execute_extraction_with_telemetry(
+        self,
+        *,
+        schedule_backoff: bool,
+        raise_on_error: bool,
+    ) -> int:
+        """Drain extraction queue and record loop/run telemetry when candidates exist."""
+        started_at = self._now()
+
+        def _on_candidates_found() -> None:
+            nonlocal started_at
+            started_at = self._now()
+            self.telemetry_recorder.record_loop_start(
+                PipelineLoopName.EXTRACTION_WORKER,
+                started_at=started_at,
+            )
+
+        try:
+            outcome = self._drain_unextracted_submissions(
+                on_candidates_found=_on_candidates_found
+            )
+        except Exception as exc:
+            completed_at = self._now()
+            next_run_at: datetime | None = None
+            if schedule_backoff:
+                backoff_seconds = self._advance_extraction_backoff()
+                next_run_at = completed_at + timedelta(seconds=backoff_seconds)
+            self.telemetry_recorder.record_loop_completion(
+                PipelineLoopName.EXTRACTION_WORKER,
+                status=PipelineLoopStatus.ERROR,
+                started_at=started_at,
+                completed_at=completed_at,
+                stats=None,
+                error_message=str(exc),
+                next_run_at=next_run_at,
+                record_run=True,
+            )
+            if raise_on_error:
+                raise
+            logger.error(
+                "Error processing unextracted submissions in background: %s",
+                exc,
+            )
+            return 0
+
+        if not outcome.had_candidates:
+            return 0
+
+        completed_at = self._now()
+        if outcome.errors:
+            summary = _format_extraction_error_summary(outcome.errors)
+            next_run_at = None
+            if outcome.extracted_count > 0:
+                self._reset_extraction_backoff()
+            elif schedule_backoff:
+                backoff_seconds = self._advance_extraction_backoff()
+                next_run_at = completed_at + timedelta(seconds=backoff_seconds)
+            self.telemetry_recorder.record_loop_completion(
+                PipelineLoopName.EXTRACTION_WORKER,
+                status=PipelineLoopStatus.ERROR,
+                started_at=started_at,
+                completed_at=completed_at,
+                stats={"extracted": outcome.extracted_count},
+                error_message=summary,
+                next_run_at=next_run_at,
+                record_run=True,
+            )
+            return outcome.extracted_count
+
+        if outcome.extracted_count > 0:
+            self._reset_extraction_backoff()
+            self.telemetry_recorder.record_loop_completion(
+                PipelineLoopName.EXTRACTION_WORKER,
+                status=PipelineLoopStatus.SLEEPING,
+                started_at=started_at,
+                completed_at=completed_at,
+                stats={"extracted": outcome.extracted_count},
+                next_run_at=None,
+                record_run=True,
+            )
+            if schedule_backoff:
+                logger.info(
+                    "Extracted and persisted %d release submissions in background",
+                    outcome.extracted_count,
+                )
+            return outcome.extracted_count
+
+        self.telemetry_recorder.record_loop_completion(
+            PipelineLoopName.EXTRACTION_WORKER,
+            status=PipelineLoopStatus.SLEEPING,
+            started_at=started_at,
+            completed_at=completed_at,
+            stats={"extracted": 0},
+            next_run_at=None,
+            record_run=False,
+        )
+        return 0
+
+    def process_unextracted_submissions(
+        self, batch_size: int | None = None
+    ) -> int:
+        """Query and process unextracted submissions through extraction and persistence."""
+        return self._drain_unextracted_submissions(
+            batch_size=batch_size
+        ).extracted_count
 
     def process_pending_enrichment(self, limit: int | None = None) -> int:
         """Query and enrich pending/retryable albums using CatalogEnrichmentService."""
@@ -708,7 +884,10 @@ class PollerService:
             assert new_stats is not None
             assert hot_stats is not None
 
-            extracted_count = self.process_unextracted_submissions()
+            extracted_count = self._execute_extraction_with_telemetry(
+                schedule_backoff=False,
+                raise_on_error=True,
+            )
             if extracted_count > 0:
                 self.trigger_enrichment()
             enriched_count = (
@@ -745,23 +924,16 @@ class PollerService:
         logger.info("Extraction background worker thread started.")
         while not self._shutdown_event.is_set():
             # Wait for signal or periodic timeout to check unextracted queue
-            self._extraction_trigger.wait(timeout=2.0)
+            wait_seconds = self._get_extraction_wait_seconds()
+            self._extraction_trigger.wait(timeout=wait_seconds)
             self._extraction_trigger.clear()
             if self._shutdown_event.is_set():
                 break
 
-            try:
-                extracted = self.process_unextracted_submissions()
-                if extracted > 0:
-                    logger.info(
-                        "Extracted and persisted %d release submissions in background",
-                        extracted,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "Error processing unextracted submissions in background: %s",
-                    exc,
-                )
+            self._execute_extraction_with_telemetry(
+                schedule_backoff=True,
+                raise_on_error=False,
+            )
 
     def _enrichment_next_run_at(
         self, base: datetime, schedule_next: bool
