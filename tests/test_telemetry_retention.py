@@ -9,81 +9,27 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
-from dotenv import load_dotenv
-from sqlalchemy import select, text
-from sqlalchemy.orm import sessionmaker
+from conftest import FakeClock, make_submission, truncate_all_tables, wait_until
+from sqlalchemy import select
 
-load_dotenv()
-
-from reddit_scrape.db import get_engine, init_db
 from reddit_scrape.models import (
     PipelineLoopName,
     PipelineLoopState,
     PipelineProcessStatus,
     PipelineRun,
     PipelineRunStatus,
-    Submission,
     SubmissionSnapshot,
 )
+from reddit_scrape.retention import purge_pipeline_runs
 from reddit_scrape.service import PollerService
 from reddit_scrape.telemetry import PipelineTelemetryRecorder
 
 
-@pytest.fixture(scope="session")
-def engine():
-    try:
-        eng = get_engine()
-        init_db(eng)
-        return eng
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Database unavailable: {exc}")
-
-
 @pytest.fixture(autouse=True)
 def clean_db(engine):
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
-                "submission_snapshots, submission_releases, releases, album_artists, albums, "
-                "artists, submissions CASCADE;"
-            )
-        )
+    truncate_all_tables(engine)
     yield
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
-                "submission_snapshots, submission_releases, releases, album_artists, albums, "
-                "artists, submissions CASCADE;"
-            )
-        )
-
-
-@pytest.fixture
-def session_factory(engine):
-    return sessionmaker(bind=engine)
-
-
-class _FakeClock:
-    def __init__(self, initial: datetime) -> None:
-        self.current = initial
-
-    def __call__(self) -> datetime:
-        return self.current
-
-    def advance(self, seconds: float) -> datetime:
-        self.current = self.current + timedelta(seconds=seconds)
-        return self.current
-
-
-def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval)
-    return False
+    truncate_all_tables(engine)
 
 
 def _run_exists(session_factory, run_id: int) -> bool:
@@ -101,12 +47,12 @@ class TestPollerServiceRunRetention:
         monkeypatch.delenv("SNAPSHOT_RETENTION_DAYS", raising=False)
 
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         with session_factory() as session:
-            sub = Submission(
-                id="sub_ret_adr0005",
+            sub = make_submission(
+                "sub_ret_adr0005",
                 reddit_id="t3_adr0005",
                 title="Boards of Canada - Music Has the Right to Children [2LP]",
                 url="https://example.com/boc",
@@ -173,7 +119,7 @@ class TestPollerServiceRunRetention:
         run_thread.start()
         try:
             # Wait for initial startup polls and startup purge to complete
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
                     not _run_exists(session_factory, expired_run_id)
                     and _count_runs(session_factory) >= 4
@@ -198,7 +144,7 @@ class TestPollerServiceRunRetention:
 
             # Advance clock to 24h (86400s) -> 24h prune fires and deletes borderline_run
             clock.current = t0 + timedelta(seconds=86400)
-            assert _wait_until(
+            assert wait_until(
                 lambda: not _run_exists(session_factory, borderline_run_id)
             )
 
@@ -217,7 +163,7 @@ class TestPollerServiceRunRetention:
         monkeypatch.setenv("PIPELINE_RUN_RETENTION_DAYS", "7")
 
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         with session_factory() as session:
@@ -257,7 +203,7 @@ class TestPollerServiceRunRetention:
         run_thread = threading.Thread(target=service.run, daemon=True)
         run_thread.start()
         try:
-            assert _wait_until(lambda: not _run_exists(session_factory, ten_days_id))
+            assert wait_until(lambda: not _run_exists(session_factory, ten_days_id))
             with session_factory() as session:
                 assert session.get(PipelineRun, ten_days_id) is None
                 assert session.get(PipelineRun, three_days_id) is not None
@@ -269,7 +215,7 @@ class TestPollerServiceRunRetention:
         self, session_factory, caplog
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         mock_adapter = MagicMock()
@@ -296,13 +242,13 @@ class TestPollerServiceRunRetention:
             run_thread = threading.Thread(target=service.run, daemon=True)
             run_thread.start()
             try:
-                assert _wait_until(lambda: mock_purge.call_count >= 1)
+                assert wait_until(lambda: mock_purge.call_count >= 1)
                 # Pipeline still ran its initial discovery & tracking polls
-                assert _wait_until(lambda: _count_runs(session_factory) >= 2)
+                assert wait_until(lambda: _count_runs(session_factory) >= 2)
 
                 # Advance 24 hours and verify second failure is also caught & logged
                 clock.current = t0 + timedelta(seconds=86400)
-                assert _wait_until(lambda: mock_purge.call_count >= 2)
+                assert wait_until(lambda: mock_purge.call_count >= 2)
             finally:
                 service.stop()
                 run_thread.join(timeout=5.0)
@@ -312,6 +258,68 @@ class TestPollerServiceRunRetention:
         ]
         assert len(warning_messages) >= 2
         assert any("db lock timeout" in msg for msg in warning_messages)
+
+    def test_run_uses_recorder_custom_clock_for_purge_cutoff(
+        self, session_factory, monkeypatch
+    ):
+        monkeypatch.delenv("PIPELINE_RUN_RETENTION_DAYS", raising=False)
+        monkeypatch.delenv("SNAPSHOT_RETENTION_DAYS", raising=False)
+
+        t0 = datetime(2099, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        clock = FakeClock(t0)
+        recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
+
+        with session_factory() as session, session.begin():
+            old_relative_to_t0 = PipelineRun(
+                loop_name=PipelineLoopName.DISCOVERY_POLL,
+                status=PipelineRunStatus.SUCCESS,
+                started_at=t0 - timedelta(days=35),
+                completed_at=t0 - timedelta(days=35) + timedelta(seconds=1),
+                duration_ms=1000,
+            )
+            fresh_relative_to_t0 = PipelineRun(
+                loop_name=PipelineLoopName.TRACKING_POLL,
+                status=PipelineRunStatus.SUCCESS,
+                started_at=t0 - timedelta(days=5),
+                completed_at=t0 - timedelta(days=5) + timedelta(seconds=1),
+                duration_ms=1000,
+            )
+            session.add_all([old_relative_to_t0, fresh_relative_to_t0])
+            session.flush()
+            old_id = old_relative_to_t0.id
+            fresh_id = fresh_relative_to_t0.id
+
+        mock_adapter = MagicMock()
+        mock_adapter.fetch_new.return_value = []
+        mock_adapter.fetch_hot.return_value = []
+
+        # Clock injected ONLY via telemetry_recorder, NOT passed to PollerService
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=MagicMock(),
+            poll_interval_seconds=172800,
+            hot_poll_interval_seconds=172800,
+            telemetry_recorder=recorder,
+        )
+
+        with patch(
+            "reddit_scrape.service.purge_pipeline_runs",
+            wraps=purge_pipeline_runs,
+        ) as spy_purge:
+            run_thread = threading.Thread(target=service.run, daemon=True)
+            run_thread.start()
+            try:
+                assert wait_until(lambda: spy_purge.call_count >= 1)
+                assert wait_until(lambda: not _run_exists(session_factory, old_id))
+            finally:
+                service.stop()
+                run_thread.join(timeout=5.0)
+
+        assert spy_purge.call_args_list[0].kwargs["cutoff"] == t0 - timedelta(days=30)
+        with session_factory() as session:
+            assert session.get(PipelineRun, old_id) is None
+            assert session.get(PipelineRun, fresh_id) is not None
 
 
 def _count_runs(session_factory) -> int:

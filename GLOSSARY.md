@@ -71,7 +71,7 @@ A periodic fetch of newly posted community announcements to discover unrecorded 
 _Avoid_: New loop, scrape job
 
 **Tracking Poll**:
-A periodic fetch of active community threads to refresh engagement metrics, flairs, and point-in-time **Submission Snapshot** observations.
+A periodic fetch of active community **Submission**s to refresh engagement metrics, flairs, and point-in-time **Submission Snapshot** observations.
 _Avoid_: Hot loop, refresh job
 
 **Extraction Queue**:

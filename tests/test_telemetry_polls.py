@@ -9,15 +9,16 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
-from dotenv import load_dotenv
-from sqlalchemy import select, text
-from sqlalchemy.orm import Session, sessionmaker
+from conftest import (
+    FakeClock,
+    get_loop_state,
+    make_raw_submission,
+    truncate_all_tables,
+    wait_until,
+)
+from sqlalchemy import select
 
-load_dotenv()
-
-from reddit_scrape.db import get_engine, init_db
 from reddit_scrape.extraction import ExtractionResult
-from reddit_scrape.ingestion import RawSubmission
 from reddit_scrape.models import (
     PipelineLoopName,
     PipelineLoopState,
@@ -33,56 +34,15 @@ from reddit_scrape.service import PollerService
 from reddit_scrape.telemetry import PipelineTelemetryRecorder
 
 
-@pytest.fixture(scope="session")
-def engine():
-    try:
-        eng = get_engine()
-        init_db(eng)
-        return eng
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Database unavailable: {exc}")
-
-
 @pytest.fixture(autouse=True)
 def clean_db(request):
     if request.cls and request.cls.__name__ == "TestPipelineTelemetryPollsUnit":
         yield
         return
     engine = request.getfixturevalue("engine")
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
-                "submission_snapshots, submission_releases, releases, album_artists, albums, "
-                "artists, submissions CASCADE;"
-            )
-        )
+    truncate_all_tables(engine)
     yield
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
-                "submission_snapshots, submission_releases, releases, album_artists, albums, "
-                "artists, submissions CASCADE;"
-            )
-        )
-
-
-@pytest.fixture
-def session_factory(engine):
-    return sessionmaker(bind=engine)
-
-
-class _FakeClock:
-    def __init__(self, initial: datetime) -> None:
-        self.current = initial
-
-    def __call__(self) -> datetime:
-        return self.current
-
-    def advance(self, seconds: float) -> datetime:
-        self.current = self.current + timedelta(seconds=seconds)
-        return self.current
+    truncate_all_tables(engine)
 
 
 class TestPipelineTelemetryRecorderLoops:
@@ -92,7 +52,7 @@ class TestPipelineTelemetryRecorderLoops:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         intervals = {
@@ -174,7 +134,7 @@ class TestPipelineTelemetryRecorderLoops:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(
             session_factory,
             clock=clock,
@@ -340,22 +300,6 @@ class TestPipelineTelemetryPollsUnit:
         assert all(r.levelno == logging.WARNING for r in caplog.records)
 
 
-def _wait_until(predicate, *, timeout: float = 3.0, interval: float = 0.05) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval)
-    return False
-
-
-def _get_loop_state(
-    session_factory: sessionmaker[Session], loop_name: PipelineLoopName
-) -> PipelineLoopState | None:
-    with session_factory() as session:
-        return session.get(PipelineLoopState, loop_name)
-
-
 class TestPollerServicePollTelemetryIntegration:
     """PostgreSQL integration tests for PollerService discovery/tracking poll telemetry."""
 
@@ -363,7 +307,7 @@ class TestPollerServicePollTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(
             session_factory, clock=clock, host="svc-host", pid=4321
         )
@@ -385,12 +329,10 @@ class TestPollerServicePollTelemetryIntegration:
             clock.advance(2)
             if new_calls == 1:
                 return [
-                    RawSubmission(
-                        id="disc_1",
+                    make_raw_submission(
+                        "disc_1",
                         title="Artist - Album [LP]",
-                        url="https://reddit.com/r/vinylreleases/disc_1",
                         created_utc=t0,
-                        fullname="t3_disc_1",
                     )
                 ]
             return []
@@ -424,13 +366,13 @@ class TestPollerServicePollTelemetryIntegration:
         run_thread.start()
 
         try:
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
-                    (s := _get_loop_state(session_factory, PipelineLoopName.TRACKING_POLL))
+                    (s := get_loop_state(session_factory, PipelineLoopName.TRACKING_POLL))
                     is not None
                     and s.status == PipelineLoopStatus.SLEEPING
                     and s.last_completed_at is not None
-                    and (e := _get_loop_state(session_factory, PipelineLoopName.EXTRACTION_WORKER))
+                    and (e := get_loop_state(session_factory, PipelineLoopName.EXTRACTION_WORKER))
                     is not None
                     and e.status == PipelineLoopStatus.SLEEPING
                 )
@@ -506,10 +448,10 @@ class TestPollerServicePollTelemetryIntegration:
             # Advance clock to disc.next_run_at -> scheduled discovery_poll triggers!
             expected_sched_start = disc.next_run_at
             clock.current = expected_sched_start
-            assert _wait_until(
+            assert wait_until(
                 lambda: new_calls >= 2
                 and (
-                    (r := _get_loop_state(session_factory, PipelineLoopName.DISCOVERY_POLL))
+                    (r := get_loop_state(session_factory, PipelineLoopName.DISCOVERY_POLL))
                     is not None
                     and r.status == PipelineLoopStatus.SLEEPING
                     and r.last_started_at == expected_sched_start
@@ -570,7 +512,7 @@ class TestPollerServicePollTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         mock_adapter = MagicMock()
@@ -592,8 +534,8 @@ class TestPollerServicePollTelemetryIntegration:
         run_thread = threading.Thread(target=service.run, daemon=True)
         run_thread.start()
         try:
-            assert _wait_until(
-                lambda: _get_loop_state(
+            assert wait_until(
+                lambda: get_loop_state(
                     session_factory, PipelineLoopName.ENRICHMENT_WORKER
                 )
                 is not None
@@ -623,7 +565,7 @@ class TestPollerServicePollTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         new_attempt = 0
@@ -635,12 +577,10 @@ class TestPollerServicePollTelemetryIntegration:
             if new_attempt == 1:
                 raise RuntimeError("reddit 503 temporary")
             return [
-                RawSubmission(
-                    id="rec_1",
+                make_raw_submission(
+                    "rec_1",
                     title="Recovered Artist - Album [LP]",
-                    url="https://reddit.com/r/vinylreleases/rec_1",
                     created_utc=t0,
-                    fullname="t3_rec_1",
                 )
             ]
 
@@ -666,9 +606,9 @@ class TestPollerServicePollTelemetryIntegration:
         run_thread.start()
         try:
             # Wait for both initial polls (both error) to complete
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
-                    (r := _get_loop_state(session_factory, PipelineLoopName.TRACKING_POLL))
+                    (r := get_loop_state(session_factory, PipelineLoopName.TRACKING_POLL))
                     is not None
                     and r.status == PipelineLoopStatus.ERROR
                 )
@@ -695,9 +635,9 @@ class TestPollerServicePollTelemetryIntegration:
 
             # Advance clock to trigger scheduled discovery_poll recovery (tracking_poll stays in error)
             clock.current = disc.next_run_at
-            assert _wait_until(
+            assert wait_until(
                 lambda: (
-                    (r := _get_loop_state(session_factory, PipelineLoopName.DISCOVERY_POLL))
+                    (r := get_loop_state(session_factory, PipelineLoopName.DISCOVERY_POLL))
                     is not None
                     and r.status == PipelineLoopStatus.SLEEPING
                 )
@@ -742,7 +682,7 @@ class TestPollerServicePollTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(
             session_factory, clock=clock, host="once-host", pid=1010
         )
@@ -752,12 +692,10 @@ class TestPollerServicePollTelemetryIntegration:
         def fake_fetch_new(limit=50):
             clock.advance(2)
             return [
-                RawSubmission(
-                    id="once_1",
+                make_raw_submission(
+                    "once_1",
                     title="Once Artist - Album [LP]",
-                    url="https://reddit.com/r/vinylreleases/once_1",
                     created_utc=t0,
-                    fullname="t3_once_1",
                 )
             ]
 
@@ -884,12 +822,10 @@ class TestPollerServicePollTelemetryIntegration:
             clock=lambda: datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
         )
 
-        sub = RawSubmission(
-            id="resilient_poll_1",
+        sub = make_raw_submission(
+            "resilient_poll_1",
             title="Resilient Band - Resilient Album",
-            url="https://reddit.com/r/vinylreleases/resilient_poll_1",
             created_utc=datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
-            fullname="t3_resilient_poll_1",
         )
         mock_adapter = MagicMock()
         mock_adapter.fetch_new.return_value = [sub]

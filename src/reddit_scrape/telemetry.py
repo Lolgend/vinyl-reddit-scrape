@@ -46,9 +46,12 @@ class PipelineTelemetryRecorder:
         pid: int | None = None,
     ) -> None:
         self.session_factory = session_factory
+        self.has_custom_clock: bool = clock is not None
         self._clock: Callable[[], datetime] = clock or _utc_now
         self.host = host if host is not None else socket.gethostname()
         self.pid = pid if pid is not None else os.getpid()
+        self._last_run_mode: PipelineRunMode = PipelineRunMode.CONTINUOUS
+        self._last_heartbeat_interval_seconds: int = 30
 
     def now(self) -> datetime:
         """Return the current timestamp from the configured clock."""
@@ -66,13 +69,43 @@ class PipelineTelemetryRecorder:
         """Execute a telemetry statement in a short-lived isolated session."""
         self._run_write(operation, lambda session: session.execute(stmt))
 
+    def _build_process_status_values(
+        self,
+        *,
+        status: PipelineProcessState,
+        timestamp: datetime,
+        run_mode: PipelineRunMode | None = None,
+        heartbeat_interval_seconds: int | None = None,
+        stopped_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Build column values for a pipeline_process_status upsert."""
+        effective_run_mode = (
+            run_mode if run_mode is not None else self._last_run_mode
+        )
+        effective_interval = (
+            heartbeat_interval_seconds
+            if heartbeat_interval_seconds is not None
+            else self._last_heartbeat_interval_seconds
+        )
+        return {
+            "process_name": DEFAULT_PROCESS_NAME,
+            "status": str(status),
+            "run_mode": str(effective_run_mode),
+            "host": self.host,
+            "pid": self.pid,
+            "heartbeat_interval_seconds": effective_interval,
+            "started_at": timestamp,
+            "last_heartbeat_at": timestamp,
+            "stopped_at": stopped_at,
+        }
+
     def _upsert_process_status(
         self,
-        operation: str,
+        session: Session,
         insert_values: dict[str, Any],
         conflict_set: dict[str, Any],
     ) -> None:
-        """Upsert the singleton pipeline_process_status row on process_name."""
+        """Upsert the singleton pipeline_process_status row inside the caller's session."""
         stmt = (
             pg_insert(PipelineProcessStatus)
             .values(**insert_values)
@@ -81,7 +114,7 @@ class PipelineTelemetryRecorder:
                 set_={**conflict_set, "updated_at": func.now()},
             )
         )
-        self._execute_write(operation, stmt)
+        session.execute(stmt)
 
     def _upsert_loop_state(
         self,
@@ -102,75 +135,57 @@ class PipelineTelemetryRecorder:
 
     def record_process_start(
         self,
-        run_mode: PipelineRunMode | str,
+        run_mode: PipelineRunMode,
         heartbeat_interval_seconds: int,
         started_at: datetime | None = None,
     ) -> None:
         """Record Pipeline startup in pipeline_process_status."""
+        self._last_run_mode = run_mode
+        self._last_heartbeat_interval_seconds = heartbeat_interval_seconds
         ts = started_at if started_at is not None else self.now()
-        values: dict[str, Any] = {
-            "process_name": DEFAULT_PROCESS_NAME,
-            "status": str(PipelineProcessState.RUNNING),
-            "run_mode": str(run_mode),
-            "host": self.host,
-            "pid": self.pid,
-            "heartbeat_interval_seconds": heartbeat_interval_seconds,
-            "started_at": ts,
-            "last_heartbeat_at": ts,
-            "stopped_at": None,
-        }
+        values = self._build_process_status_values(
+            status=PipelineProcessState.RUNNING,
+            timestamp=ts,
+            run_mode=run_mode,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            stopped_at=None,
+        )
         conflict_set = {
             key: value for key, value in values.items() if key != "process_name"
         }
-        self._upsert_process_status("record_process_start", values, conflict_set)
+        self._run_write(
+            "record_process_start",
+            lambda session: self._upsert_process_status(session, values, conflict_set),
+        )
 
     def record_heartbeat(self, heartbeat_at: datetime | None = None) -> None:
         """Refresh last_heartbeat_at while preserving existing process metadata."""
         ts = heartbeat_at if heartbeat_at is not None else self.now()
-        insert_values: dict[str, Any] = {
-            "process_name": DEFAULT_PROCESS_NAME,
-            "status": str(PipelineProcessState.RUNNING),
-            "run_mode": str(PipelineRunMode.CONTINUOUS),
-            "host": self.host,
-            "pid": self.pid,
-            "heartbeat_interval_seconds": 30,
-            "started_at": ts,
-            "last_heartbeat_at": ts,
-            "stopped_at": None,
-        }
-        self._upsert_process_status(
+        insert_values = self._build_process_status_values(
+            status=PipelineProcessState.RUNNING,
+            timestamp=ts,
+            stopped_at=None,
+        )
+        self._run_write(
             "record_heartbeat",
-            insert_values,
-            {"last_heartbeat_at": ts},
+            lambda session: self._upsert_process_status(
+                session, insert_values, {"last_heartbeat_at": ts}
+            ),
         )
 
     def record_process_stop(self, stopped_at: datetime | None = None) -> None:
         """Mark process and non-disabled loops stopped while preserving run metrics."""
         ts = stopped_at if stopped_at is not None else self.now()
-        insert_values: dict[str, Any] = {
-            "process_name": DEFAULT_PROCESS_NAME,
-            "status": str(PipelineProcessState.STOPPED),
-            "run_mode": str(PipelineRunMode.CONTINUOUS),
-            "host": self.host,
-            "pid": self.pid,
-            "heartbeat_interval_seconds": 30,
-            "started_at": ts,
-            "last_heartbeat_at": ts,
-            "stopped_at": ts,
-        }
-        process_stmt = (
-            pg_insert(PipelineProcessStatus)
-            .values(**insert_values)
-            .on_conflict_do_update(
-                index_elements=[PipelineProcessStatus.process_name],
-                set_={
-                    "status": str(PipelineProcessState.STOPPED),
-                    "stopped_at": ts,
-                    "last_heartbeat_at": ts,
-                    "updated_at": func.now(),
-                },
-            )
+        insert_values = self._build_process_status_values(
+            status=PipelineProcessState.STOPPED,
+            timestamp=ts,
+            stopped_at=ts,
         )
+        conflict_set = {
+            "status": str(PipelineProcessState.STOPPED),
+            "stopped_at": ts,
+            "last_heartbeat_at": ts,
+        }
         loops_stmt = (
             update(PipelineLoopState)
             .where(PipelineLoopState.status != str(PipelineLoopStatus.DISABLED))
@@ -182,7 +197,7 @@ class PipelineTelemetryRecorder:
         )
 
         def _write(session: Session) -> None:
-            session.execute(process_stmt)
+            self._upsert_process_status(session, insert_values, conflict_set)
             session.execute(loops_stmt)
 
         self._run_write("record_process_stop", _write)
@@ -238,7 +253,7 @@ class PipelineTelemetryRecorder:
 
     def record_loop_start(
         self,
-        loop_name: PipelineLoopName | str,
+        loop_name: PipelineLoopName,
         *,
         started_at: datetime | None = None,
     ) -> None:
@@ -263,9 +278,9 @@ class PipelineTelemetryRecorder:
 
     def record_loop_completion(
         self,
-        loop_name: PipelineLoopName | str,
+        loop_name: PipelineLoopName,
         *,
-        status: PipelineLoopStatus | str,
+        status: PipelineLoopStatus,
         started_at: datetime,
         completed_at: datetime,
         stats: dict[str, int] | None = None,
@@ -324,10 +339,12 @@ class PipelineTelemetryRecorder:
 
     def refresh_loop_next_run(
         self,
-        loop_name: PipelineLoopName | str,
+        loop_name: PipelineLoopName,
         *,
         next_run_at: datetime | None,
         clear_error: bool = True,
+        completed_at: datetime | None = None,
+        duration_ms: int | None = None,
     ) -> None:
         """Refresh a loop's sleeping status and next_run_at without creating a PipelineRun."""
         loop_name_str = str(loop_name)
@@ -344,6 +361,12 @@ class PipelineTelemetryRecorder:
         if clear_error:
             insert_values["last_error"] = None
             conflict_set["last_error"] = None
+        if completed_at is not None:
+            insert_values["last_completed_at"] = completed_at
+            conflict_set["last_completed_at"] = completed_at
+        if duration_ms is not None:
+            insert_values["last_duration_ms"] = duration_ms
+            conflict_set["last_duration_ms"] = duration_ms
         self._run_write(
             "refresh_loop_next_run",
             lambda session: self._upsert_loop_state(

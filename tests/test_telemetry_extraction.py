@@ -9,13 +9,16 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from dotenv import load_dotenv
-from sqlalchemy import select, text
+from conftest import (
+    FakeClock,
+    get_loop_state,
+    make_submission,
+    truncate_all_tables,
+    wait_until,
+)
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-load_dotenv()
-
-from reddit_scrape.db import get_engine, init_db
 from reddit_scrape.extraction import ExtractedRelease, ExtractionResult
 from reddit_scrape.models import (
     PipelineLoopName,
@@ -29,65 +32,15 @@ from reddit_scrape.service import PollerService
 from reddit_scrape.telemetry import PipelineTelemetryRecorder
 
 
-@pytest.fixture(scope="session")
-def engine():
-    try:
-        eng = get_engine()
-        init_db(eng)
-        return eng
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Database unavailable: {exc}")
-
-
 @pytest.fixture(autouse=True)
 def clean_db(request):
     if request.cls and request.cls.__name__ == "TestExtractionTelemetryUnit":
         yield
         return
     engine = request.getfixturevalue("engine")
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
-                "submission_snapshots, submission_releases, releases, album_artists, albums, "
-                "artists, submissions CASCADE;"
-            )
-        )
+    truncate_all_tables(engine)
     yield
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "TRUNCATE TABLE pipeline_runs, pipeline_loop_states, pipeline_process_status, "
-                "submission_snapshots, submission_releases, releases, album_artists, albums, "
-                "artists, submissions CASCADE;"
-            )
-        )
-
-
-@pytest.fixture
-def session_factory(engine):
-    return sessionmaker(bind=engine)
-
-
-class _FakeClock:
-    def __init__(self, initial: datetime) -> None:
-        self.current = initial
-
-    def __call__(self) -> datetime:
-        return self.current
-
-    def advance(self, seconds: float) -> datetime:
-        self.current = self.current + timedelta(seconds=seconds)
-        return self.current
-
-
-def _wait_until(predicate, *, timeout: float = 3.0, interval: float = 0.05) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval)
-    return False
+    truncate_all_tables(engine)
 
 
 def _insert_submission(
@@ -99,14 +52,11 @@ def _insert_submission(
     is_extracted: bool = False,
     is_release: bool = True,
 ) -> None:
-    reddit_id = sub_id.removeprefix("t3_")
     with session_factory() as session, session.begin():
         session.add(
-            Submission(
-                id=sub_id,
-                reddit_id=reddit_id,
+            make_submission(
+                sub_id,
                 title=title,
-                url=f"https://reddit.com/r/vinylreleases/{reddit_id}",
                 created_utc=created_utc,
                 is_extracted=is_extracted,
                 is_release=is_release,
@@ -121,7 +71,7 @@ class TestExtractionQueueTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(
             session_factory, clock=clock, host="ext-host", pid=7001
         )
@@ -263,10 +213,10 @@ class TestExtractionQueueTelemetryIntegration:
                 )
                 service.trigger_extraction()
 
-                assert _wait_until(
+                assert wait_until(
                     lambda: (
                         (
-                            r := _get_loop_state(
+                            r := get_loop_state(
                                 session_factory, PipelineLoopName.EXTRACTION_WORKER
                             )
                         )
@@ -317,7 +267,7 @@ class TestExtractionQueueTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         _insert_submission(session_factory, "t3_part_1", "Artist 1 - Album 1 [LP]", t0)
@@ -386,10 +336,10 @@ class TestExtractionQueueTelemetryIntegration:
             run_thread = threading.Thread(target=service.run, daemon=True)
             run_thread.start()
             try:
-                assert _wait_until(
+                assert wait_until(
                     lambda: (
                         (
-                            r := _get_loop_state(
+                            r := get_loop_state(
                                 session_factory, PipelineLoopName.EXTRACTION_WORKER
                             )
                         )
@@ -432,10 +382,10 @@ class TestExtractionQueueTelemetryIntegration:
 
                 # Trigger next drain; remaining 2 submissions succeed cleanly
                 service.trigger_extraction()
-                assert _wait_until(
+                assert wait_until(
                     lambda: (
                         (
-                            r := _get_loop_state(
+                            r := get_loop_state(
                                 session_factory, PipelineLoopName.EXTRACTION_WORKER
                             )
                         )
@@ -474,7 +424,7 @@ class TestExtractionQueueTelemetryIntegration:
 
     def test_zero_progress_backoff_progression_and_resets(self, session_factory):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         _insert_submission(session_factory, "t3_bo_1", "Backoff Artist - Album [LP]", t0)
@@ -538,10 +488,10 @@ class TestExtractionQueueTelemetryIntegration:
             try:
                 expected_backoffs = [10, 20, 40, 80, 160, 300, 300]
                 for idx, expected_sec in enumerate(expected_backoffs, start=1):
-                    assert _wait_until(
+                    assert wait_until(
                         lambda target=idx: (
                             (
-                                r := _get_loop_state(
+                                r := get_loop_state(
                                     session_factory, PipelineLoopName.EXTRACTION_WORKER
                                 )
                             )
@@ -578,7 +528,7 @@ class TestExtractionQueueTelemetryIntegration:
                 # trigger_extraction() resets backoff immediately (next failure starts at 10s again)
                 backoff_wait_entered.clear()
                 service.trigger_extraction()
-                assert _wait_until(
+                assert wait_until(
                     lambda: fail_count >= 8 and backoff_wait_entered.is_set()
                 ), "Triggered extraction did not run after backoff reset"
 
@@ -598,10 +548,10 @@ class TestExtractionQueueTelemetryIntegration:
                 recorded_waits.clear()
                 service._extraction_trigger.set()
 
-                assert _wait_until(
+                assert wait_until(
                     lambda: (
                         (
-                            r := _get_loop_state(
+                            r := get_loop_state(
                                 session_factory, PipelineLoopName.EXTRACTION_WORKER
                             )
                         )
@@ -618,7 +568,7 @@ class TestExtractionQueueTelemetryIntegration:
                 assert ok_state is not None
                 assert ok_state.last_error is None
                 assert ok_state.next_run_at is None
-                assert _wait_until(lambda: 2.0 in recorded_waits)
+                assert wait_until(lambda: 2.0 in recorded_waits)
             finally:
                 service.stop()
                 run_thread.join(timeout=5.0)
@@ -627,7 +577,7 @@ class TestExtractionQueueTelemetryIntegration:
         self, session_factory
     ):
         t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-        clock = _FakeClock(t0)
+        clock = FakeClock(t0)
         recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
 
         mock_adapter = MagicMock()
@@ -805,6 +755,104 @@ class TestExtractionQueueTelemetryIntegration:
         assert any("record_loop_start" in r.message for r in caplog.records)
         assert any("record_loop_completion" in r.message for r in caplog.records)
 
+    def test_graceful_shutdown_before_batch_one_preserves_prior_metrics(
+        self, session_factory
+    ):
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        clock = FakeClock(t0)
+        recorder = PipelineTelemetryRecorder(session_factory, clock=clock)
+
+        t_prev_start = t0 - timedelta(minutes=5)
+        t_prev_end = t_prev_start + timedelta(milliseconds=2500)
+        recorder.seed_loop_states(
+            {
+                PipelineLoopName.DISCOVERY_POLL: 300,
+                PipelineLoopName.TRACKING_POLL: 900,
+                PipelineLoopName.EXTRACTION_WORKER: 2,
+                PipelineLoopName.ENRICHMENT_WORKER: 60,
+            },
+            enrichment_enabled=False,
+            is_continuous=True,
+            now=t_prev_start,
+        )
+        recorder.record_loop_completion(
+            PipelineLoopName.EXTRACTION_WORKER,
+            status=PipelineLoopStatus.ERROR,
+            started_at=t_prev_start,
+            completed_at=t_prev_end,
+            stats={"extracted": 4},
+            error_message="prior extraction error",
+            next_run_at=None,
+            record_run=False,
+        )
+
+        _insert_submission(
+            session_factory,
+            "t3_shut_ext_1",
+            "Shutdown Band - Album [LP]",
+            t0,
+        )
+
+        mock_worker = MagicMock()
+        mock_adapter = MagicMock()
+        service = PollerService(
+            session_factory=session_factory,
+            reddit_adapter=mock_adapter,
+            extraction_worker=mock_worker,
+            telemetry_recorder=recorder,
+            clock=clock,
+        )
+
+        # Case 1: shutdown already set before drain -> preserves last_started_at too
+        service.stop()
+        assert (
+            service._execute_extraction_with_telemetry(
+                schedule_backoff=True, raise_on_error=False
+            )
+            == 0
+        )
+        mock_worker.extract_batch.assert_not_called()
+        with session_factory() as session:
+            state_1 = session.get(PipelineLoopState, PipelineLoopName.EXTRACTION_WORKER)
+            runs_1 = session.scalars(select(PipelineRun)).all()
+        assert state_1 is not None
+        assert state_1.last_started_at == t_prev_start
+        assert state_1.last_completed_at == t_prev_end
+        assert state_1.last_duration_ms == 2500
+        assert state_1.last_run_stats == {"extracted": 4}
+        assert state_1.last_error == "prior extraction error"
+        assert runs_1 == []
+
+        # Case 2: shutdown requested right after candidates found, before batch 1
+        service._shutdown_event.clear()
+        orig_record_start = recorder.record_loop_start
+
+        def stop_on_start(
+            loop_name: PipelineLoopName, *, started_at: datetime | None = None
+        ) -> None:
+            orig_record_start(loop_name, started_at=started_at)
+            service.stop()
+
+        with patch.object(recorder, "record_loop_start", side_effect=stop_on_start):
+            clock.advance(10)
+            assert (
+                service._execute_extraction_with_telemetry(
+                    schedule_backoff=True, raise_on_error=False
+                )
+                == 0
+            )
+
+        mock_worker.extract_batch.assert_not_called()
+        with session_factory() as session:
+            state_2 = session.get(PipelineLoopState, PipelineLoopName.EXTRACTION_WORKER)
+            runs_2 = session.scalars(select(PipelineRun)).all()
+        assert state_2 is not None
+        assert state_2.last_completed_at == t_prev_end
+        assert state_2.last_duration_ms == 2500
+        assert state_2.last_run_stats == {"extracted": 4}
+        assert state_2.last_error == "prior extraction error"
+        assert runs_2 == []
+
 
 class TestExtractionTelemetryUnit:
     """Unit tests for extraction error summary formatting and backoff helpers."""
@@ -821,10 +869,3 @@ class TestExtractionTelemetryUnit:
         truncated = _format_extraction_error_summary([long_err], max_length=100)
         assert len(truncated) == 100
         assert truncated.endswith("...")
-
-
-def _get_loop_state(
-    session_factory: sessionmaker[Session], loop_name: PipelineLoopName
-) -> PipelineLoopState | None:
-    with session_factory() as session:
-        return session.get(PipelineLoopState, loop_name)
